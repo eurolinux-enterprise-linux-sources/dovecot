@@ -1,0 +1,44 @@
+
+# HG changeset patch
+# User Timo Sirainen <tss@iki.fi>
+# Date 1412862083 -10800
+# Node ID 0e1a3c909a137edd2ad2c133d71eee7f565265bf
+# Parent  90fbf199ebdaeb3a3a4863f0897cbeec17a19105
+lib-storage: Fixed header parsing when there were multiple same header names.
+For example if a mail had:
+
+Name1: a
+Name1: b
+Name2: c
+
+If the Name1: was initially added to cache and Name2: not, but later on both
+were attempted to be added to cache, the Name2: lookup would have been added
+with "b" instead of "c" value.
+
+diff -r 90fbf199ebda -r 0e1a3c909a13 src/lib-storage/index/index-mail-headers.c
+--- a/src/lib-storage/index/index-mail-headers.c	Thu Oct 09 12:02:21 2014 +0300
++++ b/src/lib-storage/index/index-mail-headers.c	Thu Oct 09 16:41:23 2014 +0300
+@@ -71,6 +71,7 @@
+ 
+ 		if (match_idx < match_count) {
+ 			/* save index to first header line */
++			i_assert(match_idx == lines[i].field_idx);
+ 			j = i + 1;
+ 			array_idx_set(&mail->header_match_lines, match_idx, &j);
+ 			match_idx++;
+@@ -78,8 +79,12 @@
+ 
+ 		if (!mail_cache_field_can_add(_mail->transaction->cache_trans,
+ 					      _mail->seq, lines[i].field_idx)) {
+-			/* header is already cached */
+-			j = i + 1;
++			/* header is already cached. skip over all the
++			   header lines. */
++			for (j = i+1; j < count; j++) {
++				if (lines[j].field_idx != lines[i].field_idx)
++					break;
++			}
+ 			continue;
+ 		}
+ 
+

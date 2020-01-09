@@ -1,7 +1,16 @@
-diff -up dovecot-2.1.rc1/doc/example-config/conf.d/10-mail.conf.default-settings dovecot-2.1.rc1/doc/example-config/conf.d/10-mail.conf
---- dovecot-2.1.rc1/doc/example-config/conf.d/10-mail.conf.default-settings	2011-11-15 21:24:30.000000000 +0100
-+++ dovecot-2.1.rc1/doc/example-config/conf.d/10-mail.conf	2011-12-14 14:46:41.808749847 +0100
-@@ -277,6 +277,7 @@
+diff -up dovecot-2.2.10/doc/example-config/conf.d/10-mail.conf.default-settings dovecot-2.2.10/doc/example-config/conf.d/10-mail.conf
+--- dovecot-2.2.10/doc/example-config/conf.d/10-mail.conf.default-settings	2013-04-23 12:33:55.000000000 +0200
++++ dovecot-2.2.10/doc/example-config/conf.d/10-mail.conf	2016-06-17 17:56:17.353210369 +0200
+@@ -165,7 +165,7 @@ namespace inbox {
+ # to make sure that users can't log in as daemons or other system users.
+ # Note that denying root logins is hardcoded to dovecot binary and can't
+ # be done even if first_valid_uid is set to 0.
+-#first_valid_uid = 500
++first_valid_uid = 1000
+ #last_valid_uid = 0
+ 
+ # Valid GID range for users, defaults to non-root/wheel. Users having
+@@ -286,6 +286,7 @@ namespace inbox {
  # them simultaneously.
  #mbox_read_locks = fcntl
  #mbox_write_locks = dotlock fcntl
@@ -9,9 +18,9 @@ diff -up dovecot-2.1.rc1/doc/example-config/conf.d/10-mail.conf.default-settings
  
  # Maximum time to wait for lock (all of them) before aborting.
  #mbox_lock_timeout = 5 mins
-diff -up dovecot-2.1.rc1/doc/example-config/conf.d/10-ssl.conf.default-settings dovecot-2.1.rc1/doc/example-config/conf.d/10-ssl.conf
---- dovecot-2.1.rc1/doc/example-config/conf.d/10-ssl.conf.default-settings	2011-12-14 14:48:19.967721153 +0100
-+++ dovecot-2.1.rc1/doc/example-config/conf.d/10-ssl.conf	2011-12-14 14:51:10.413786253 +0100
+diff -up dovecot-2.2.10/doc/example-config/conf.d/10-ssl.conf.default-settings dovecot-2.2.10/doc/example-config/conf.d/10-ssl.conf
+--- dovecot-2.2.10/doc/example-config/conf.d/10-ssl.conf.default-settings	2013-11-19 21:36:30.000000000 +0100
++++ dovecot-2.2.10/doc/example-config/conf.d/10-ssl.conf	2016-06-17 17:54:18.749626750 +0200
 @@ -3,7 +3,9 @@
  ##
  

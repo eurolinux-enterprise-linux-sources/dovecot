@@ -5,7 +5,7 @@ Name: dovecot
 Epoch: 1
 Version: 2.2.10
 %global prever %{nil}
-Release: 5%{?dist}
+Release: 7%{?dist}
 #dovecot itself is MIT, a few sources are PD, pigeonhole is LGPLv2
 License: MIT and LGPLv2
 Group: System Environment/Daemons
@@ -41,13 +41,27 @@ Patch7: dovecot-2.2.9-nodevrand.patch
 
 # dovecot < 2.2.13, rhbz#1096402,rhbz#1108004
 Patch8: dovecot-2.2.10-CVE_2014_3430.patch
+Patch9: dovecot-pigeonhole-2.2.10-b6c55ac6460d.patch
+
+# from upstream, for dovecot < 2.2.13, rhbz#1234868
+Patch10: dovecot-2.2-e84555e6eb59.patch
+
+# rhbz#1249625
+Patch11: dovecot-2.2.10-valgrindlog.patch
+
+# 2x rhbz#1331478
+Patch12: dovecot-2.2.10-ed6e472cab0e.patch
+Patch13: dovecot-2.2.10-b8864211b88ed7521e9af514590639344af38910.patch
+
+# dovecot < 2.2.14, rhbz#1224496
+Patch14: dovecot-2.2.10-0e1a3c909a13.patch
 
 Source15: prestartscript
 
 Buildroot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
-BuildRequires: openssl-devel, pam-devel, zlib-devel, bzip2-devel, libcap-devel
+BuildRequires: openssl-devel, pam-devel, zlib-devel, bzip2-devel, xz-devel, libcap-devel
 BuildRequires: libtool, autoconf, automake, pkgconfig
-BuildRequires: sqlite-devel
+BuildRequires: sqlite-devel, tcp_wrappers-devel
 BuildRequires: postgresql-devel
 BuildRequires: mysql-devel
 BuildRequires: openldap-devel
@@ -123,6 +137,13 @@ Group: System Environment/Daemons
 %description mysql
 This package provides the MySQL back end for dovecot-auth etc.
 
+%package devel
+Requires: %{name} = %{epoch}:%{version}-%{release}
+Summary: Development files for dovecot
+Group: Development/Libraries
+%description devel
+This package provides the development files for dovecot.
+
 %prep
 %setup -q -n %{name}-%{version}%{?prever} -a 8
 %patch1 -p1 -b .default-settings
@@ -133,7 +154,16 @@ This package provides the MySQL back end for dovecot-auth etc.
 %patch6 -p1 -b .waitonline
 %patch7 -p1 -b .nodevrand
 %patch8 -p1 -b .CVE_2014_3430
+%patch10 -p1 -b .e84555e6eb59
+%patch11 -p1 -b .valgrindlog
+%patch12 -p1 -b .ed6e472cab0e
+%patch13 -p1 -b .b8864211b88ed7521e9af514590639344af38910
+%patch14 -p1 -b .0e1a3c909a13
 sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src/plugins/fts-lucene/Makefile.in
+#pigeonhole
+pushd dovecot-2*2-pigeonhole-%{pigeonholever}
+%patch9 -p1 -b .2.2.10-b6c55ac6460d
+popd
 
 %build
 #required for fdpass.c line 125,190: dereferencing type-punned pointer will break strict-aliasing rules
@@ -155,6 +185,7 @@ autoreconf -I . -fiv #required for aarch64 support
     --with-pgsql                 \
     --with-mysql                 \
     --with-sqlite                \
+    --with-lzma                  \
     --with-zlib                  \
     --with-libcap                \
 %if %{?fedora}0 > 150 || %{?rhel}0 >60
@@ -166,7 +197,8 @@ autoreconf -I . -fiv #required for aarch64 support
 %if %{?fedora}0 > 140 || %{?rhel}0 > 60
     --with-systemdsystemunitdir=%{_unitdir}  \
 %endif
-    --with-docs
+    --with-docs                  \
+    --with-libwrap
 
 sed -i 's|/etc/ssl|/etc/pki/dovecot|' doc/mkcert.sh doc/example-config/conf.d/10-ssl.conf
 
@@ -257,11 +289,6 @@ pushd docinstall
 rm -f securecoding.txt thread-refs.txt
 popd
 
-#drop -devel files
-rm -rf $RPM_BUILD_ROOT/%{_includedir}/dovecot
-rm -f  $RPM_BUILD_ROOT/%{_datadir}/aclocal/dovecot.m4
-rm -f  $RPM_BUILD_ROOT/%{_libdir}/dovecot/libdovecot*.so
-rm -f  $RPM_BUILD_ROOT/%{_libdir}/dovecot/dovecot-config
 
 %clean
 rm -rf $RPM_BUILD_ROOT
@@ -312,7 +339,7 @@ fi
 install -d -m 0755 -g dovecot -d /var/run/dovecot
 install -d -m 0755 -d /var/run/dovecot/empty
 install -d -m 0750 -g dovenull /var/run/dovecot/login
-[ -x /sbin/restorecon ] && /sbin/restorecon -R /var/run/dovecot
+/sbin/restorecon -R /var/run/dovecot 2>/dev/null || :
 
 %preun
 if [ $1 = 0 ]; then
@@ -483,7 +510,30 @@ make check
 %{_libdir}/%{name}/auth/libdriver_pgsql.so
 %{_libdir}/%{name}/dict/libdriver_pgsql.so
 
+%files devel
+%{_includedir}/dovecot
+%{_datadir}/aclocal/dovecot*.m4
+%{_libdir}/dovecot/libdovecot*.so
+%{_libdir}/dovecot/dovecot-config
+
+
 %changelog
+* Thu Jun 09 2016 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.10-7
+- prevent warning messages from %%post section if selinux-policy is
+  not installed (yet) (#1057522)
+- compile with xz compression support enabled (#1176214)
+- fix crash in sieve script compilation (#1177852)
+- wait with start after network-online target (#1209006)
+- build with tcp wrappers enabled (#1229164)
+- fixed userdb extra fields handling in passdb failure (#1234868)
+- fix valgrind option detection for make check (#1249625)
+- first valid regular user id is 1000 (#1280433)
+- fixed race condition when creating a new mailbox and another process getting its GUID (#1331478)
+- fixed header parsing when there were multiple same header names (#1224496)
+
+* Mon Jun 06 2016 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.10-6
+- add devel sub-package (#1122676)
+
 * Wed Jun 11 2014 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.10-5
 - fix CVE-2014-3430: denial of service through maxxing out SSL connections (#1108004)
 

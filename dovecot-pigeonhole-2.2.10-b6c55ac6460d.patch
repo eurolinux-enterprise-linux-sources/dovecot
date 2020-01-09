@@ -1,0 +1,84 @@
+
+# HG changeset patch
+# User Stephan Bosch <stephan@rename-it.nl>
+# Date 1419976864 -3600
+# Node ID b6c55ac6460d6e9d7c8784d7e0b9c0bd5ce160aa
+# Parent  c9698bc1751a70a808c286d43728e79b35c6ade7
+lib-sieve: Fixed crash in validation of the string parameter of the comparator tag.
+It couldn't handle a missing parameter (which also means missing arguments of the test itself in most cases).
+This is fixed by using the sieve_validate_tag_parameter() utility function.
+Testsuite is also extended.
+
+diff -r c9698bc1751a -r b6c55ac6460d src/lib-sieve/sieve-comparators.c
+--- a/src/lib-sieve/sieve-comparators.c	Tue Dec 30 22:57:07 2014 +0100
++++ b/src/lib-sieve/sieve-comparators.c	Tue Dec 30 23:01:04 2014 +0100
+@@ -140,16 +140,11 @@
+ 	/* Check syntax:
+ 	 *   ":comparator" <comparator-name: string>
+ 	 */
+-	if ( (*arg)->type != SAAT_STRING ) {
+-		sieve_argument_validate_error(valdtr, *arg,
+-			":comparator tag requires one string argument, but %s was found",
+-			sieve_ast_argument_name(*arg) );
++	if ( !sieve_validate_tag_parameter
++		(valdtr, cmd, tag, *arg, NULL, 0, SAAT_STRING, FALSE) ) {
+ 		return FALSE;
+ 	}
+ 
+-	if ( !sieve_validator_argument_activate(valdtr, cmd, *arg, FALSE) )
+-		return FALSE;
+-
+ 	/* FIXME: We can currently only handle string literal argument, so
+ 	 * variables are not allowed.
+ 	 */
+diff -r c9698bc1751a -r b6c55ac6460d tests/compile/errors.svtest
+--- a/tests/compile/errors.svtest	Tue Dec 30 22:57:07 2014 +0100
++++ b/tests/compile/errors.svtest	Tue Dec 30 23:01:04 2014 +0100
+@@ -243,6 +243,20 @@
+ }
+ 
+ /*
++ * COMPARATOR errors
++ */
++
++test "COMPARATOR errors (FIXME: count only)" {
++	if test_script_compile "errors/comparator.sieve" {
++		test_fail "compile should have failed.";
++	}
++
++	if not test_error :count "eq" :comparator "i;ascii-numeric" "6" {
++		test_fail "wrong number of errors reported";
++	}
++}
++
++/*
+  * ADDRESS-PART errors
+  */
+ 
+diff -r c9698bc1751a -r b6c55ac6460d tests/compile/errors/comparator.sieve
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/compile/errors/comparator.sieve	Tue Dec 30 23:01:04 2014 +0100
+@@ -0,0 +1,21 @@
++/*
++ * Address part errors
++ *
++ * Total errors: 5 (+1 = 6)
++ */
++
++# 1: No argument
++if address :comparator { }
++
++# 2: Number argument
++if address :comparator 1 "from" "frop" { }
++
++# 3: String list argument
++if address :comparator ["a", "b"] "from" "frop" { }
++
++# 4: Unknown tag
++if address :comparator :frop "from" "frop" { }
++
++# 5: Known tag
++if address :comparator :all "from" "frop" { }
++
+
+
