@@ -1,0 +1,37 @@
+--- dovecot-2.0.9/src/lib-storage/list/mailbox-list-fs.c	2010-12-30 10:42:54.000000000 +0100
++++ dovecot-2.0.9/src/lib-storage/list/mailbox-list-fs.c	2013-06-10 11:24:27.487734384 +0200
+@@ -141,12 +141,18 @@ fs_list_get_path(struct mailbox_list *_l
+ {
+ 	const struct mailbox_list_settings *set = &_list->set;
+ 	const char *root_dir;
++	unsigned int len;
+ 
+ 	if (name == NULL) {
+ 		/* return root directories */
+ 		return mailbox_list_get_root_path(set, type);
+ 	}
+ 
++	/* if name ends with hierarchy separator, drop the separator */
++	len = strlen(name);
++	if (len > 0 && name[len-1] == '/')
++		name = t_strndup(name, len-1);
++	
+ 	i_assert(mailbox_list_is_valid_pattern(_list, name));
+ 
+ 	if (mailbox_list_try_get_absolute_path(_list, &name))
+--- dovecot-2.0.9/src/lib-storage/mail-storage.c	2011-01-03 18:03:42.000000000 +0100
++++ dovecot-2.0.9/src/lib-storage/mail-storage.c	2013-06-10 11:25:20.159171169 +0200
+@@ -573,6 +573,13 @@ static int mailbox_open_full(struct mail
+ 
+ 	if (box->opened)
+ 		return 0;
++	
++	if (strcmp(box->list->name, "fs")==0 &&  box->list->hierarchy_sep=='/')
++	{
++		unsigned int len = strlen(box->name); 
++		if (len > 0 && box->name[len-1] == box->list->hierarchy_sep) 
++			box->name = t_strndup(box->name, len-1);
++	}
+ 
+ 	if (!mailbox_list_is_valid_existing_name(box->list, box->name)) {
+ 		mail_storage_set_error(box->storage, MAIL_ERROR_PARAMS,

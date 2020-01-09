@@ -1,0 +1,43 @@
+diff -up dovecot-2.0.9/src/lib-storage/mail-storage.c.slowcreate dovecot-2.0.9/src/lib-storage/mail-storage.c
+--- dovecot-2.0.9/src/lib-storage/mail-storage.c.slowcreate	2011-01-03 18:03:42.000000000 +0100
++++ dovecot-2.0.9/src/lib-storage/mail-storage.c	2015-03-05 12:29:22.340950803 +0100
+@@ -522,6 +522,15 @@ const char *mail_storage_get_last_error(
+ 	return storage->error_string;
+ }
+ 
++enum mail_error mailbox_get_last_mail_error(struct mailbox *box)
++{
++	enum mail_error error;
++
++	(void)mail_storage_get_last_error(box->storage, &error);
++	return error;
++}
++
++
+ bool mail_storage_is_mailbox_file(struct mail_storage *storage)
+ {
+ 	return (storage->class_flags &
+@@ -683,7 +692,10 @@ int mailbox_create(struct mailbox *box,
+ 		MAILBOX_DIR_CREATE_TYPE_MAILBOX;
+ 	if (box->list->v.create_mailbox_dir(box->list, box->name, type) < 0) {
+ 		mail_storage_copy_list_error(box->storage, box->list);
+-		return -1;
++		if (directory ||
++		    mailbox_get_last_mail_error(box) != MAIL_ERROR_EXISTS)
++			return -1;
++		/* the directory already exists, but the mailbox might not */
+ 	}
+ 	mailbox_refresh_permissions(box);
+ 
+diff -up dovecot-2.0.9/src/lib-storage/mail-storage.h.slowcreate dovecot-2.0.9/src/lib-storage/mail-storage.h
+--- dovecot-2.0.9/src/lib-storage/mail-storage.h.slowcreate	2015-03-05 12:31:23.133890966 +0100
++++ dovecot-2.0.9/src/lib-storage/mail-storage.h	2015-03-05 12:32:37.673236959 +0100
+@@ -321,6 +321,8 @@ int mail_storage_purge(struct mail_stora
+ /* Returns the error message of last occurred error. */
+ const char *mail_storage_get_last_error(struct mail_storage *storage,
+ 					enum mail_error *error_r);
++/* Wrapper for mail_storage_get_last_error(); */
++enum mail_error mailbox_get_last_mail_error(struct mailbox *box);
+ 
+ /* Returns TRUE if mailboxes are files. */
+ bool mail_storage_is_mailbox_file(struct mail_storage *storage) ATTR_PURE;

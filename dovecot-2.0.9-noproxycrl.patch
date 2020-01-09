@@ -1,0 +1,14 @@
+diff -up dovecot-2.0.9/src/login-common/ssl-proxy-openssl.c.noproxycrl dovecot-2.0.9/src/login-common/ssl-proxy-openssl.c
+--- dovecot-2.0.9/src/login-common/ssl-proxy-openssl.c.noproxycrl	2015-02-26 16:01:58.131909910 +0100
++++ dovecot-2.0.9/src/login-common/ssl-proxy-openssl.c	2015-02-26 16:01:58.140909875 +0100
+@@ -932,6 +932,10 @@ static int ssl_verify_client_cert(int pr
+ 		else
+ 			i_info("Valid certificate: %s", buf);
+ 	}
++	if (ctx->error == X509_V_ERR_UNABLE_TO_GET_CRL && proxy->client_proxy) {
++		/* no CRL given with the CA list. don't worry about it. */
++		preverify_ok = 1;
++	}
+ 	if (!preverify_ok)
+ 		proxy->cert_broken = TRUE;
+ 

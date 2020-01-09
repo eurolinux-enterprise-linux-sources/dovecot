@@ -1,0 +1,26 @@
+
+# HG changeset patch
+# User Timo Sirainen <tss@iki.fi>
+# Date 1325589183 -7200
+# Node ID d06061408f6d01f2ce537ab10b4d0f376f855262
+# Parent  49a77e9dad662f640c169bb1c4d7dc733f9d9a82
+imap-login: LOGIN_MAX_INBUF_SIZE was too small, because of SASL-IR extension
+
+diff -r 49a77e9dad66 -r d06061408f6d src/login-common/client-common.h
+--- a/src/login-common/client-common.h	Tue Dec 20 14:45:09 2011 +0200
++++ b/src/login-common/client-common.h	Tue Jan 03 13:13:03 2012 +0200
+@@ -7,10 +7,11 @@
+ 
+ /* max. size of input buffer. this means:
+ 
+-   IMAP: Max. length of a single parameter
++   IMAP: Max. length of a single parameter. SASL initial response can be
++         long with GSSAPI.
+    POP3: Max. length of a command line (spec says 512 would be enough)
+ */
+-#define LOGIN_MAX_INBUF_SIZE 1024
++#define LOGIN_MAX_INBUF_SIZE 4096
+ /* max. size of output buffer. if it gets full, the client is disconnected.
+    SASL authentication gives the largest output. */
+ #define LOGIN_MAX_OUTBUF_SIZE 4096
+

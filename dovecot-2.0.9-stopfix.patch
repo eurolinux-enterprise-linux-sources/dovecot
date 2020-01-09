@@ -1,0 +1,184 @@
+diff -up dovecot-2.0.9/src/master/main.c.stopfix dovecot-2.0.9/src/master/main.c
+--- dovecot-2.0.9/src/master/main.c.stopfix	2015-02-16 16:07:44.345095963 +0100
++++ dovecot-2.0.9/src/master/main.c	2015-02-16 16:10:08.084203725 +0100
+@@ -325,7 +325,7 @@ sig_settings_reload(const siginfo_t *si
+ 			 services->config->config_file_path);
+ 
+ 	/* switch to new configuration. */
+-	services_monitor_stop(services);
++	services_monitor_stop(services, FALSE);
+ 	if (services_listen_using(new_services, services) < 0) {
+ 		services_monitor_start(services);
+ 		return;
+@@ -337,7 +337,7 @@ sig_settings_reload(const siginfo_t *si
+ 		while (service->processes != NULL)
+ 			service_process_destroy(service->processes);
+ 	}
+-	services_destroy(services);
++	services_destroy(services, FALSE);
+ 
+ 	services = new_services;
+         services_monitor_start(services);
+@@ -420,13 +420,26 @@ static void main_init(const struct maste
+ 	services_monitor_start(services);
+ }
+ 
++static void global_dead_pipe_close(void)
++{
++	if (close(master_dead_pipe_fd[0]) < 0)
++		i_error("close(global dead pipe) failed: %m");
++	if (close(master_dead_pipe_fd[1]) < 0)
++		i_error("close(global dead pipe) failed: %m");
++	master_dead_pipe_fd[0] = -1;
++	master_dead_pipe_fd[1] = -1;
++}
++
+ static void main_deinit(void)
+ {
++	/* kill services and wait for them to die before unlinking pid file */
++	global_dead_pipe_close();
++	services_destroy(services, TRUE);
++
+ 	if (unlink(pidfile_path) < 0)
+ 		i_error("unlink(%s) failed: %m", pidfile_path);
+ 	i_free(pidfile_path);
+ 
+-	services_destroy(services);
+ 	service_anvil_global_deinit();
+ 	service_pids_deinit();
+ }
+diff -up dovecot-2.0.9/src/master/service.c.stopfix dovecot-2.0.9/src/master/service.c
+--- dovecot-2.0.9/src/master/service.c.stopfix	2015-02-16 16:21:44.693890816 +0100
++++ dovecot-2.0.9/src/master/service.c	2015-02-16 16:23:09.300368449 +0100
+@@ -604,12 +604,13 @@ static void services_kill_timeout(struct
+ 	}
+ }
+ 
+-void services_destroy(struct service_list *service_list)
++void services_destroy(struct service_list *service_list, bool wait)
+ {
+ 	/* make sure we log if child processes died unexpectedly */
+-        services_monitor_reap_children();
++	service_list->destroying = TRUE;
++	services_monitor_reap_children();
+ 
+-	services_monitor_stop(service_list);
++	services_monitor_stop(service_list, wait);
+ 
+ 	if (service_list->refcount > 1 &&
+ 	    service_list->service_set->shutdown_clients) {
+diff -up dovecot-2.0.9/src/master/service.h.stopfix dovecot-2.0.9/src/master/service.h
+--- dovecot-2.0.9/src/master/service.h.stopfix	2015-02-16 16:24:01.603045528 +0100
++++ dovecot-2.0.9/src/master/service.h	2015-02-16 16:24:01.630045361 +0100
+@@ -122,6 +122,7 @@ struct service_list {
+ 
+ 	ARRAY_DEFINE(services, struct service *);
+ 
++	unsigned int destroying:1;
+ 	unsigned int destroyed:1;
+ 	unsigned int sigterm_sent:1;
+ 	unsigned int sigterm_sent_to_log:1;
+@@ -135,7 +136,7 @@ int services_create(const struct master_
+ 		    struct service_list **services_r, const char **error_r);
+ 
+ /* Destroy services */
+-void services_destroy(struct service_list *service_list);
++void services_destroy(struct service_list *service_list, bool wait);
+ 
+ void service_list_ref(struct service_list *service_list);
+ void service_list_unref(struct service_list *service_list);
+diff -up dovecot-2.0.9/src/master/service-monitor.c.stopfix dovecot-2.0.9/src/master/service-monitor.c
+--- dovecot-2.0.9/src/master/service-monitor.c.stopfix	2015-02-16 16:10:30.958061739 +0100
++++ dovecot-2.0.9/src/master/service-monitor.c	2015-02-16 16:18:22.914136620 +0100
+@@ -22,6 +22,7 @@
+ 
+ #define SERVICE_STARTUP_FAILURE_THROTTLE_SECS 60
+ #define SERVICE_DROP_WARN_INTERVAL_SECS 60
++#define MAX_DIE_WAIT_SECS 5
+ 
+ static void service_monitor_start_extra_avail(struct service *service);
+ static void service_status_more(struct service_process *process,
+@@ -169,8 +170,10 @@ static void service_status_input(struct
+ 	if (ret <= 0) {
+ 		if (ret == 0)
+ 			service_error(service, "read(status) failed: EOF");
+-		else
++		else if (errno != EAGAIN)
+ 			service_error(service, "read(status) failed: %m");
++		else
++			return;
+ 		service_monitor_stop(service);
+ 		return;
+ 	}
+@@ -405,10 +408,38 @@ void service_monitor_stop(struct service
+ 		timeout_remove(&service->to_throttle);
+ }
+ 
+-void services_monitor_stop(struct service_list *service_list)
++static void services_monitor_wait(struct service_list *service_list)
++{
++	struct service *const *servicep;
++	time_t max_wait_time = time(NULL) + MAX_DIE_WAIT_SECS;
++	bool finished;
++
++	for (;;) {
++		finished = TRUE;
++		services_monitor_reap_children();
++		array_foreach(&service_list->services, servicep) {
++			if ((*servicep)->status_fd[0] != -1)
++				service_status_input(*servicep);
++			if ((*servicep)->process_avail > 0)
++				finished = FALSE;
++		}
++		if (finished || time(NULL) > max_wait_time)
++			break;
++		usleep(100000);
++	}
++}
++
++void services_monitor_stop(struct service_list *service_list, bool wait)
+ {
+ 	struct service *const *services;
+ 
++	if (wait) {
++		/* we've notified all children that the master is dead.
++		   now wait for the children to either die or to tell that
++		   they're no longer listening for new connections */
++		services_monitor_wait(service_list);
++	}
++
+ 	array_foreach(&service_list->services, services)
+ 		service_monitor_stop(*services);
+ 
+@@ -445,7 +476,8 @@ void services_monitor_reap_children(void
+ 		service = process->service;
+ 		if (status == 0) {
+ 			/* success */
+-			if (service->listen_pending)
++			if (service->listen_pending &&
++			    !service->list->destroying)
+ 				service_monitor_listen_start(service);
+ 			throttle = FALSE;
+ 		} else {
+@@ -464,7 +496,8 @@ void services_monitor_reap_children(void
+ 			service_monitor_throttle(service);
+ 		service_stopped = service->status_fd[0] == -1;
+ 		if (!service_stopped) {
+-			service_monitor_start_extra_avail(service);
++			if (!service->list->destroying)
++				service_monitor_start_extra_avail(service);
+ 			if (service->to_throttle == NULL)
+ 				service_monitor_listen_start(service);
+ 		}
+diff -up dovecot-2.0.9/src/master/service-monitor.h.stopfix dovecot-2.0.9/src/master/service-monitor.h
+--- dovecot-2.0.9/src/master/service-monitor.h.stopfix	2015-02-16 16:19:01.023901327 +0100
++++ dovecot-2.0.9/src/master/service-monitor.h	2015-02-16 16:19:01.038901235 +0100
+@@ -5,7 +5,7 @@
+ void services_monitor_start(struct service_list *service_list);
+ 
+ /* Stop services. */
+-void services_monitor_stop(struct service_list *service_list);
++void services_monitor_stop(struct service_list *service_list, bool wait);
+ 
+ /* Call after SIGCHLD has been detected */
+ void services_monitor_reap_children(void);

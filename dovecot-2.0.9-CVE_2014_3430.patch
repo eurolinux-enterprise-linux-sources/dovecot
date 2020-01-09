@@ -1,0 +1,64 @@
+
+# HG changeset patch
+# User Timo Sirainen <tss@iki.fi>
+# Date 1399555236 -10800
+# Node ID 48f90e7e92dcc0f429fd86aba30b2230acf00f56
+# Parent  74d9f61e224d572e763129f2b1c2e180805e23ea
+*-login: SSL connections didn't get closed when the client got destroyed.
+
+diff -r 74d9f61e224d -r 48f90e7e92dc src/login-common/client-common.c
+--- a/src/login-common/client-common.c	Tue Nov 27 08:44:12 2012 +0200
++++ b/src/login-common/client-common.c	Thu May 08 16:20:36 2014 +0300
+@@ -105,6 +105,8 @@
+ 		last_client = client->prev;
+ 	DLLIST_REMOVE(&clients, client);
+ 
++	if (!client->login_success && client->ssl_proxy != NULL)
++		ssl_proxy_destroy(client->ssl_proxy);
+ 	if (client->input != NULL)
+ 		i_stream_close(client->input);
+ 	if (client->output != NULL)
+diff -r 74d9f61e224d -r 48f90e7e92dc src/login-common/ssl-proxy-openssl.c
+--- a/src/login-common/ssl-proxy-openssl.c	Tue Nov 27 08:44:12 2012 +0200
++++ b/src/login-common/ssl-proxy-openssl.c	Thu May 08 16:20:36 2014 +0300
+@@ -103,7 +103,6 @@
+ static void ssl_read(struct ssl_proxy *proxy);
+ static void ssl_write(struct ssl_proxy *proxy);
+ static void ssl_step(struct ssl_proxy *proxy);
+-static void ssl_proxy_destroy(struct ssl_proxy *proxy);
+ static void ssl_proxy_unref(struct ssl_proxy *proxy);
+ 
+ static struct ssl_server_context *
+@@ -845,7 +844,7 @@
+ 	i_free(proxy);
+ }
+ 
+-static void ssl_proxy_destroy(struct ssl_proxy *proxy)
++void ssl_proxy_destroy(struct ssl_proxy *proxy)
+ {
+ 	if (proxy->destroyed)
+ 		return;
+diff -r 74d9f61e224d -r 48f90e7e92dc src/login-common/ssl-proxy.c
+--- a/src/login-common/ssl-proxy.c	Tue Nov 27 08:44:12 2012 +0200
++++ b/src/login-common/ssl-proxy.c	Thu May 08 16:20:36 2014 +0300
+@@ -77,6 +77,8 @@
+ 	return NULL;
+ }
+ 
++void ssl_proxy_destroy(struct ssl_proxy *proxy ATTR_UNUSED) {}
++
+ void ssl_proxy_free(struct ssl_proxy **proxy ATTR_UNUSED) {}
+ 
+ unsigned int ssl_proxy_get_count(void)
+diff -r 74d9f61e224d -r 48f90e7e92dc src/login-common/ssl-proxy.h
+--- a/src/login-common/ssl-proxy.h	Tue Nov 27 08:44:12 2012 +0200
++++ b/src/login-common/ssl-proxy.h	Thu May 08 16:20:36 2014 +0300
+@@ -30,6 +30,7 @@
+ const char *ssl_proxy_get_last_error(const struct ssl_proxy *proxy) ATTR_PURE;
+ const char *ssl_proxy_get_security_string(struct ssl_proxy *proxy);
+ const char *ssl_proxy_get_compression(struct ssl_proxy *proxy);
++void ssl_proxy_destroy(struct ssl_proxy *proxy);
+ void ssl_proxy_free(struct ssl_proxy **proxy);
+ 
+ /* Return number of active SSL proxies */
+

@@ -1,0 +1,49 @@
+diff -up dovecot-2.0.9/src/lib-master/master-service.c.nodevrand dovecot-2.0.9/src/lib-master/master-service.c
+--- dovecot-2.0.9/src/lib-master/master-service.c.nodevrand	2010-12-30 10:42:54.000000000 +0100
++++ dovecot-2.0.9/src/lib-master/master-service.c	2015-03-05 12:26:03.200698059 +0100
+@@ -477,6 +477,11 @@ const char *master_service_get_name(stru
+ 	return service->name;
+ }
+ 
++const enum master_service_flags master_service_get_flags(struct master_service *service)
++{
++	return service->flags;
++}
++
+ void master_service_run(struct master_service *service,
+ 			master_service_connection_callback_t *callback)
+ {
+diff -up dovecot-2.0.9/src/lib-master/master-service.h.nodevrand dovecot-2.0.9/src/lib-master/master-service.h
+--- dovecot-2.0.9/src/lib-master/master-service.h.nodevrand	2010-12-30 10:42:54.000000000 +0100
++++ dovecot-2.0.9/src/lib-master/master-service.h	2015-03-05 12:26:03.201698050 +0100
+@@ -105,6 +105,8 @@ const char *master_service_get_version_s
+ /* Returns name of the service, as given in name parameter to _init(). */
+ const char *master_service_get_name(struct master_service *service);
+ 
++const enum master_service_flags master_service_get_flags(struct master_service *service);
++
+ /* Start the service. Blocks until finished */
+ void master_service_run(struct master_service *service,
+ 			master_service_connection_callback_t *callback);
+diff -up dovecot-2.0.9/src/ssl-params/main.c.nodevrand dovecot-2.0.9/src/ssl-params/main.c
+--- dovecot-2.0.9/src/ssl-params/main.c.nodevrand	2015-03-05 12:26:03.184698199 +0100
++++ dovecot-2.0.9/src/ssl-params/main.c	2015-03-05 12:27:04.238162516 +0100
+@@ -10,6 +10,7 @@
+ #include "ssl-params.h"
+ 
+ #include <sys/wait.h>
++#include <stdlib.h>
+ 
+ #define SSL_BUILD_PARAM_FNAME "ssl-parameters.dat"
+ #define STARTUP_IDLE_TIMEOUT_MSECS 1000
+@@ -100,7 +101,10 @@ static void sig_chld(const siginfo_t *si
+ 	if (waitpid(-1, &status, WNOHANG) < 0)
+ 		i_error("waitpid() failed: %m");
+ 	else if (status != 0)
++	{
+ 		i_error("child process failed with status %d", status);
++		if(master_service_get_flags(master_service) & MASTER_SERVICE_FLAG_STANDALONE) exit(1);
++	}
+ 	else {
+ 		/* params should have been created now. try refreshing. */
+ 		ssl_params_refresh(param);

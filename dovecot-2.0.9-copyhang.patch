@@ -1,0 +1,21 @@
+
+# HG changeset patch
+# User Timo Sirainen <tss@iki.fi>
+# Date 1296683912 -7200
+# Node ID 826981b2c5c430188de78000e21b4621763ff140
+# Parent  5a6e44ca58256b5359d34de02d8f5cb68c927ca3
+imap: Fixed a hang when trying to COPY to a nonexistent mailbox.
+
+diff -r 5a6e44ca5825 -r 826981b2c5c4 src/imap/cmd-copy.c
+--- a/src/imap/cmd-copy.c	Mon Jan 31 00:27:53 2011 +0200
++++ b/src/imap/cmd-copy.c	Wed Feb 02 23:58:32 2011 +0200
+@@ -126,7 +126,7 @@
+ 	case MAILBOX_NAME_NOINFERIORS:
+ 		client_fail_mailbox_name_status(cmd, mailbox,
+ 						"TRYCREATE", status);
+-		return NULL;
++		return TRUE;
+ 	}
+ 
+ 	if (mailbox_equals(client->mailbox, dest_ns, storage_name))
+

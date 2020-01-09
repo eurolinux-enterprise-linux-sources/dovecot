@@ -1,0 +1,87 @@
+diff -up dovecot-2.0.9/src/ssl-params/main.c.fipsfix dovecot-2.0.9/src/ssl-params/main.c
+--- dovecot-2.0.9/src/ssl-params/main.c.fipsfix	2010-12-30 10:42:54.000000000 +0100
++++ dovecot-2.0.9/src/ssl-params/main.c	2013-10-01 19:43:13.538401766 +0200
+@@ -140,13 +140,13 @@ int main(int argc, char *argv[])
+ 	restrict_access_by_env(NULL, FALSE);
+ 	restrict_access_allow_coredumps(TRUE);
+ 
+-	master_service_init_finish(master_service);
+ 
+ #ifndef HAVE_SSL
+ 	i_fatal("Dovecot built without SSL support");
+ #endif
+ 
+ 	main_init(set);
++	master_service_init_finish(master_service);
+ 	master_service_run(master_service, client_connected);
+ 	main_deinit();
+ 
+diff -up dovecot-2.0.9/src/ssl-params/ssl-params.c.fipsfix dovecot-2.0.9/src/ssl-params/ssl-params.c
+--- dovecot-2.0.9/src/ssl-params/ssl-params.c.fipsfix	2010-01-25 00:16:47.000000000 +0100
++++ dovecot-2.0.9/src/ssl-params/ssl-params.c	2013-10-01 19:43:13.538401766 +0200
+@@ -5,6 +5,7 @@
+ #include "buffer.h"
+ #include "file-lock.h"
+ #include "read-full.h"
++#include "master-service.h"
+ #include "master-service-settings.h"
+ #include "ssl-params-settings.h"
+ #include "ssl-params.h"
+@@ -118,7 +119,9 @@ static void ssl_params_rebuild(struct ss
+ 	case -1:
+ 		i_fatal("fork() failed: %m");
+ 	case 0:
+-		/* child */
++		/* child - close listener fds so a long-running ssl-params
++		   doesn't cause Dovecot restart to fail */
++		master_service_stop_new_connections(master_service);
+ 		ssl_params_if_unchanged(param->path, param->last_mtime);
+ 		exit(0);
+ 	default:
+diff -up dovecot-2.0.9/src/ssl-params/ssl-params-openssl.c.fipsfix dovecot-2.0.9/src/ssl-params/ssl-params-openssl.c
+--- dovecot-2.0.9/src/ssl-params/ssl-params-openssl.c.fipsfix	2010-01-25 00:16:12.000000000 +0100
++++ dovecot-2.0.9/src/ssl-params/ssl-params-openssl.c	2013-10-02 14:41:18.447599323 +0200
+@@ -31,15 +31,17 @@ static const char *ssl_last_error(void)
+ 	return buf;
+ }
+ 
+-static void generate_dh_parameters(int bitsize, int fd, const char *fname)
++static int generate_dh_parameters(int bitsize, int fd, const char *fname)
+ {
+         DH *dh = DH_generate_parameters(bitsize, DH_GENERATOR, NULL, NULL);
+ 	unsigned char *buf, *p;
+ 	int len;
+ 
+-	if (dh == NULL) {
+-		i_fatal("DH_generate_parameters(bits=%d, gen=%d) failed: %s",
++	if (dh == NULL)
++	{
++		i_error("DH_generate_parameters(bits=%d, gen=%d) failed: %s",
+ 			bitsize, DH_GENERATOR, ssl_last_error());
++		return -1;
+ 	}
+ 
+ 	len = i2d_DHparams(dh, NULL);
+@@ -54,15 +56,20 @@ static void generate_dh_parameters(int b
+ 	    write_full(fd, buf, len) < 0)
+ 		i_fatal("write_full() failed for file %s: %m", fname);
+ 	i_free(buf);
++	return 0;
+ }
+ 
+ void ssl_generate_parameters(int fd, const char *fname)
+ {
+ 	unsigned int i;
+-	int bits;
++	int bits, ret=1;
+ 
+ 	for (i = 0; i < N_ELEMENTS(dh_param_bitsizes); i++)
+-		generate_dh_parameters(dh_param_bitsizes[i], fd, fname);
++		ret &= generate_dh_parameters(dh_param_bitsizes[i], fd, fname);
++	if (ret)
++	{
++		i_fatal("Unable to generate any DH parameter");
++	}
+ 	bits = 0;
+ 	if (write_full(fd, &bits, sizeof(bits)) < 0)
+ 		i_fatal("write_full() failed for file %s: %m", fname);

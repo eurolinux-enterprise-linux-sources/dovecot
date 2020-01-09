@@ -1,0 +1,27 @@
+diff -up dovecot-2.0.9/src/master/main.c.stderrclose dovecot-2.0.9/src/master/main.c
+--- dovecot-2.0.9/src/master/main.c.stderrclose	2015-02-26 15:54:27.607651850 +0100
++++ dovecot-2.0.9/src/master/main.c	2015-02-26 15:54:27.617651810 +0100
+@@ -778,14 +778,21 @@ int main(int argc, char *argv[])
+ 	if (services_listen(services) <= 0)
+ 		i_fatal("Failed to start listeners");
+ 
+-	if (!foreground)
+-		daemonize();
+ 	if (chdir(set->base_dir) < 0)
+ 		i_fatal("chdir(%s) failed: %m", set->base_dir);
+ 
++	if (strcmp(services->service_set->log_path, "/dev/stderr") != 0 &&
++	    strcmp(services->service_set->info_log_path, "/dev/stderr") != 0 &&
++	    strcmp(services->service_set->debug_log_path, "/dev/stderr") != 0) {
++		if (dup2(null_fd, STDERR_FILENO) < 0)
++			i_fatal("dup2(null_fd) failed: %m");
++	}
+ 	i_set_fatal_handler(master_fatal_callback);
+ 	i_set_error_handler(orig_error_callback);
+ 
++	if (!foreground)
++		daemonize();
++
+ 	main_init(set);
+ 	master_service_run(master_service, NULL);
+ 	main_deinit();

@@ -1,0 +1,30 @@
+
+# HG changeset patch
+# User Timo Sirainen <tss@iki.fi>
+# Date 1295205310 -7200
+# Node ID c75a13e5b6784c1eaa677871b032edd13d94a984
+# Parent  113b54dcb950b4123bcff3817350522077879bf2
+mkdir_*chown/chgrp(): If chown() fails, rmdir() the directory.
+
+diff -r 113b54dcb950 -r c75a13e5b678 src/lib/mkdir-parents.c
+--- a/src/lib/mkdir-parents.c	Sun Jan 16 18:53:27 2011 +0200
++++ b/src/lib/mkdir-parents.c	Sun Jan 16 21:15:10 2011 +0200
+@@ -33,12 +33,16 @@
+ 		return -1;
+ 	}
+ 	if (chown(path, uid, gid) < 0) {
++		orig_errno = errno;
++		if (rmdir(path) < 0)
++			i_error("rmdir(%s) failed: %m", path);
++		errno = orig_errno;
++
+ 		if (errno == EPERM && uid == (uid_t)-1) {
+ 			i_error("%s", eperm_error_get_chgrp("chown", path, gid,
+ 							    gid_origin));
+ 			return -1;
+ 		}
+-		orig_errno = errno;
+ 
+ 		str = t_str_new(256);
+ 		str_printfa(str, "chown(%s, %ld", path,
+
