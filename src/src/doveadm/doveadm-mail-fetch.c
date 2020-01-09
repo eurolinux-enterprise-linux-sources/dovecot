@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -15,6 +15,7 @@
 #include "mail-storage.h"
 #include "mail-search.h"
 #include "mail-namespace.h"
+#include "imap-msgpart.h"
 #include "doveadm-print.h"
 #include "doveadm-mail.h"
 #include "doveadm-mailbox-list-iter.h"
@@ -25,7 +26,6 @@
 struct fetch_cmd_context {
 	struct doveadm_mail_cmd_context ctx;
 
-	struct ostream *output;
 	struct mail *mail;
 
 	ARRAY(struct fetch_field) fields;
@@ -33,6 +33,9 @@ struct fetch_cmd_context {
 	enum mail_fetch_field wanted_fields;
 
 	const struct fetch_field *cur_field;
+	/* if print() returns -1, log this error if non-NULL. otherwise log
+	   the storage error. */
+	const char *print_error;
 };
 
 struct fetch_field {
@@ -107,32 +110,26 @@ static int fetch_modseq(struct fetch_cmd_context *ctx)
 	return 0;
 }
 
+static void
+fetch_set_istream_error(struct fetch_cmd_context *ctx, struct istream *input)
+{
+	ctx->print_error = t_strdup_printf("read(%s) failed: %s",
+		i_stream_get_name(input), i_stream_get_error(input));
+}
+
 static int fetch_hdr(struct fetch_cmd_context *ctx)
 {
 	struct istream *input;
 	struct message_size hdr_size;
-	const unsigned char *data;
-	size_t size;
-	int ret = 0;
+	int ret;
 
 	if (mail_get_hdr_stream(ctx->mail, &hdr_size, &input) < 0)
 		return -1;
 
 	input = i_stream_create_limit(input, hdr_size.physical_size);
-	while (!i_stream_is_eof(input)) {
-		if (i_stream_read_data(input, &data, &size, 0) == -1)
-			break;
-		if (size == 0)
-			break;
-		doveadm_print_stream(data, size);
-		i_stream_skip(input, size);
-	}
-	if (input->stream_errno != 0) {
-		i_error("read() failed: %m");
-		ret = -1;
-	}
+	if ((ret = doveadm_print_istream(input) < 0))
+		fetch_set_istream_error(ctx, input);
 	i_stream_unref(&input);
-	doveadm_print_stream("", 0);
 	return ret;
 }
 
@@ -140,15 +137,19 @@ static int fetch_hdr_field(struct fetch_cmd_context *ctx)
 {
 	const char *const *value, *filter, *name = ctx->cur_field->name;
 	string_t *str = t_str_new(256);
-	unsigned int pos;
 	bool add_lf = FALSE;
 
 	filter = strchr(name, '.');
 	if (filter != NULL)
 		name = t_strdup_until(name, filter++);
 
-	if (mail_get_headers(ctx->mail, name, &value) < 0)
-		return -1;
+	if (filter != NULL && strcmp(filter, "utf8") == 0) {
+		if (mail_get_headers_utf8(ctx->mail, name, &value) < 0)
+			return -1;
+	} else {
+		if (mail_get_headers(ctx->mail, name, &value) < 0)
+			return -1;
+	}
 
 	for (; *value != NULL; value++) {
 		if (add_lf)
@@ -157,13 +158,8 @@ static int fetch_hdr_field(struct fetch_cmd_context *ctx)
 		add_lf = TRUE;
 	}
 
-	if (filter == NULL) {
+	if (filter == NULL || strcmp(filter, "utf8") == 0) {
 		/* print the header as-is */
-	} else if (strcmp(filter, "utf8") == 0) {
-		pos = str_len(str);
-		message_header_decode_utf8(str_data(str), str_len(str),
-					   str, FALSE);
-		str_delete(str, 0, pos);
 	} else if (strcmp(filter, "address") == 0 ||
 		   strcmp(filter, "address_name") == 0 ||
 		   strcmp(filter, "address_name.utf8") == 0) {
@@ -190,7 +186,7 @@ static int fetch_hdr_field(struct fetch_cmd_context *ctx)
 				else {
 					message_header_decode_utf8(
 						(const void *)addr->name,
-						strlen(addr->name), str, FALSE);
+						strlen(addr->name), str, NULL);
 				}
 			}
 			add_lf = TRUE;
@@ -202,57 +198,68 @@ static int fetch_hdr_field(struct fetch_cmd_context *ctx)
 	return 0;
 }
 
+static int fetch_body_field(struct fetch_cmd_context *ctx)
+{
+	const char *name = ctx->cur_field->name;
+	struct imap_msgpart *msgpart;
+	struct imap_msgpart_open_result result;
+	bool binary;
+	int ret;
+
+	binary = strncmp(name, "binary.", 7) == 0;
+	name += binary ? 7 : 5;
+	if (imap_msgpart_parse(name, &msgpart) < 0)
+		i_unreached(); /* we already verified this was ok */
+	if (binary)
+		imap_msgpart_set_decode_to_binary(msgpart);
+
+	if (imap_msgpart_open(ctx->mail, msgpart, &result) < 0) {
+		imap_msgpart_free(&msgpart);
+		return -1;
+	}
+	if ((ret = doveadm_print_istream(result.input) < 0))
+		fetch_set_istream_error(ctx, result.input);
+	i_stream_unref(&result.input);
+	imap_msgpart_free(&msgpart);
+	return ret;
+}
+
 static int fetch_body(struct fetch_cmd_context *ctx)
 {
 	struct istream *input;
 	struct message_size hdr_size;
-	const unsigned char *data;
-	size_t size;
-	int ret = 0;
+	int ret;
 
 	if (mail_get_stream(ctx->mail, &hdr_size, NULL, &input) < 0)
 		return -1;
 
 	i_stream_skip(input, hdr_size.physical_size);
-	while (!i_stream_is_eof(input)) {
-		if (i_stream_read_data(input, &data, &size, 0) == -1)
-			break;
-		if (size == 0)
-			break;
-		doveadm_print_stream(data, size);
-		i_stream_skip(input, size);
-	}
-	if (input->stream_errno != 0) {
-		i_error("read() failed: %m");
-		ret = -1;
-	}
-	doveadm_print_stream("", 0);
+	if ((ret = doveadm_print_istream(input) < 0))
+		fetch_set_istream_error(ctx, input);
 	return ret;
+}
+
+static int fetch_body_snippet(struct fetch_cmd_context *ctx)
+{
+	const char *value;
+
+	if (mail_get_special(ctx->mail, MAIL_FETCH_BODY_SNIPPET, &value) < 0)
+		return -1;
+	/* [0] contains the snippet algorithm, skip over it */
+	i_assert(value[0] != '\0');
+	doveadm_print(value + 1);
+	return 0;
 }
 
 static int fetch_text(struct fetch_cmd_context *ctx)
 {
 	struct istream *input;
-	const unsigned char *data;
-	size_t size;
-	int ret = 0;
+	int ret;
 
 	if (mail_get_stream(ctx->mail, NULL, NULL, &input) < 0)
 		return -1;
-
-	while (!i_stream_is_eof(input)) {
-		if (i_stream_read_data(input, &data, &size, 0) == -1)
-			break;
-		if (size == 0)
-			break;
-		doveadm_print_stream(data, size);
-		i_stream_skip(input, size);
-	}
-	if (input->stream_errno != 0) {
-		i_error("read() failed: %m");
-		ret = -1;
-	}
-	doveadm_print_stream("", 0);
+	if ((ret = doveadm_print_istream(input) < 0))
+		fetch_set_istream_error(ctx, input);
 	return ret;
 }
 
@@ -301,7 +308,8 @@ static int fetch_text_utf8(struct fetch_cmd_context *ctx)
 
 	doveadm_print_stream("", 0);
 	if (input->stream_errno != 0) {
-		i_error("read() failed: %m");
+		i_error("read(%s) failed: %s", i_stream_get_name(input),
+			i_stream_get_error(input));
 		return -1;
 	}
 	return 0;
@@ -363,6 +371,38 @@ static int fetch_date_saved(struct fetch_cmd_context *ctx)
 	return 0;
 }
 
+static int fetch_date_received_unixtime(struct fetch_cmd_context *ctx)
+{
+	time_t t;
+
+	if (mail_get_received_date(ctx->mail, &t) < 0)
+		return -1;
+	doveadm_print(dec2str(t));
+	return 0;
+}
+
+static int fetch_date_sent_unixtime(struct fetch_cmd_context *ctx)
+{
+	time_t t;
+	int tz;
+
+	if (mail_get_date(ctx->mail, &t, &tz) < 0)
+		return -1;
+
+	doveadm_print(dec2str(t));
+	return 0;
+}
+
+static int fetch_date_saved_unixtime(struct fetch_cmd_context *ctx)
+{
+	time_t t;
+
+	if (mail_get_save_date(ctx->mail, &t) < 0)
+		return -1;
+	doveadm_print(dec2str(t));
+	return 0;
+}
+
 static int fetch_imap_envelope(struct fetch_cmd_context *ctx)
 {
 	const char *value;
@@ -402,6 +442,36 @@ static int fetch_pop3_uidl(struct fetch_cmd_context *ctx)
 	return 0;
 }
 
+static int fetch_pop3_order(struct fetch_cmd_context *ctx)
+{
+	const char *value;
+
+	if (mail_get_special(ctx->mail, MAIL_FETCH_POP3_ORDER, &value) < 0)
+		return -1;
+	doveadm_print(value);
+	return 0;
+}
+
+static int fetch_refcount(struct fetch_cmd_context *ctx)
+{
+	const char *value;
+
+	if (mail_get_special(ctx->mail, MAIL_FETCH_REFCOUNT, &value) < 0)
+		return -1;
+	doveadm_print(value);
+	return 0;
+}
+
+static int fetch_storageid(struct fetch_cmd_context *ctx)
+{
+	const char *value;
+
+	if (mail_get_special(ctx->mail, MAIL_FETCH_STORAGE_ID, &value) < 0)
+		return -1;
+	doveadm_print(value);
+	return 0;
+}
+
 static const struct fetch_field fetch_fields[] = {
 	{ "user",          0,                        fetch_user },
 	{ "mailbox",       0,                        fetch_mailbox },
@@ -413,6 +483,7 @@ static const struct fetch_field fetch_fields[] = {
 	{ "modseq",        0,                        fetch_modseq },
 	{ "hdr",           MAIL_FETCH_STREAM_HEADER, fetch_hdr },
 	{ "body",          MAIL_FETCH_STREAM_BODY,   fetch_body },
+	{ "body.snippet",  MAIL_FETCH_BODY_SNIPPET,  fetch_body_snippet },
 	{ "text",          MAIL_FETCH_STREAM_HEADER |
 	                   MAIL_FETCH_STREAM_BODY,   fetch_text },
 	{ "text.utf8",     MAIL_FETCH_STREAM_HEADER |
@@ -422,10 +493,16 @@ static const struct fetch_field fetch_fields[] = {
 	{ "date.received", MAIL_FETCH_RECEIVED_DATE, fetch_date_received },
 	{ "date.sent",     MAIL_FETCH_DATE,          fetch_date_sent },
 	{ "date.saved",    MAIL_FETCH_SAVE_DATE,     fetch_date_saved },
+	{ "date.received.unixtime", MAIL_FETCH_RECEIVED_DATE, fetch_date_received_unixtime },
+	{ "date.sent.unixtime",     MAIL_FETCH_DATE,          fetch_date_sent_unixtime },
+	{ "date.saved.unixtime",    MAIL_FETCH_SAVE_DATE,     fetch_date_saved_unixtime },
 	{ "imap.envelope", MAIL_FETCH_IMAP_ENVELOPE, fetch_imap_envelope },
 	{ "imap.body",     MAIL_FETCH_IMAP_BODY,     fetch_imap_body },
 	{ "imap.bodystructure", MAIL_FETCH_IMAP_BODYSTRUCTURE, fetch_imap_bodystructure },
-	{ "pop3.uidl",     MAIL_FETCH_UIDL_BACKEND,  fetch_pop3_uidl }
+	{ "pop3.uidl",     MAIL_FETCH_UIDL_BACKEND,  fetch_pop3_uidl },
+	{ "pop3.order",    MAIL_FETCH_POP3_ORDER,    fetch_pop3_order },
+	{ "refcount",      MAIL_FETCH_REFCOUNT,      fetch_refcount },
+	{ "storageid",     MAIL_FETCH_STORAGE_ID,    fetch_storageid }
 };
 
 static const struct fetch_field *fetch_field_find(const char *name)
@@ -443,7 +520,7 @@ static void print_fetch_fields(void)
 {
 	unsigned int i;
 
-	fprintf(stderr, "Available fetch fields: %s", fetch_fields[0].name);
+	fprintf(stderr, "Available fetch fields: hdr.<name> body.<section> binary.<section> %s", fetch_fields[0].name);
 	for (i = 1; i < N_ELEMENTS(fetch_fields); i++)
 		fprintf(stderr, " %s", fetch_fields[i].name);
 	fprintf(stderr, "\n");
@@ -453,10 +530,14 @@ static void parse_fetch_fields(struct fetch_cmd_context *ctx, const char *str)
 {
 	const char *const *fields, *name;
 	const struct fetch_field *field;
-	struct fetch_field hdr_field;
+	struct fetch_field hdr_field, body_field;
+	struct imap_msgpart *msgpart;
 
-	memset(&hdr_field, 0, sizeof(hdr_field));
+	i_zero(&hdr_field);
 	hdr_field.print = fetch_hdr_field;
+
+	i_zero(&body_field);
+	body_field.print = fetch_body_field;
 
 	t_array_init(&ctx->fields, 32);
 	t_array_init(&ctx->header_fields, 32);
@@ -465,20 +546,31 @@ static void parse_fetch_fields(struct fetch_cmd_context *ctx, const char *str)
 		name = t_str_lcase(*fields);
 
 		doveadm_print_header_simple(name);
-		if (strncmp(name, "hdr.", 4) == 0) {
+		if ((field = fetch_field_find(name)) != NULL) {
+			ctx->wanted_fields |= field->wanted_fields;
+			array_append(&ctx->fields, field, 1);
+		} else if (strncmp(name, "hdr.", 4) == 0) {
 			name += 4;
 			hdr_field.name = name;
 			array_append(&ctx->fields, &hdr_field, 1);
 			name = t_strcut(name, '.');
 			array_append(&ctx->header_fields, &name, 1);
-		} else {
-			field = fetch_field_find(name);
-			if (field == NULL) {
+		} else if (strncmp(name, "body.", 5) == 0 ||
+			   strncmp(name, "binary.", 7) == 0) {
+			bool binary = strncmp(name, "binary.", 7) == 0;
+			body_field.name = t_strarray_join(t_strsplit(name, ","), " ");
+
+			name += binary ? 7 : 5;
+			if (imap_msgpart_parse(name, &msgpart) < 0) {
 				print_fetch_fields();
-				i_fatal("Unknown fetch field: %s", name);
+				i_fatal("Unknown fetch section: %s", name);
 			}
-			ctx->wanted_fields |= field->wanted_fields;
-			array_append(&ctx->fields, field, 1);
+			array_append(&ctx->fields, &body_field, 1);
+			ctx->wanted_fields |= imap_msgpart_get_fetch_data(msgpart);
+			imap_msgpart_free(&msgpart);
+		} else {
+			print_fetch_fields();
+			i_fatal("Unknown fetch field: %s", name);
 		}
 	}
 	array_append_zero(&ctx->header_fields);
@@ -495,8 +587,11 @@ static int cmd_fetch_mail(struct fetch_cmd_context *ctx)
 		if (field->print(ctx) < 0) {
 			i_error("fetch(%s) failed for box=%s uid=%u: %s",
 				field->name, mailbox_get_vname(mail->box),
-				mail->uid, mailbox_get_last_error(mail->box, NULL));
+				mail->uid,
+				ctx->print_error != NULL ? ctx->print_error :
+				mailbox_get_last_internal_error(mail->box, NULL));
 			doveadm_mail_failed_mailbox(&ctx->ctx, mail->box);
+			ctx->print_error = NULL;
 			ret = -1;
 		}
 	}
@@ -512,6 +607,7 @@ cmd_fetch_box(struct fetch_cmd_context *ctx, const struct mailbox_info *info)
 	if (doveadm_mail_iter_init(&ctx->ctx, info, ctx->ctx.search_args,
 				   ctx->wanted_fields,
 				   array_idx(&ctx->header_fields, 0),
+				   FALSE,
 				   &iter) < 0)
 		return -1;
 
@@ -548,13 +644,6 @@ cmd_fetch_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	return ret;
 }
 
-static void cmd_fetch_deinit(struct doveadm_mail_cmd_context *_ctx)
-{
-	struct fetch_cmd_context *ctx = (struct fetch_cmd_context *)_ctx;
-
-	o_stream_unref(&ctx->output);
-}
-
 static void cmd_fetch_init(struct doveadm_mail_cmd_context *_ctx,
 			   const char *const args[])
 {
@@ -566,9 +655,6 @@ static void cmd_fetch_init(struct doveadm_mail_cmd_context *_ctx,
 
 	parse_fetch_fields(ctx, fetch_fields);
 	_ctx->search_args = doveadm_mail_build_search_args(args + 1);
-
-	ctx->output = o_stream_create_fd(STDOUT_FILENO, 0, FALSE);
-	o_stream_set_no_error_handling(ctx->output, TRUE);
 }
 
 static struct doveadm_mail_cmd_context *cmd_fetch_alloc(void)
@@ -578,11 +664,18 @@ static struct doveadm_mail_cmd_context *cmd_fetch_alloc(void)
 	ctx = doveadm_mail_cmd_alloc(struct fetch_cmd_context);
 	ctx->ctx.v.init = cmd_fetch_init;
 	ctx->ctx.v.run = cmd_fetch_run;
-	ctx->ctx.v.deinit = cmd_fetch_deinit;
-	doveadm_print_init("pager");
+	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
 	return &ctx->ctx;
 }
 
-struct doveadm_mail_cmd cmd_fetch = {
-	cmd_fetch_alloc, "fetch", "<fields> <search query>"
+struct doveadm_cmd_ver2 doveadm_cmd_fetch_ver2 = {
+	.name = "fetch",
+	.mail_cmd = cmd_fetch_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX"<fields> <search query>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "field", CMD_PARAM_ARRAY, 0)
+DOVEADM_CMD_PARAM('\0', "fieldstr", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL | CMD_PARAM_FLAG_DO_NOT_EXPOSE) /* FIXME: horrible hack, remove me when possible */
+DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

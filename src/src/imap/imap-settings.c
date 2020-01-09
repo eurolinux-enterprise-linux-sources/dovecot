@@ -1,14 +1,14 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
 #include "settings-parser.h"
 #include "service-settings.h"
 #include "mail-storage-settings.h"
+#include "lda-settings.h"
 #include "imap-settings.h"
 
 #include <stddef.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 static bool imap_settings_verify(void *_set, pool_t pool,
@@ -16,13 +16,15 @@ static bool imap_settings_verify(void *_set, pool_t pool,
 
 /* <settings checks> */
 static struct file_listener_settings imap_unix_listeners_array[] = {
-	{ "login/imap", 0666, "", "" }
+	{ "login/imap", 0666, "", "" },
+	{ "imap-master", 0600, "", "" }
 };
 static struct file_listener_settings *imap_unix_listeners[] = {
-	&imap_unix_listeners_array[0]
+	&imap_unix_listeners_array[0],
+	&imap_unix_listeners_array[1]
 };
 static buffer_t imap_unix_listeners_buf = {
-	imap_unix_listeners, sizeof(imap_unix_listeners), { 0, }
+	imap_unix_listeners, sizeof(imap_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 
@@ -61,6 +63,7 @@ struct service_settings imap_service_settings = {
 
 static const struct setting_define imap_setting_defines[] = {
 	DEF(SET_BOOL, verbose_proctitle),
+	DEF(SET_STR_VARS, rawlog_dir),
 
 	DEF(SET_SIZE, imap_max_line_length),
 	DEF(SET_TIME, imap_idle_notify_interval),
@@ -69,16 +72,19 @@ static const struct setting_define imap_setting_defines[] = {
 	DEF(SET_STR, imap_logout_format),
 	DEF(SET_STR, imap_id_send),
 	DEF(SET_STR, imap_id_log),
+	DEF(SET_ENUM, imap_fetch_failure),
 	DEF(SET_BOOL, imap_metadata),
+	DEF(SET_TIME, imap_hibernate_timeout),
 
 	DEF(SET_STR, imap_urlauth_host),
-	DEF(SET_UINT, imap_urlauth_port),
+	DEF(SET_IN_PORT, imap_urlauth_port),
 
 	SETTING_DEFINE_LIST_END
 };
 
 static const struct imap_settings imap_default_settings = {
 	.verbose_proctitle = FALSE,
+	.rawlog_dir = "",
 
 	/* RFC-2683 recommends at least 8000 bytes. Some clients however don't
 	   break large message sets to multiple commands, so we're pretty
@@ -90,7 +96,9 @@ static const struct imap_settings imap_default_settings = {
 	.imap_logout_format = "in=%i out=%o",
 	.imap_id_send = "name *",
 	.imap_id_log = "",
+	.imap_fetch_failure = "disconnect-immediately:disconnect-after:no-after",
 	.imap_metadata = FALSE,
+	.imap_hibernate_timeout = 0,
 
 	.imap_urlauth_host = "",
 	.imap_urlauth_port = 143
@@ -98,6 +106,7 @@ static const struct imap_settings imap_default_settings = {
 
 static const struct setting_parser_info *imap_setting_dependencies[] = {
 	&mail_user_setting_parser_info,
+	&lda_setting_parser_info,
 	NULL
 };
 
@@ -163,6 +172,18 @@ imap_settings_verify(void *_set, pool_t pool ATTR_UNUSED, const char **error_r)
 
 	if (imap_settings_parse_workarounds(set, error_r) < 0)
 		return FALSE;
+
+	if (strcmp(set->imap_fetch_failure, "disconnect-immediately") == 0)
+		set->parsed_fetch_failure = IMAP_CLIENT_FETCH_FAILURE_DISCONNECT_IMMEDIATELY;
+	else if (strcmp(set->imap_fetch_failure, "disconnect-after") == 0)
+		set->parsed_fetch_failure = IMAP_CLIENT_FETCH_FAILURE_DISCONNECT_AFTER;
+	else if (strcmp(set->imap_fetch_failure, "no-after") == 0)
+		set->parsed_fetch_failure = IMAP_CLIENT_FETCH_FAILURE_NO_AFTER;
+	else {
+		*error_r = t_strdup_printf("Unknown imap_fetch_failure: %s",
+					   set->imap_fetch_failure);
+		return FALSE;
+	}
 	return TRUE;
 }
 /* </settings checks> */

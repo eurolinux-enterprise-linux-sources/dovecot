@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -15,7 +15,7 @@ static struct file_listener_settings *config_unix_listeners[] = {
 	&config_unix_listeners_array[0]
 };
 static buffer_t config_unix_listeners_buf = {
-	config_unix_listeners, sizeof(config_unix_listeners), { 0, }
+	config_unix_listeners, sizeof(config_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 
@@ -36,7 +36,7 @@ struct service_settings config_service_settings = {
 	.process_limit = 0,
 	.client_limit = 0,
 	.service_count = 0,
-	.idle_kill = 0,
+	.idle_kill = UINT_MAX,
 	.vsz_limit = (uoff_t)-1,
 
 	.unix_listeners = { { &config_unix_listeners_buf,

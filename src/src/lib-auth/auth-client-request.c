@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -8,7 +8,6 @@
 #include "auth-server-connection.h"
 #include "auth-client-request.h"
 
-#include <stdlib.h>
 
 struct auth_client_request {
 	pool_t pool;
@@ -43,6 +42,8 @@ static void auth_server_send_new_request(struct auth_server_connection *conn,
 		str_append(str, "\tno-penalty");
 	if ((info->flags & AUTH_REQUEST_FLAG_VALID_CLIENT_CERT) != 0)
 		str_append(str, "\tvalid-client-cert");
+	if ((info->flags & AUTH_REQUEST_FLAG_DEBUG) != 0)
+		str_append(str, "\tdebug");
 
 	if (info->session_id != NULL) {
 		str_append(str, "\tsession=");
@@ -79,7 +80,21 @@ static void auth_server_send_new_request(struct auth_server_connection *conn,
 	if (info->real_remote_port != 0 &&
 	    info->real_remote_port != info->remote_port)
 		str_printfa(str, "\treal_rport=%u", info->real_remote_port);
-
+	if (info->local_name != NULL &&
+	    *info->local_name != '\0') {
+		str_append(str, "\tlocal_name=");
+		str_append_tabescaped(str, info->local_name);
+	}
+	if (info->client_id != NULL &&
+	    *info->client_id != '\0') {
+		str_append(str, "\tclient_id=");
+		str_append_tabescaped(str, info->client_id);
+	}
+	if (info->forward_fields != NULL &&
+	    *info->forward_fields != '\0') {
+		str_append(str, "\tforward_fields=");
+		str_append_tabescaped(str, info->forward_fields);
+	}
 	if (info->initial_resp_base64 != NULL) {
 		str_append(str, "\tresp=");
 		str_append_tabescaped(str, info->initial_resp_base64);
@@ -165,6 +180,9 @@ void auth_client_request_abort(struct auth_client_request **_request)
 
 	auth_client_send_cancel(request->conn->client, request->id);
 	call_callback(request, AUTH_REQUEST_STATUS_ABORT, NULL, NULL);
+	/* remove the request */
+	auth_server_connection_remove_request(request->conn, request->id);
+	pool_unref(&request->pool);
 }
 
 unsigned int auth_client_request_get_id(struct auth_client_request *request)

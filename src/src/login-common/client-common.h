@@ -1,12 +1,16 @@
 #ifndef CLIENT_COMMON_H
 #define CLIENT_COMMON_H
 
+struct module;
+
 #include "net.h"
 #include "login-proxy.h"
 #include "sasl-server.h"
 #include "master-login.h" /* for LOGIN_MAX_SESSION_ID_LEN */
 
+#define LOGIN_MAX_SESSION_ID_LEN 64
 #define LOGIN_MAX_MASTER_PREFIX_LEN 128
+#define LOGIN_MAX_CLIENT_ID_LEN 256
 
 /* max. size of input buffer. this means:
 
@@ -33,6 +37,8 @@
 #define AUTH_MASTER_WAITING_MSG \
 	"Waiting for authentication master process to respond.."
 
+struct master_service_connection;
+
 enum client_disconnect_reason {
 	CLIENT_DISCONNECT_TIMEOUT,
 	CLIENT_DISCONNECT_SYSTEM_SHUTDOWN,
@@ -55,13 +61,19 @@ enum client_auth_result {
 struct client_auth_reply {
 	const char *master_user, *reason;
 	/* for proxying */
-	const char *host, *hostip, *destuser, *password, *proxy_mech;
-	unsigned int port;
+	const char *host, *hostip, *source_ip;
+	const char *destuser, *password, *proxy_mech;
+	in_port_t port;
 	unsigned int proxy_timeout_msecs;
 	unsigned int proxy_refresh_secs;
 	enum login_proxy_ssl_flags ssl_flags;
 
+	/* all the key=value fields returned by passdb */
+	const char *const *all_fields;
+
 	unsigned int proxy:1;
+	unsigned int proxy_nopipelining:1;
+	unsigned int proxy_not_trusted:1;
 	unsigned int temp:1;
 	unsigned int nologin:1;
 	unsigned int authz_failure:1;
@@ -90,12 +102,20 @@ struct client_vfuncs {
 	void (*proxy_reset)(struct client *client);
 	int (*proxy_parse_line)(struct client *client, const char *line);
 	void (*proxy_error)(struct client *client, const char *text);
+	const char *(*proxy_get_state)(struct client *client);
+	void (*send_raw_data)(struct client *client,
+			      const void *data, size_t size);
+	bool (*input_next_cmd)(struct client *client);
+	void (*free)(struct client *client);
 };
 
 struct client {
 	struct client *prev, *next;
 	pool_t pool;
+	/* this pool gets free'd once proxying starts */
+	pool_t preproxy_pool;
 	struct client_vfuncs v;
+	struct client_vfuncs *vlast;
 
 	time_t created;
 	int refcount;
@@ -103,12 +123,15 @@ struct client {
 	struct ip_addr local_ip;
 	struct ip_addr ip;
 	struct ip_addr real_remote_ip, real_local_ip;
-	unsigned int local_port, remote_port;
-	unsigned int real_local_port, real_remote_port;
+	in_port_t local_port, remote_port;
+	in_port_t real_local_port, real_remote_port;
 	struct ssl_proxy *ssl_proxy;
 	const struct login_settings *set;
 	const struct master_service_ssl_settings *ssl_set;
-	const char *session_id;
+	const char *session_id, *listener_name, *postlogin_socket_path;
+	const char *local_name;
+	string_t *client_id;
+	string_t *forward_fields;
 
 	int fd;
 	struct istream *input;
@@ -124,7 +147,6 @@ struct client {
 	char *proxy_user, *proxy_master_user, *proxy_password;
 	const struct dsasl_client_mech *proxy_mech;
 	struct dsasl_client *proxy_sasl_client;
-	unsigned int proxy_state;
 	unsigned int proxy_ttl;
 
 	char *auth_mech_name;
@@ -132,6 +154,7 @@ struct client {
 	string_t *auth_response;
 	time_t auth_first_started, auth_finished;
 	const char *sasl_final_resp;
+	const char *const *auth_passdb_args;
 
 	unsigned int master_auth_id;
 	unsigned int master_tag;
@@ -141,7 +164,18 @@ struct client {
 	unsigned int auth_attempts, auth_successes;
 	pid_t mail_pid;
 
-	char *virtual_user, *virtual_user_orig;
+	/* Module-specific contexts. */
+	ARRAY(union login_client_module_context *) module_contexts;
+
+	char *virtual_user, *virtual_user_orig, *virtual_auth_user;
+	/* passdb user_* fields are set here after a successful auth.
+	   This is a NULL-terminated array where fields are in the same order
+	   as in global_alt_usernames. If some field doesn't exist, it's "".
+	   Can also be NULL if there are no user_* fields. */
+	const char **alt_usernames;
+	/* director_username_hash cached, if non-zero */
+	unsigned int director_username_hash_cache;
+
 	unsigned int destroyed:1;
 	unsigned int input_blocked:1;
 	unsigned int login_success:1;
@@ -150,6 +184,7 @@ struct client {
 	unsigned int secured:1;
 	unsigned int trusted:1;
 	unsigned int ssl_servername_settings_read:1;
+	unsigned int banner_sent:1;
 	unsigned int authenticating:1;
 	unsigned int auth_tried_disabled_plaintext:1;
 	unsigned int auth_tried_unsupported_mech:1;
@@ -157,6 +192,8 @@ struct client {
 	unsigned int auth_initializing:1;
 	unsigned int auth_process_comm_fail:1;
 	unsigned int proxy_auth_failed:1;
+	unsigned int proxy_nopipelining:1;
+	unsigned int proxy_not_trusted:1;
 	unsigned int auth_waiting:1;
 	unsigned int auth_user_disabled:1;
 	unsigned int auth_pass_expired:1;
@@ -165,14 +202,29 @@ struct client {
 	/* ... */
 };
 
+union login_client_module_context {
+	struct client_vfuncs super;
+	struct login_module_register *reg;
+};
+
+struct login_client_hooks {
+	void (*client_allocated)(struct client *client);
+};
+
 extern struct client *clients;
+
+typedef void login_client_allocated_func_t(struct client *client);
+
+void login_client_hooks_add(struct module *module,
+			    const struct login_client_hooks *hooks);
+void login_client_hooks_remove(const struct login_client_hooks *hooks);
 
 struct client *
 client_create(int fd, bool ssl, pool_t pool,
+	      const struct master_service_connection *conn,
 	      const struct login_settings *set,
 	      const struct master_service_ssl_settings *ssl_set,
-	      void **other_sets,
-	      const struct ip_addr *local_ip, const struct ip_addr *remote_ip);
+	      void **other_sets);
 void client_destroy(struct client *client, const char *reason);
 void client_destroy_success(struct client *client, const char *reason);
 void client_destroy_internal_failure(struct client *client);
@@ -184,6 +236,8 @@ void client_cmd_starttls(struct client *client);
 
 unsigned int clients_get_count(void) ATTR_PURE;
 
+void client_add_forward_field(struct client *client, const char *key,
+			      const char *value);
 void client_set_title(struct client *client);
 void client_log(struct client *client, const char *msg);
 void client_log_err(struct client *client, const char *msg);
@@ -207,6 +261,9 @@ void client_notify_disconnect(struct client *client,
 
 void client_send_raw_data(struct client *client, const void *data, size_t size);
 void client_send_raw(struct client *client, const char *data);
+void client_common_send_raw_data(struct client *client,
+				 const void *data, size_t size);
+void client_common_default_free(struct client *client);
 
 void client_set_auth_waiting(struct client *client);
 void client_auth_send_challenge(struct client *client, const char *data);
@@ -219,10 +276,14 @@ int client_auth_read_line(struct client *client);
 void client_proxy_finish_destroy_client(struct client *client);
 void client_proxy_log_failure(struct client *client, const char *line);
 void client_proxy_failed(struct client *client, bool send_line);
+const char *client_proxy_get_state(struct client *client);
 
 void clients_notify_auth_connected(void);
 void client_destroy_oldest(void);
 void clients_destroy_all(void);
 void clients_destroy_all_reason(const char *reason);
+
+void client_common_init(void);
+void client_common_deinit(void);
 
 #endif

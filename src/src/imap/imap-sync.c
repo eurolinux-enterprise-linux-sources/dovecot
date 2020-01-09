@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "str.h"
@@ -11,46 +11,7 @@
 #include "imap-fetch.h"
 #include "imap-notify.h"
 #include "imap-commands.h"
-#include "imap-sync.h"
-
-struct client_sync_context {
-	/* if multiple commands are in progress, we may need to wait for them
-	   to finish before syncing mailbox. */
-	unsigned int counter;
-	enum mailbox_sync_flags flags;
-	enum imap_sync_flags imap_flags;
-	const char *tagline;
-	imap_sync_callback_t *callback;
-};
-
-struct imap_sync_context {
-	struct client *client;
-	struct mailbox *box;
-        enum imap_sync_flags imap_flags;
-
-	struct mailbox_transaction_context *t;
-	struct mailbox_sync_context *sync_ctx;
-	struct mail *mail;
-
-	struct mailbox_status status;
-	struct mailbox_sync_status sync_status;
-
-	struct mailbox_sync_rec sync_rec;
-	ARRAY_TYPE(keywords) tmp_keywords;
-	ARRAY_TYPE(seq_range) expunges;
-	uint32_t seq;
-
-	ARRAY_TYPE(seq_range) search_adds, search_removes;
-	unsigned int search_update_idx;
-
-	unsigned int messages_count;
-
-	unsigned int failed:1;
-	unsigned int finished:1;
-	unsigned int no_newmail:1;
-	unsigned int have_new_mails:1;
-	unsigned int search_update_notifying:1;
-};
+#include "imap-sync-private.h"
 
 static void uids_to_seqs(struct mailbox *box, ARRAY_TYPE(seq_range) *uids)
 {
@@ -222,6 +183,7 @@ imap_sync_init(struct client *client, struct mailbox *box,
 	ctx->client = client;
 	ctx->box = box;
 	ctx->imap_flags = imap_flags;
+	i_array_init(&ctx->module_contexts, 5);
 
 	/* make sure user can't DoS the system by causing Dovecot to create
 	   tons of useless namespaces. */
@@ -229,7 +191,8 @@ imap_sync_init(struct client *client, struct mailbox *box,
 
 	ctx->sync_ctx = mailbox_sync_init(box, flags);
 	ctx->t = mailbox_transaction_begin(box, 0);
-	ctx->mail = mail_alloc(ctx->t, MAIL_FETCH_FLAGS, 0);
+	mailbox_transaction_set_reason(ctx->t, "Mailbox sync");
+	ctx->mail = mail_alloc(ctx->t, MAIL_FETCH_FLAGS, NULL);
 	ctx->messages_count = client->messages_count;
 	i_array_init(&ctx->tmp_keywords, client->keywords.announce_count + 8);
 
@@ -316,7 +279,7 @@ static int imap_sync_finish(struct imap_sync_context *ctx, bool aborting)
 	if (mailbox_sync_deinit(&ctx->sync_ctx, &ctx->sync_status) < 0 ||
 	    ctx->failed) {
 		ctx->failed = TRUE;
-		return -1;
+		ret = -1;
 	}
 	mailbox_get_open_status(ctx->box, STATUS_UIDVALIDITY |
 				STATUS_MESSAGES | STATUS_RECENT |
@@ -326,6 +289,13 @@ static int imap_sync_finish(struct imap_sync_context *ctx, bool aborting)
 		/* most clients would get confused by this. disconnect them. */
 		client_disconnect_with_error(client,
 					     "Mailbox UIDVALIDITY changed");
+	}
+	if (mailbox_is_inconsistent(ctx->box)) {
+		client_disconnect_with_error(client,
+			"IMAP session state is inconsistent, please relogin.");
+		/* we can't trust status information anymore, so don't try to
+		   sync message counts. */
+		return -1;
 	}
 	if (!ctx->no_newmail && !aborting) {
 		if (ctx->status.messages < ctx->messages_count)
@@ -363,6 +333,9 @@ static int imap_sync_notify_more(struct imap_sync_context *ctx)
 	   now it contains added/removed messages. */
 	if ((ret = imap_sync_send_search_updates(ctx, FALSE)) < 0)
 		ctx->failed = TRUE;
+
+	if (ret > 0)
+		ret = ctx->client->v.sync_notify_more(ctx);
 	return ret;
 }
 
@@ -384,6 +357,7 @@ int imap_sync_deinit(struct imap_sync_context *ctx,
 	}
 
 	array_free(&ctx->tmp_keywords);
+	array_free(&ctx->module_contexts);
 	i_free(ctx);
 	return ret;
 }
@@ -415,8 +389,7 @@ static int imap_sync_send_flags(struct imap_sync_context *ctx, string_t *str)
 	str_printfa(str, "* %u FETCH (", ctx->seq);
 	if (ctx->imap_flags & IMAP_SYNC_FLAG_SEND_UID)
 		str_printfa(str, "UID %u ", ctx->mail->uid);
-	if ((mailbox_get_enabled_features(ctx->box) &
-	     MAILBOX_FEATURE_CONDSTORE) != 0 &&
+	if ((ctx->client->enabled_features & MAILBOX_FEATURE_CONDSTORE) != 0 &&
 	    !ctx->client->nonpermanent_modseqs) {
 		imap_sync_add_modseq(ctx, str);
 		str_append_c(str, ' ');
@@ -639,9 +612,6 @@ bool imap_sync_is_allowed(struct client *client)
 
 static bool cmd_finish_sync(struct client_command_context *cmd)
 {
-	if (cmd->sync->callback != NULL)
-		return cmd->sync->callback(cmd);
-
 	if (cmd->sync->tagline != NULL)
 		client_send_tagline(cmd, cmd->sync->tagline);
 	return TRUE;
@@ -679,11 +649,12 @@ static bool cmd_sync_continue(struct client_command_context *sync_cmd)
 		if (cmd->state == CLIENT_COMMAND_STATE_WAIT_SYNC &&
 		    cmd != sync_cmd &&
 		    cmd->sync->counter+1 == client->sync_counter) {
-			if (cmd_finish_sync(cmd))
-				client_command_free(&cmd);
+			cmd_finish_sync(cmd);
+			client_command_free(&cmd);
 		}
 	}
-	return cmd_finish_sync(sync_cmd);
+	cmd_finish_sync(sync_cmd);
+	return TRUE;
 }
 
 static void get_common_sync_flags(struct client *client,
@@ -756,10 +727,8 @@ static bool cmd_sync_client(struct client_command_context *sync_cmd)
 	return TRUE;
 }
 
-static bool ATTR_NULL(4, 5)
-cmd_sync_full(struct client_command_context *cmd, enum mailbox_sync_flags flags,
-	      enum imap_sync_flags imap_flags, const char *tagline,
-	      imap_sync_callback_t *callback)
+bool cmd_sync(struct client_command_context *cmd, enum mailbox_sync_flags flags,
+	      enum imap_sync_flags imap_flags, const char *tagline)
 {
 	struct client *client = cmd->client;
 
@@ -768,20 +737,20 @@ cmd_sync_full(struct client_command_context *cmd, enum mailbox_sync_flags flags,
 	if (cmd->cancel)
 		return TRUE;
 
+	cmd->stats.last_run_timeval = ioloop_timeval;
 	if (client->mailbox == NULL) {
 		/* no mailbox selected, no point in delaying the sync */
-		i_assert(callback == NULL);
 		if (tagline != NULL)
 			client_send_tagline(cmd, tagline);
 		return TRUE;
 	}
+	cmd->tagline_reply = p_strdup(cmd->pool, tagline);
 
-	cmd->sync = p_new(cmd->pool, struct client_sync_context, 1);
+	cmd->sync = p_new(cmd->pool, struct imap_client_sync_context, 1);
 	cmd->sync->counter = client->sync_counter;
 	cmd->sync->flags = flags;
 	cmd->sync->imap_flags = imap_flags;
-	cmd->sync->tagline = p_strdup(cmd->pool, tagline);
-	cmd->sync->callback = callback;
+	cmd->sync->tagline = cmd->tagline_reply;
 	cmd->state = CLIENT_COMMAND_STATE_WAIT_SYNC;
 
 	cmd->func = NULL;
@@ -790,20 +759,6 @@ cmd_sync_full(struct client_command_context *cmd, enum mailbox_sync_flags flags,
 	if (client->input_lock == cmd)
 		client->input_lock = NULL;
 	return FALSE;
-}
-
-bool cmd_sync(struct client_command_context *cmd, enum mailbox_sync_flags flags,
-	      enum imap_sync_flags imap_flags, const char *tagline)
-{
-	return cmd_sync_full(cmd, flags, imap_flags, tagline, NULL);
-}
-
-bool cmd_sync_callback(struct client_command_context *cmd,
-		       enum mailbox_sync_flags flags,
-		       enum imap_sync_flags imap_flags,
-		       imap_sync_callback_t *callback)
-{
-	return cmd_sync_full(cmd, flags, imap_flags, NULL, callback);
 }
 
 static bool cmd_sync_drop_fast(struct client *client)
@@ -823,10 +778,9 @@ static bool cmd_sync_drop_fast(struct client *client)
 
 		i_assert(cmd->sync != NULL);
 		if ((cmd->sync->flags & MAILBOX_SYNC_FLAG_FAST) != 0) {
-			if (cmd_finish_sync(cmd)) {
-				client_command_free(&cmd);
-				ret = TRUE;
-			}
+			cmd_finish_sync(cmd);
+			client_command_free(&cmd);
+			ret = TRUE;
 		}
 	}
 	return ret;

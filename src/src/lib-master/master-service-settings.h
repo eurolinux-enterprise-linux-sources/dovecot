@@ -15,10 +15,14 @@ struct master_service_settings {
 	const char *debug_log_path;
 	const char *log_timestamp;
 	const char *syslog_facility;
+	const char *import_environment;
 	uoff_t config_cache_size;
 	bool version_ignore;
 	bool shutdown_clients;
 	bool verbose_proctitle;
+
+	const char *haproxy_trusted_networks;
+	unsigned int haproxy_timeout;
 };
 
 struct master_service_settings_input {
@@ -63,6 +67,9 @@ extern const struct setting_parser_info master_service_setting_parser_info;
 /* Try to open the config socket if it's going to be needed later by
    master_service_settings_read*() */
 void master_service_config_socket_try_open(struct master_service *service);
+int master_service_settings_get_filters(struct master_service *service,
+					const char *const **filters,
+					const char **error_r);
 int master_service_settings_read(struct master_service *service,
 				 const struct master_service_settings_input *input,
 				 struct master_service_settings_output *output_r,

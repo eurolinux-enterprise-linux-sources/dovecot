@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -146,18 +146,12 @@ static int mailbox_log_rotate_if_needed(struct mailbox_log *log)
 void mailbox_log_record_set_timestamp(struct mailbox_log_record *rec,
 				      time_t stamp)
 {
-	rec->timestamp[0] = (stamp & 0xff000000) >> 24;
-	rec->timestamp[1] = (stamp & 0x00ff0000) >> 16;
-	rec->timestamp[2] = (stamp & 0x0000ff00) >> 8;
-	rec->timestamp[3] = (stamp & 0x000000ff);
+	cpu32_to_be_unaligned(stamp, rec->timestamp);
 }
 
 time_t mailbox_log_record_get_timestamp(const struct mailbox_log_record *rec)
 {
-	return ((time_t)rec->timestamp[0] << 24) |
-		((time_t)rec->timestamp[1] << 16) |
-		((time_t)rec->timestamp[2] << 8) |
-		(time_t)rec->timestamp[3];
+	return (time_t) be32_to_cpu_unaligned(rec->timestamp);
 }
 
 int mailbox_log_append(struct mailbox_log *log,
@@ -176,6 +170,7 @@ int mailbox_log_append(struct mailbox_log *log,
 	if (log->fd == -1) {
 		if (mailbox_log_open(log) < 0)
 			return -1;
+		i_assert(log->fd != -1);
 	}
 
 	/* We don't bother with locking, atomic appends will protect us.
@@ -276,8 +271,7 @@ mailbox_log_iter_next(struct mailbox_log_iter *iter)
 			(iter->count - iter->idx) * sizeof(iter->buf[0]);
 		i_error("Corrupted mailbox log %s at offset %"PRIuUOFF_T": "
 			"type=%d", iter->filepath, offset, rec->type);
-		if (unlink(iter->filepath) < 0)
-			i_error("unlink(%s) failed: %m", iter->filepath);
+		i_unlink(iter->filepath);
 		return NULL;
 	}
 	return rec;

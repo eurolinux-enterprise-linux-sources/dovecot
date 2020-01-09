@@ -1,13 +1,11 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
 #include "mail-user-hash.h"
 #include "mail-host.h"
-#include "user-directory.h"
 #include "test-common.h"
 
-#include <stdlib.h>
 
 #define USER_DIR_TIMEOUT 1000000
 
@@ -21,7 +19,7 @@ verify_user_directory(struct user_directory *dir, unsigned int user_count)
 	struct user *user, *prev = NULL;
 	unsigned int prev_stamp = 0, iter_count = 0;
 
-	iter = user_directory_iter_init(dir);
+	iter = user_directory_iter_init(dir, FALSE);
 	while ((user = user_directory_iter_next(iter)) != NULL) {
 		test_assert(prev_stamp <= user->timestamp);
 		test_assert(user->prev == prev);
@@ -43,7 +41,7 @@ static void test_user_directory_ascending(void)
 	unsigned int i;
 
 	test_begin("user directory ascending");
-	dir = user_directory_init(USER_DIR_TIMEOUT, "%u");
+	dir = user_directory_init(USER_DIR_TIMEOUT, NULL);
 	(void)user_directory_add(dir, 1, host, ioloop_time + count+1);
 
 	for (i = 0; i < count; i++)
@@ -61,7 +59,7 @@ static void test_user_directory_descending(void)
 	unsigned int i;
 
 	test_begin("user directory descending");
-	dir = user_directory_init(USER_DIR_TIMEOUT, "%u");
+	dir = user_directory_init(USER_DIR_TIMEOUT, NULL);
 
 	for (i = 0; i < count; i++)
 		(void)user_directory_add(dir, i+1, host, ioloop_time - i);
@@ -78,7 +76,7 @@ static void test_user_directory_random(void)
 	unsigned int i, count = 10000 + rand()%10000;
 
 	test_begin("user directory random");
-	dir = user_directory_init(USER_DIR_TIMEOUT, "%u");
+	dir = user_directory_init(USER_DIR_TIMEOUT, NULL);
 	for (i = 0; i < count; i++) {
 		if (rand() % 10 == 0)
 			timestamp = ioloop_time;
@@ -99,6 +97,8 @@ int main(void)
 		test_user_directory_random,
 		NULL
 	};
-	ioloop_time = 1234567890;
-	return test_run(test_functions);
+	struct ioloop *ioloop = io_loop_create();
+	int ret = test_run(test_functions);
+	io_loop_destroy(&ioloop);
+	return ret;
 }

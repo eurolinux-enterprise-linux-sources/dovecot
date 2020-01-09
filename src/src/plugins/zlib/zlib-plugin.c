@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -12,7 +12,6 @@
 #include "compression.h"
 #include "zlib-plugin.h"
 
-#include <stdlib.h>
 #include <fcntl.h>
 
 #define ZLIB_PLUGIN_DEFAULT_LEVEL 6
@@ -27,10 +26,9 @@
 #define MAX_INBUF_SIZE (1024*1024)
 #define ZLIB_MAIL_CACHE_EXPIRE_MSECS (60*1000)
 
-struct zlib_transaction_context {
-	union mailbox_transaction_module_context module_ctx;
-
-	struct mail *tmp_mail;
+struct zlib_mail {
+	union mail_module_context module_ctx;
+	bool verifying_save;
 };
 
 struct zlib_mail_cache {
@@ -58,6 +56,14 @@ static MODULE_CONTEXT_DEFINE_INIT(zlib_storage_module,
 				  &mail_storage_module_register);
 static MODULE_CONTEXT_DEFINE_INIT(zlib_mail_module, &mail_module_register);
 
+static bool zlib_mailbox_is_permail(struct mailbox *box)
+{
+	enum mail_storage_class_flags class_flags = box->storage->class_flags;
+
+	return (class_flags & MAIL_STORAGE_CLASS_FLAG_OPEN_STREAMS) == 0 &&
+		(class_flags & MAIL_STORAGE_CLASS_FLAG_BINARY_DATA) != 0;
+}
+
 static void zlib_mail_cache_close(struct zlib_user *zuser)
 {
 	struct zlib_mail_cache *cache = &zuser->cache;
@@ -66,18 +72,19 @@ static void zlib_mail_cache_close(struct zlib_user *zuser)
 		timeout_remove(&cache->to);
 	if (cache->input != NULL)
 		i_stream_unref(&cache->input);
-	memset(cache, 0, sizeof(*cache));
+	i_zero(cache);
 }
 
 static struct istream *
 zlib_mail_cache_open(struct zlib_user *zuser, struct mail *mail,
-		     struct istream *input)
+		     struct istream *input, bool do_cache)
 {
 	struct zlib_mail_cache *cache = &zuser->cache;
 	struct istream *inputs[2];
 	string_t *temp_prefix = t_str_new(128);
 
-	zlib_mail_cache_close(zuser);
+	if (do_cache)
+		zlib_mail_cache_close(zuser);
 
 	/* zlib istream is seekable, but very slow. create a seekable istream
 	   which we can use to quickly seek around in the stream that's been
@@ -97,15 +104,18 @@ zlib_mail_cache_open(struct zlib_user *zuser, struct mail *mail,
 						 i_stream_get_name(inputs[0])));
 	i_stream_unref(&inputs[0]);
 
-	cache->to = timeout_add(ZLIB_MAIL_CACHE_EXPIRE_MSECS,
-				zlib_mail_cache_close, zuser);
-	cache->box = mail->box;
-	cache->uid = mail->uid;
-	cache->input = input;
-
-	/* index-mail wants the stream to be destroyed at close, so create
-	   a new stream instead of just increasing reference. */
-	return i_stream_create_limit(cache->input, (uoff_t)-1);
+	if (do_cache) {
+		cache->to = timeout_add(ZLIB_MAIL_CACHE_EXPIRE_MSECS,
+					zlib_mail_cache_close, zuser);
+		cache->box = mail->box;
+		cache->uid = mail->uid;
+		cache->input = input;
+		/* index-mail wants the stream to be destroyed at close, so create
+		   a new stream instead of just increasing reference. */
+		return i_stream_create_limit(cache->input, (uoff_t)-1);
+	} else {
+		return input;
+	}
 }
 
 static int zlib_istream_opened(struct mail *_mail, struct istream **stream)
@@ -113,24 +123,23 @@ static int zlib_istream_opened(struct mail *_mail, struct istream **stream)
 	struct zlib_user *zuser = ZLIB_USER_CONTEXT(_mail->box->storage->user);
 	struct zlib_mail_cache *cache = &zuser->cache;
 	struct mail_private *mail = (struct mail_private *)_mail;
-	union mail_module_context *zmail = ZLIB_MAIL_CONTEXT(mail);
+	struct zlib_mail *zmail = ZLIB_MAIL_CONTEXT(mail);
 	struct istream *input;
 	const struct compression_handler *handler;
 
-	/* don't uncompress input when we are reading a mail that we're just
-	   in the middle of saving, and we didn't do the compression ourself.
-	   in such situation we're probably checking if the user-given input
-	   looks compressed */
-	if (_mail->saving && zuser->save_handler == NULL)
-		return zmail->super.istream_opened(_mail, stream);
+	if (zmail->verifying_save) {
+		/* zlib_mail_save_finish() is verifying that the user-given
+		   input doesn't look compressed. */
+		return zmail->module_ctx.super.istream_opened(_mail, stream);
+	}
 
-	if (cache->uid == _mail->uid && cache->box == _mail->box) {
+	if (_mail->uid > 0 && cache->uid == _mail->uid && cache->box == _mail->box) {
 		/* use the cached stream. when doing partial reads it should
 		   already be seeked into the wanted offset. */
 		i_stream_unref(stream);
 		i_stream_seek(cache->input, 0);
 		*stream = i_stream_create_limit(cache->input, (uoff_t)-1);
-		return zmail->super.istream_opened(_mail, stream);
+		return zmail->module_ctx.super.istream_opened(_mail, stream);
 	}
 
 	handler = compression_detect_handler(*stream);
@@ -145,103 +154,65 @@ static int zlib_istream_opened(struct mail *_mail, struct istream **stream)
 		input = *stream;
 		*stream = handler->create_istream(input, TRUE);
 		i_stream_unref(&input);
-
-		*stream = zlib_mail_cache_open(zuser, _mail, *stream);
+		/* dont cache the stream if _mail->uid is 0 */
+		*stream = zlib_mail_cache_open(zuser, _mail, *stream, (_mail->uid > 0));
 	}
-	return zmail->super.istream_opened(_mail, stream);
+	return zmail->module_ctx.super.istream_opened(_mail, stream);
+}
+
+static void zlib_mail_close(struct mail *_mail)
+{
+	struct mail_private *mail = (struct mail_private *)_mail;
+	struct zlib_mail *zmail = ZLIB_MAIL_CONTEXT(mail);
+	struct zlib_user *zuser = ZLIB_USER_CONTEXT(_mail->box->storage->user);
+	struct zlib_mail_cache *cache = &zuser->cache;
+	uoff_t size;
+
+	if (_mail->uid > 0 && cache->uid == _mail->uid && cache->box == _mail->box) {
+		/* make sure we have read the entire email into the seekable
+		   stream (which causes the original input stream to be
+		   unrefed). we can't safely keep the original input stream
+		   open after the mail is closed. */
+		if (i_stream_get_size(cache->input, TRUE, &size) < 0)
+			zlib_mail_cache_close(zuser);
+	}
+	zmail->module_ctx.super.close(_mail);
 }
 
 static void zlib_mail_allocated(struct mail *_mail)
 {
-	struct zlib_transaction_context *zt = ZLIB_CONTEXT(_mail->transaction);
 	struct mail_private *mail = (struct mail_private *)_mail;
 	struct mail_vfuncs *v = mail->vlast;
-	union mail_module_context *zmail;
+	struct zlib_mail *zmail;
 
-	if (zt == NULL)
+	if (!zlib_mailbox_is_permail(_mail->box))
 		return;
 
-	zmail = p_new(mail->pool, union mail_module_context, 1);
-	zmail->super = *v;
-	mail->vlast = &zmail->super;
+	zmail = p_new(mail->pool, struct zlib_mail, 1);
+	zmail->module_ctx.super = *v;
+	mail->vlast = &zmail->module_ctx.super;
 
 	v->istream_opened = zlib_istream_opened;
-	MODULE_CONTEXT_SET_SELF(mail, zlib_mail_module, zmail);
-}
-
-static struct mailbox_transaction_context *
-zlib_mailbox_transaction_begin(struct mailbox *box,
-			       enum mailbox_transaction_flags flags)
-{
-	union mailbox_module_context *zbox = ZLIB_CONTEXT(box);
-	struct mailbox_transaction_context *t;
-	struct zlib_transaction_context *zt;
-
-	t = zbox->super.transaction_begin(box, flags);
-
-	zt = i_new(struct zlib_transaction_context, 1);
-
-	MODULE_CONTEXT_SET(t, zlib_storage_module, zt);
-	return t;
-}
-
-static void
-zlib_mailbox_transaction_rollback(struct mailbox_transaction_context *t)
-{
-	union mailbox_module_context *zbox = ZLIB_CONTEXT(t->box);
-	struct zlib_transaction_context *zt = ZLIB_CONTEXT(t);
-
-	if (zt->tmp_mail != NULL)
-		mail_free(&zt->tmp_mail);
-
-	zbox->super.transaction_rollback(t);
-	i_free(zt);
-}
-
-static int
-zlib_mailbox_transaction_commit(struct mailbox_transaction_context *t,
-				struct mail_transaction_commit_changes *changes_r)
-{
-	union mailbox_module_context *zbox = ZLIB_CONTEXT(t->box);
-	struct zlib_transaction_context *zt = ZLIB_CONTEXT(t);
-	int ret;
-
-	if (zt->tmp_mail != NULL)
-		mail_free(&zt->tmp_mail);
-
-	ret = zbox->super.transaction_commit(t, changes_r);
-	i_free(zt);
-	return ret;
-}
-
-static int
-zlib_mail_save_begin(struct mail_save_context *ctx, struct istream *input)
-{
-	struct mailbox_transaction_context *t = ctx->transaction;
-	struct zlib_transaction_context *zt = ZLIB_CONTEXT(t);
-	union mailbox_module_context *zbox = ZLIB_CONTEXT(t->box);
-
-	if (ctx->dest_mail == NULL) {
-		if (zt->tmp_mail == NULL) {
-			zt->tmp_mail = mail_alloc(t, MAIL_FETCH_PHYSICAL_SIZE,
-						  NULL);
-		}
-		ctx->dest_mail = zt->tmp_mail;
-	}
-
-	return zbox->super.save_begin(ctx, input);
+	v->close = zlib_mail_close;
+	MODULE_CONTEXT_SET(mail, zlib_mail_module, zmail);
 }
 
 static int zlib_mail_save_finish(struct mail_save_context *ctx)
 {
 	struct mailbox *box = ctx->transaction->box;
 	union mailbox_module_context *zbox = ZLIB_CONTEXT(box);
+	struct mail_private *mail = (struct mail_private *)ctx->dest_mail;
+	struct zlib_mail *zmail = ZLIB_MAIL_CONTEXT(mail);
 	struct istream *input;
+	int ret;
 
 	if (zbox->super.save_finish(ctx) < 0)
 		return -1;
 
-	if (mail_get_stream(ctx->dest_mail, NULL, NULL, &input) < 0)
+	zmail->verifying_save = TRUE;
+	ret = mail_get_stream(ctx->dest_mail, NULL, NULL, &input);
+	zmail->verifying_save = FALSE;
+	if (ret < 0)
 		return -1;
 
 	if (compression_detect_handler(input) != NULL) {
@@ -277,11 +248,7 @@ zlib_permail_alloc_init(struct mailbox *box, struct mailbox_vfuncs *v)
 {
 	struct zlib_user *zuser = ZLIB_USER_CONTEXT(box->storage->user);
 
-	v->transaction_begin = zlib_mailbox_transaction_begin;
-	v->transaction_rollback = zlib_mailbox_transaction_rollback;
-	v->transaction_commit = zlib_mailbox_transaction_commit;
 	if (zuser->save_handler == NULL) {
-		v->save_begin = zlib_mail_save_begin;
 		v->save_finish = zlib_mail_save_finish;
 	} else {
 		v->save_begin = zlib_mail_save_compress_begin;
@@ -314,7 +281,7 @@ static int zlib_mailbox_open_input(struct mailbox *box)
 			i_close_fd(&fd);
 			return 0;
 		}
-		input = i_stream_create_fd(fd, MAX_INBUF_SIZE, TRUE);
+		input = i_stream_create_fd_autoclose(&fd, MAX_INBUF_SIZE);
 		i_stream_set_name(input, box_path);
 		box->input = handler->create_istream(input, TRUE);
 		i_stream_unref(&input);
@@ -351,7 +318,6 @@ static void zlib_mailbox_allocated(struct mailbox *box)
 {
 	struct mailbox_vfuncs *v = box->vlast;
 	union mailbox_module_context *zbox;
-	enum mail_storage_class_flags class_flags = box->storage->class_flags;
 
 	zbox = p_new(box->pool, union mailbox_module_context, 1);
 	zbox->super = *v;
@@ -361,8 +327,7 @@ static void zlib_mailbox_allocated(struct mailbox *box)
 
 	MODULE_CONTEXT_SET_SELF(box, zlib_storage_module, zbox);
 
-	if ((class_flags & MAIL_STORAGE_CLASS_FLAG_OPEN_STREAMS) == 0 &&
-	    (class_flags & MAIL_STORAGE_CLASS_FLAG_BINARY_DATA) != 0)
+	if (zlib_mailbox_is_permail(box))
 		zlib_permail_alloc_init(box, v);
 }
 

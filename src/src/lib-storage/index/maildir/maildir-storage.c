@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -51,7 +51,7 @@ maildir_storage_create(struct mail_storage *_storage, struct mail_namespace *ns,
 	struct mailbox_list *list = ns->list;
 	const char *dir;
 
-	storage->set = mail_storage_get_driver_settings(_storage);
+	storage->set = mail_namespace_get_driver_settings(ns, _storage);
 
 	storage->temp_prefix = p_strdup(_storage->pool,
 					mailbox_list_get_temp_prefix(list));
@@ -361,8 +361,8 @@ static int maildir_mailbox_open(struct mailbox *box)
 	}
 	root_dir = mailbox_list_get_root_forced(box->list,
 						MAILBOX_LIST_PATH_TYPE_MAILBOX);
-	if (strcmp(box_path, root_dir) == 0) {
-		/* root directory. either INBOX or some other namespace root */
+	if (strcmp(box_path, root_dir) == 0 && !box->inbox_any) {
+		/* root directory for some namespace. */
 		errno = ENOENT;
 	} else if (stat(box_path, &st) == 0) {
 		/* yes, we'll need to create the missing dirs */
@@ -579,11 +579,11 @@ static void maildir_notify_changes(struct mailbox *box)
 	const char *box_path = mailbox_get_path(box);
 
 	if (box->notify_callback == NULL)
-		index_mailbox_check_remove_all(&mbox->box);
+		mailbox_watch_remove_all(&mbox->box);
 	else {
-		index_mailbox_check_add(&mbox->box,
+		mailbox_watch_add(&mbox->box,
 			t_strconcat(box_path, "/new", NULL));
-		index_mailbox_check_add(&mbox->box,
+		mailbox_watch_add(&mbox->box,
 			t_strconcat(box_path, "/cur", NULL));
 	}
 }
@@ -604,7 +604,7 @@ static void maildir_storage_add_list(struct mail_storage *storage,
 
 	mlist = p_new(list->pool, struct maildir_mailbox_list_context, 1);
 	mlist->module_ctx.super = list->v;
-	mlist->set = mail_storage_get_driver_settings(storage);
+	mlist->set = mail_namespace_get_driver_settings(list->ns, storage);
 
 	list->v.is_internal_name = maildir_is_internal_name;
 	MODULE_CONTEXT_SET(list, maildir_mailbox_list_module, mlist);
@@ -678,7 +678,8 @@ struct mail_storage maildir_storage = {
 		maildir_storage_get_list_settings,
 		maildir_storage_autodetect,
 		maildir_mailbox_alloc,
-		NULL
+		NULL,
+		NULL,
 	}
 };
 

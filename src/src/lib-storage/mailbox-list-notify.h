@@ -30,7 +30,8 @@ struct mailbox_list_notify {
 };
 
 struct mailbox_list_notify_rec {
-	enum mailbox_list_notify_event event;
+	/* Each record can contain multiple events */
+	enum mailbox_list_notify_event events;
 
 	/* For all events: */
 	const char *storage_name, *vname;
@@ -40,6 +41,8 @@ struct mailbox_list_notify_rec {
 	/* For rename: */
 	const char *old_vname;
 };
+
+typedef void mailbox_list_notify_callback_t(void *);
 
 /* Monitor for specified changes in the mailbox list.
    Returns 0 if ok, -1 if notifications aren't supported. */
@@ -54,6 +57,11 @@ int mailbox_list_notify_next(struct mailbox_list_notify *notify,
 			     const struct mailbox_list_notify_rec **rec_r);
 /* Call the specified callback when something changes. */
 void mailbox_list_notify_wait(struct mailbox_list_notify *notify,
-			      void (*callback)(void *context), void *context);
+			      mailbox_list_notify_callback_t *callback, void *context);
+#define mailbox_list_notify_wait(notify, callback, context) \
+	mailbox_list_notify_wait(notify + CALLBACK_TYPECHECK(callback, void (*)(typeof(context))), \
+				(mailbox_list_notify_callback_t*)callback, context);
+/* Flush any delayed notifications now. */
+void mailbox_list_notify_flush(struct mailbox_list_notify *notify);
 
 #endif

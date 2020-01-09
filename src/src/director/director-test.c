@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 /*
    This program accepts incoming unauthenticated IMAP connections from
@@ -22,12 +22,12 @@
 #include "write-full.h"
 #include "hash.h"
 #include "llist.h"
+#include "strescape.h"
 #include "imap-parser.h"
 #include "master-service.h"
 #include "master-service-settings.h"
 #include "director-settings.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 #define IMAP_PORT 14300
@@ -388,7 +388,7 @@ static void director_connection_destroy(struct director_connection **_conn)
 static void client_connected(struct master_service_connection *conn)
 {
 	struct ip_addr local_ip, remote_ip;
-	unsigned int local_port;
+	in_port_t local_port;
 
 	if (net_getsockname(conn->fd, &local_ip, &local_port) < 0)
 		i_fatal("net_getsockname() failed: %m");
@@ -460,7 +460,7 @@ static struct admin_connection *admin_connect(const char *path)
 					    admin_random_action, conn);
 
 	net_set_nonblock(conn->fd, FALSE);
-	conn->input = i_stream_create_fd(conn->fd, (size_t)-1, TRUE);
+	conn->input = i_stream_create_fd(conn->fd, (size_t)-1, FALSE);
 	admin_send(conn, DIRECTOR_ADMIN_HANDSHAKE);
 
 	line = i_stream_read_next_line(conn->input);
@@ -498,7 +498,7 @@ static void admin_read_hosts(struct admin_connection *conn)
 			break;
 		/* ip vhost-count user-count */
 		T_BEGIN {
-			const char *const *args = t_strsplit_tab(line);
+			const char *const *args = t_strsplit_tabescaped(line);
 			struct host *host;
 
 			host = i_new(struct host, 1);

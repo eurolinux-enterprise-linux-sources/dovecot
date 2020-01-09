@@ -1,10 +1,9 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "env-util.h"
 
-#include <stdlib.h>
 #ifdef __APPLE__
 #  include <crt_externs.h>
 #endif
@@ -37,7 +36,7 @@ void env_remove(const char *name)
 #endif
 #else
 	extern char **environ;
-	unsigned int len;
+	size_t len;
 	char **envp;
 
 	len = strlen(name);

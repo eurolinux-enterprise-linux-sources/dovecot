@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
@@ -14,8 +14,10 @@ struct child_wait {
 	void *context;
 };
 
+static int child_wait_refcount = 0;
+
 /* pid_t => wait */
-HASH_TABLE(void *, struct child_wait *) child_pids;
+static HASH_TABLE(void *, struct child_wait *) child_pids;
 
 #undef child_wait_new_with_pid
 struct child_wait *
@@ -90,6 +92,8 @@ sigchld_handler(const siginfo_t *si ATTR_UNUSED, void *context ATTR_UNUSED)
 
 void child_wait_init(void)
 {
+	if (child_wait_refcount++ > 0) return;
+
 	hash_table_create_direct(&child_pids, default_pool, 0);
 
 	lib_signals_set_handler(SIGCHLD, LIBSIG_FLAGS_SAFE,
@@ -101,6 +105,9 @@ void child_wait_deinit(void)
 	struct hash_iterate_context *iter;
 	void *key;
 	struct child_wait *value;
+
+	i_assert(child_wait_refcount > 0);
+	if (--child_wait_refcount > 0) return;
 
 	lib_signals_unset_handler(SIGCHLD, sigchld_handler, NULL);
 

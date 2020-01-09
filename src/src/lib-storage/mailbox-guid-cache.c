@@ -1,6 +1,7 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "ioloop.h"
 #include "hash.h"
 #include "mail-storage.h"
 #include "mailbox-list-private.h"
@@ -17,12 +18,13 @@ int mailbox_guid_cache_find(struct mailbox_list *list,
 	const struct mailbox_guid_cache_rec *rec;
 	const uint8_t *guid_p = guid;
 
-	if (!hash_table_is_created(list->guid_cache)) {
+	if (!hash_table_is_created(list->guid_cache) ||
+	    list->guid_cache_invalidated) {
 		mailbox_guid_cache_refresh(list);
 		rec = hash_table_lookup(list->guid_cache, guid_p);
 	} else {
 		rec = hash_table_lookup(list->guid_cache, guid_p);
-		if (rec == NULL) {
+		if (rec == NULL && list->guid_cache_updated) {
 			mailbox_guid_cache_refresh(list);
 			rec = hash_table_lookup(list->guid_cache, guid_p);
 		}
@@ -53,6 +55,8 @@ void mailbox_guid_cache_refresh(struct mailbox_list *list)
 		hash_table_clear(list->guid_cache, TRUE);
 		p_clear(list->guid_cache_pool);
 	}
+	list->guid_cache_invalidated = FALSE;
+	list->guid_cache_updated = FALSE;
 	list->guid_cache_errors = FALSE;
 
 	ctx = mailbox_list_iter_init(list, "*",
@@ -67,8 +71,13 @@ void mailbox_guid_cache_refresh(struct mailbox_list *list)
 		if (mailbox_get_metadata(box, MAILBOX_METADATA_GUID,
 					 &metadata) < 0) {
 			i_error("Couldn't get mailbox %s GUID: %s",
-				info->vname, mailbox_get_last_error(box, NULL));
+				info->vname, mailbox_get_last_internal_error(box, NULL));
 			list->guid_cache_errors = TRUE;
+		} else if ((rec = hash_table_lookup(list->guid_cache,
+				(const uint8_t *)metadata.guid)) != NULL) {
+			i_warning("Mailbox %s has duplicate GUID with %s: %s",
+				  info->vname, rec->vname,
+				  guid_128_to_string(metadata.guid));
 		} else {
 			rec = p_new(list->guid_cache_pool,
 				    struct mailbox_guid_cache_rec, 1);

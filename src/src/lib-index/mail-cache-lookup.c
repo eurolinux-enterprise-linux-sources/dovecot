@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,7 +6,6 @@
 #include "str.h"
 #include "mail-cache-private.h"
 
-#include <stdlib.h>
 
 #define CACHE_PREFETCH IO_BLOCK_SIZE
 
@@ -145,7 +144,7 @@ void mail_cache_lookup_iter_init(struct mail_cache_view *view, uint32_t seq,
 	if (!view->cache->opened)
 		(void)mail_cache_open_and_verify(view->cache);
 
-	memset(ctx, 0, sizeof(*ctx));
+	i_zero(ctx);
 	ctx->view = view;
 	ctx->seq = seq;
 
@@ -160,7 +159,7 @@ void mail_cache_lookup_iter_init(struct mail_cache_view *view, uint32_t seq,
 	}
 	ctx->remap_counter = view->cache->remap_counter;
 
-	memset(&view->loop_track, 0, sizeof(view->loop_track));
+	i_zero(&view->loop_track);
 }
 
 static bool
@@ -200,7 +199,7 @@ mail_cache_lookup_iter_next_record(struct mail_cache_lookup_iterate_ctx *ctx)
 				return 1;
 			ctx->memory_appends_checked = TRUE;
 		}
-		if (MAIL_CACHE_IS_UNUSABLE(view->cache))
+		if (MAIL_CACHE_IS_UNUSABLE(view->cache) || ctx->stop)
 			return 0;
 
 		/* check data already written to cache file */
@@ -211,7 +210,7 @@ mail_cache_lookup_iter_next_record(struct mail_cache_lookup_iterate_ctx *ctx)
 
 		ctx->disk_appends_checked = TRUE;
 		ctx->remap_counter = view->cache->remap_counter;
-		memset(&view->loop_track, 0, sizeof(view->loop_track));
+		i_zero(&view->loop_track);
 	}
 
 	if (ctx->stop)
@@ -478,9 +477,11 @@ static void header_lines_save(struct header_lookup_context *ctx,
 
 	hdr_data = p_new(ctx->pool, struct header_lookup_data, 1);
 	hdr_data->data_size = data_size;
-	hdr_data->data = data_dup = data_size == 0 ? NULL :
-		p_malloc(ctx->pool, data_size);
-	memcpy(data_dup, CONST_PTR_OFFSET(field->data, pos), data_size);
+	if (data_size > 0) {
+		hdr_data->data = data_dup =
+			p_malloc(ctx->pool, data_size);
+		memcpy(data_dup, CONST_PTR_OFFSET(field->data, pos), data_size);
+	}
 
 	for (i = 0; i < lines_count; i++) {
 		hdr_line.line_num = lines[i];
@@ -540,9 +541,9 @@ mail_cache_lookup_headers_real(struct mail_cache_view *view, string_t *dest,
 	field_state = buffer_get_modifiable_data(buf, NULL);
 
 	/* lookup the fields */
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.view = view;
-	ctx.pool = *pool_r = pool_alloconly_create("mail cache headers", 1024);
+	ctx.pool = *pool_r = pool_alloconly_create(MEMPOOL_GROWING"mail cache headers", 1024);
 	t_array_init(&ctx.lines, 32);
 
 	mail_cache_lookup_iter_init(view, seq, &iter);
@@ -609,4 +610,75 @@ int mail_cache_lookup_headers(struct mail_cache_view *view, string_t *dest,
 			pool_unref(&pool);
 	} T_END;
 	return ret;
+}
+
+static uint32_t
+mail_cache_get_highest_seq_with_cache(struct mail_cache_view *view,
+				      uint32_t below_seq, uint32_t *reset_id_r)
+{
+	struct mail_cache_missing_reason_cache *rc = &view->reason_cache;
+	uint32_t seq = below_seq-1, highest_checked_seq = 0;
+
+	/* find the newest mail that has anything in cache */
+	if (rc->log_file_head_offset == view->view->log_file_head_offset &&
+	    rc->log_file_head_seq == view->view->log_file_head_seq) {
+		/* reason_cache matches the current view - we can use it */
+		highest_checked_seq = rc->highest_checked_seq;
+	} else {
+		rc->log_file_head_offset = view->view->log_file_head_offset;
+		rc->log_file_head_seq = view->view->log_file_head_seq;
+	}
+	rc->highest_checked_seq = below_seq;
+
+	/* first check anything not already in reason_cache */
+	for (; seq > highest_checked_seq; seq--) {
+		if (mail_cache_lookup_cur_offset(view->view, seq, reset_id_r) != 0) {
+			rc->highest_seq_with_cache = seq;
+			rc->reset_id = *reset_id_r;
+			return seq;
+		}
+	}
+	if (seq == 0)
+		return 0;
+	/* then return the result from cache */
+	*reset_id_r = rc->reset_id;
+	return rc->highest_seq_with_cache;
+}
+
+const char *
+mail_cache_get_missing_reason(struct mail_cache_view *view, uint32_t seq)
+{
+	uint32_t offset, reset_id;
+
+	if (MAIL_CACHE_IS_UNUSABLE(view->cache))
+		return "Cache file is unusable";
+
+	offset = mail_cache_lookup_cur_offset(view->view, seq, &reset_id);
+	if (offset != 0) {
+		if (view->cache->hdr->file_seq != reset_id) {
+			return t_strdup_printf(
+				"Index reset_id=%u doesn't match cache reset_id=%u",
+				reset_id, view->cache->hdr->file_seq);
+		}
+		return t_strdup_printf(
+			"Mail has other cached fields, reset_id=%u", reset_id);
+	}
+	seq = mail_cache_get_highest_seq_with_cache(view, seq, &reset_id);
+	if (seq == 0) {
+		return t_strdup_printf("Cache file is empty, reset_id=%u",
+				       view->cache->hdr->file_seq);
+	}
+
+	uint32_t uid;
+	mail_index_lookup_uid(view->view, seq, &uid);
+
+	if (view->cache->hdr->file_seq != reset_id) {
+		return t_strdup_printf(
+			"Mail not cached, highest cached seq=%u uid=%u: "
+			"Index reset_id=%u doesn't match cache reset_id=%u",
+			seq, uid, reset_id, view->cache->hdr->file_seq);
+	}
+	return t_strdup_printf(
+		"Mail not cached, highest cached seq=%u uid=%u: reset_id=%u",
+		seq, uid, reset_id);
 }

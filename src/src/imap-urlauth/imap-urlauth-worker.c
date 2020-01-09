@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -28,7 +28,6 @@
 #include "imap-urlauth-fetch.h"
 #include "imap-urlauth-worker-settings.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <sysexits.h>
 
@@ -256,15 +255,12 @@ static void client_destroy(struct client *client)
 	if (client->ctrl_output != NULL)
 		o_stream_destroy(&client->ctrl_output);
 
-	if (client->fd_in >= 0)
-		net_disconnect(client->fd_in);
-	if (client->fd_out >= 0 && client->fd_in != client->fd_out)
-		net_disconnect(client->fd_out);
+	fd_close_maybe_stdio(&client->fd_in, &client->fd_out);
 	if (client->fd_ctrl >= 0)
 		net_disconnect(client->fd_ctrl);
 
 	if (client->service_user != NULL)
-		mail_storage_service_user_free(&client->service_user);
+		mail_storage_service_user_unref(&client->service_user);
 	i_free(client->access_user);
 	array_foreach_modifiable(&client->access_apps, app)
 		i_free(*app);
@@ -300,7 +296,7 @@ static int client_run_url(struct client *client)
 	}
 
 	if (client->msg_part_input->eof) {
-		o_stream_send(client->output, "\n", 1);
+		(void)o_stream_send(client->output, "\n", 1);
 		imap_msgpart_url_free(&client->url);
 		return 1;
 	}
@@ -373,30 +369,27 @@ client_fetch_urlpart(struct client *client, const char *url,
 	if ((url_flags & IMAP_URLAUTH_FETCH_FLAG_BINARY) != 0)
 		imap_msgpart_url_set_decode_to_binary(client->url);
 	if ((url_flags & IMAP_URLAUTH_FETCH_FLAG_BODYPARTSTRUCTURE) != 0) {
-		if (imap_msgpart_url_get_bodypartstructure(client->url,
-							   bpstruct_r,
-							   &error) <= 0) {
-			if (ret < 0)
-				return -1;
+		ret = imap_msgpart_url_get_bodypartstructure(client->url,
+							     bpstruct_r, &error);
+		if (ret <= 0) {
 			*errormsg_r = t_strdup_printf(
 				"Failed to read URLAUTH \"%s\": %s", url, error);
 			if (client->debug)
 				i_debug("%s", *errormsg_r);
-			return 0;
+			return ret;
 		}
 	}
 
 	/* if requested, read the message part the URL points to */
 	if ((url_flags & IMAP_URLAUTH_FETCH_FLAG_BODY) != 0 ||
 	    (url_flags & IMAP_URLAUTH_FETCH_FLAG_BINARY) != 0) {
-		if (imap_msgpart_url_read_part(client->url, &mpresult, &error) <= 0) {
-			if (ret < 0)
-				return -1;
+		ret = imap_msgpart_url_read_part(client->url, &mpresult, &error);
+		if (ret <= 0) {
 			*errormsg_r = t_strdup_printf(
 				"Failed to read URLAUTH \"%s\": %s", url, error);
 			if (client->debug)
 				i_debug("%s", *errormsg_r);
-			return 0;
+			return ret;
 		}
 		client->msg_part_size = mpresult.size;
 		client->msg_part_input = mpresult.input;
@@ -481,7 +474,7 @@ static int client_fetch_url(struct client *client, const char *url,
 		}
 		if (client_run_url(client) < 0) {
 			client_abort(client,
-				"Session aborted: Fatal failure while transfering URL");
+				"Session aborted: Fatal failure while transferring URL");
 			return 0;
 		}		
 	}
@@ -584,7 +577,7 @@ client_handle_user_command(struct client *client, const char *cmd,
 	}
 
 	/* lookup user */
-	memset(&input, 0, sizeof(input));
+	i_zero(&input);
 	input.module = "imap-urlauth-worker";
 	input.service = "imap-urlauth-worker";
 	input.username = args[0];
@@ -640,7 +633,7 @@ client_handle_user_command(struct client *client, const char *cmd,
 		return 0;
 	}
 
-	memset(&config, 0, sizeof(config));
+	i_zero(&config);
 	config.url_host = set->imap_urlauth_host;
 	config.url_port = set->imap_urlauth_port;
 	config.access_user = client->access_user;

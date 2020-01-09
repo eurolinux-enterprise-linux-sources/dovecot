@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -13,6 +13,9 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <ctype.h>
+
+#define DOVEADM_TCP_CONNECT_TIMEOUT_SECS 30
 
 bool doveadm_verbose = FALSE, doveadm_debug = FALSE, doveadm_server = FALSE;
 static struct module *modules = NULL;
@@ -24,7 +27,7 @@ void doveadm_load_modules(void)
 	/* some doveadm plugins have dependencies to mail plugins. we can load
 	   only those whose dependencies have been loaded earlier, the rest are
 	   ignored. */
-	memset(&mod_set, 0, sizeof(mod_set));
+	i_zero(&mod_set);
 	mod_set.abi_version = DOVECOT_ABI_VERSION;
 	mod_set.require_init_funcs = TRUE;
 	mod_set.debug = doveadm_debug;
@@ -46,7 +49,7 @@ bool doveadm_has_unloaded_plugin(const char *name)
 	DIR *dir;
 	struct dirent *d;
 	const char *plugin_name;
-	unsigned int name_len = strlen(name);
+	size_t name_len = strlen(name);
 	bool found = FALSE;
 
 	/* first check that it's not actually loaded */
@@ -96,32 +99,14 @@ const char *doveadm_plugin_getenv(const char *name)
 	return NULL;
 }
 
-static bool
-parse_hostport(const char *str, unsigned int default_port,
-	       const char **host_r, unsigned int *port_r)
-{
-	const char *p;
-
-	/* host:port */
-	p = strrchr(str, ':');
-	if (p == NULL && default_port != 0) {
-		*host_r = str;
-		*port_r = default_port;
-	} else {
-		if (p == NULL || str_to_uint(p+1, port_r) < 0)
-			return FALSE;
-		*host_r = t_strdup_until(str, p);
-	}
-	return TRUE;
-}
-
 static int
-doveadm_tcp_connect_port(const char *host, unsigned int port)
+doveadm_tcp_connect_port(const char *host, in_port_t port)
 {
 	struct ip_addr *ips;
 	unsigned int ips_count;
 	int ret, fd;
 
+	alarm(DOVEADM_TCP_CONNECT_TIMEOUT_SECS);
 	ret = net_gethostbyname(host, &ips, &ips_count);
 	if (ret != 0) {
 		i_fatal("Lookup of host %s failed: %s",
@@ -132,15 +117,16 @@ doveadm_tcp_connect_port(const char *host, unsigned int port)
 		i_fatal("connect(%s:%u) failed: %m",
 			net_ip2addr(&ips[0]), port);
 	}
+	alarm(0);
 	return fd;
 }
 
-int doveadm_tcp_connect(const char *target, unsigned int default_port)
+int doveadm_tcp_connect(const char *target, in_port_t default_port)
 {
 	const char *host;
-	unsigned int port;
+	in_port_t port;
 
-	if (!parse_hostport(target, default_port, &host, &port)) {
+	if (net_str2hostport(target, default_port, &host, &port) < 0) {
 		i_fatal("Port not known for %s. Either set proxy_port "
 			"or use %s:port", target, target);
 	}
@@ -148,7 +134,7 @@ int doveadm_tcp_connect(const char *target, unsigned int default_port)
 }
 
 int doveadm_connect_with_default_port(const char *path,
-				      unsigned int default_port)
+				      in_port_t default_port)
 {
 	int fd;
 
@@ -167,4 +153,69 @@ int doveadm_connect_with_default_port(const char *path,
 int doveadm_connect(const char *path)
 {
 	return doveadm_connect_with_default_port(path, 0);
+}
+
+int i_strccdascmp(const char *a, const char *b)
+{
+	while(*a && *b) {
+		if ((*a == ' ' || *a == '-') && *a != *b && *b != ' ' && *b != '-') {
+			if (i_toupper(*(a+1)) == *(b)) a++;
+			else break;
+		} else if ((*b == ' ' || *b == '-') && *a != *b && *a != ' ' && *a != '-') {
+			if (*a == i_toupper(*(b+1))) b++;
+			else break;
+		} else if (!((*a == ' ' || *a == '-') &&
+			     (*b == ' ' || *b == '-')) &&
+			    (*a != *b)) break;
+		a++; b++;
+	}
+	return *a-*b;
+}
+
+char doveadm_log_type_to_char(enum log_type type)
+{
+	switch(type) {
+	case LOG_TYPE_DEBUG:
+		return '\x01';
+	case LOG_TYPE_INFO:
+		return '\x02';
+	case LOG_TYPE_WARNING:
+		return '\x03';
+	case LOG_TYPE_ERROR:
+		return '\x04';
+	case LOG_TYPE_FATAL:
+		return '\x05';
+	case LOG_TYPE_PANIC:
+		return '\x06';
+	default:
+		i_unreached();
+	}
+}
+
+bool doveadm_log_type_from_char(char c, enum log_type *type_r)
+{
+	switch(c) {
+	case '\x01':
+		*type_r = LOG_TYPE_DEBUG;
+		break;
+	case '\x02':
+		*type_r = LOG_TYPE_INFO;
+		break;
+	case '\x03':
+		*type_r = LOG_TYPE_WARNING;
+		break;
+	case '\x04':
+		*type_r = LOG_TYPE_ERROR;
+		break;
+	case '\x05':
+		*type_r = LOG_TYPE_FATAL;
+		break;
+	case '\x06':
+		*type_r = LOG_TYPE_PANIC;
+		break;
+	default:
+		*type_r = LOG_TYPE_WARNING;
+		return FALSE;
+	}
+	return TRUE;
 }

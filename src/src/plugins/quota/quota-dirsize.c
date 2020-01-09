@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 /* Quota reporting based on simply summing sizes of all files in mailbox
    together. */
@@ -8,7 +8,6 @@
 #include "str.h"
 #include "quota-private.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -24,6 +23,13 @@ extern struct quota_backend quota_backend_dirsize;
 static struct quota_root *dirsize_quota_alloc(void)
 {
 	return i_new(struct quota_root, 1);
+}
+
+static int dirsize_quota_init(struct quota_root *root, const char *args,
+			      const char **error_r)
+{
+	root->auto_updating = TRUE;
+	return quota_root_default_init(root, args, error_r);
 }
 
 static void dirsize_quota_deinit(struct quota_root *_root)
@@ -119,7 +125,8 @@ static void quota_count_path_add(ARRAY_TYPE(quota_count_path) *paths,
 				 const char *path, bool is_file)
 {
 	struct quota_count_path *count_path;
-	unsigned int i, count, path_len;
+	unsigned int i, count;
+	size_t path_len;
 
 	path_len = strlen(path);
 	count_path = array_get_modifiable(paths, &count);
@@ -211,7 +218,7 @@ struct quota_backend quota_backend_dirsize = {
 
 	{
 		dirsize_quota_alloc,
-		NULL,
+		dirsize_quota_init,
 		dirsize_quota_deinit,
 		NULL,
 		NULL,

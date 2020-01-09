@@ -1,12 +1,12 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 /* Inside transaction we keep messages stored in sequences in uid fields.
    Before they're written to transaction log the sequences are changed to
    UIDs. */
 
 #include "lib.h"
-#include "ioloop.h"
 #include "array.h"
+#include "time-util.h"
 #include "mail-index-private.h"
 #include "mail-index-transaction-private.h"
 
@@ -101,6 +101,7 @@ void mail_index_transaction_reset_v(struct mail_index_transaction *t)
 	t->index_undeleted = FALSE;
 	t->log_updates = FALSE;
 	t->log_ext_updates = FALSE;
+	t->tail_offset_changed = FALSE;
 }
 
 void mail_index_transaction_set_log_updates(struct mail_index_transaction *t)
@@ -115,26 +116,19 @@ void mail_index_transaction_set_log_updates(struct mail_index_transaction *t)
 		t->min_highest_modseq != 0;
 }
 
-void mail_index_update_day_headers(struct mail_index_transaction *t)
+void mail_index_update_day_headers(struct mail_index_transaction *t,
+				   time_t day_stamp)
 {
 	struct mail_index_header hdr;
 	const struct mail_index_record *rec;
 	const int max_days = N_ELEMENTS(hdr.day_first_uid);
-	struct tm tm;
 	time_t stamp;
 	int i, days;
 
 	hdr = *mail_index_get_header(t->view);
 	rec = array_idx(&t->appends, 0);
 
-	/* get beginning of today */
-	tm = *localtime(&ioloop_time);
-	tm.tm_hour = 0;
-	tm.tm_min = 0;
-	tm.tm_sec = 0;
-	stamp = mktime(&tm);
-	i_assert(stamp != (time_t)-1);
-
+	stamp = time_to_local_day_start(day_stamp);
 	if ((time_t)hdr.day_stamp >= stamp)
 		return;
 
@@ -145,8 +139,9 @@ void mail_index_update_day_headers(struct mail_index_transaction *t)
 
 	/* @UNSAFE: move days forward and fill the missing days with old
 	   day_first_uid[0]. */
-	memmove(hdr.day_first_uid + days, hdr.day_first_uid,
-		(max_days - days) * sizeof(hdr.day_first_uid[0]));
+	if (days > 0 && days < max_days)
+		memmove(hdr.day_first_uid + days, hdr.day_first_uid,
+			(max_days - days) * sizeof(hdr.day_first_uid[0]));
 	for (i = 1; i < days; i++)
 		hdr.day_first_uid[i] = hdr.day_first_uid[0];
 
@@ -210,6 +205,8 @@ void mail_index_append_finish_uids(struct mail_index_transaction *t,
 	if (!array_is_created(&t->appends))
 		return;
 
+	i_assert(first_uid < (uint32_t)-1);
+
 	/* first find the highest assigned uid */
 	recs = array_get_modifiable(&t->appends, &count);
 	i_assert(count > 0);
@@ -219,12 +216,16 @@ void mail_index_append_finish_uids(struct mail_index_transaction *t,
 		if (next_uid <= recs[i].uid)
 			next_uid = recs[i].uid + 1;
 	}
+	i_assert(next_uid > 0 && next_uid < (uint32_t)-1);
 
 	/* assign missing uids */
 	for (i = 0; i < count; i++) {
-		if (recs[i].uid == 0 || recs[i].uid < first_uid)
+		if (recs[i].uid == 0 || recs[i].uid < first_uid) {
+			i_assert(next_uid < (uint32_t)-1);
 			recs[i].uid = next_uid++;
-		else {
+			if (t->highest_append_uid < recs[i].uid)
+				t->highest_append_uid = recs[i].uid;
+		} else {
 			if (next_uid != first_uid)
 				t->appends_nonsorted = TRUE;
 		}
@@ -280,8 +281,8 @@ void mail_index_update_highest_modseq(struct mail_index_transaction *t,
 }
 
 static void
-mail_index_expunge_last_append_ext(ARRAY_TYPE(seq_array_array) *ext_updates,
-				   uint32_t seq)
+mail_index_revert_ext(ARRAY_TYPE(seq_array_array) *ext_updates,
+		      uint32_t seq)
 {
 	ARRAY_TYPE(seq_array) *seqs;
 	unsigned int idx;
@@ -297,16 +298,14 @@ mail_index_expunge_last_append_ext(ARRAY_TYPE(seq_array_array) *ext_updates,
 }
 
 static void
-mail_index_expunge_last_append(struct mail_index_transaction *t, uint32_t seq)
+mail_index_revert_changes_common(struct mail_index_transaction *t, uint32_t seq)
 {
 	struct mail_index_transaction_keyword_update *kw_update;
 	unsigned int i;
 
-	i_assert(seq == t->last_new_seq);
-
 	/* remove extension updates */
-	mail_index_expunge_last_append_ext(&t->ext_rec_updates, seq);
-	mail_index_expunge_last_append_ext(&t->ext_rec_atomics, seq);
+	mail_index_revert_ext(&t->ext_rec_updates, seq);
+	mail_index_revert_ext(&t->ext_rec_atomics, seq);
 	t->log_ext_updates = mail_index_transaction_has_ext_changes(t);
 
 	/* remove keywords */
@@ -326,6 +325,20 @@ mail_index_expunge_last_append(struct mail_index_transaction *t, uint32_t seq)
 	if (array_is_created(&t->modseq_updates) &&
 	    mail_index_seq_array_lookup((void *)&t->modseq_updates, seq, &i))
 		array_delete(&t->modseq_updates, i, 1);
+}
+
+void mail_index_revert_changes(struct mail_index_transaction *t, uint32_t seq)
+{
+	mail_index_revert_changes_common(t, seq);
+	mail_index_cancel_flag_updates(t, seq);
+}
+
+static void
+mail_index_expunge_last_append(struct mail_index_transaction *t, uint32_t seq)
+{
+	i_assert(seq == t->last_new_seq);
+
+	mail_index_revert_changes_common(t, seq);
 
 	/* and finally remove the append itself */
 	array_delete(&t->appends, seq - t->first_new_seq, 1);
@@ -578,7 +591,7 @@ void mail_index_update_flags_range(struct mail_index_transaction *t,
 	if ((t->flags & MAIL_INDEX_TRANSACTION_FLAG_AVOID_FLAG_UPDATES) != 0)
 		t->drop_unnecessary_flag_updates = TRUE;
 
-	memset(&u, 0, sizeof(u));
+	i_zero(&u);
 	u.uid1 = seq1;
 	u.uid2 = seq2;
 
@@ -712,40 +725,84 @@ void mail_index_update_header(struct mail_index_transaction *t,
 	}
 }
 
+static void
+mail_index_ext_rec_updates_resize(struct mail_index_transaction *t,
+				  uint32_t ext_id, uint16_t new_record_size)
+{
+	ARRAY_TYPE(seq_array) *array, old_array;
+	unsigned int i;
+
+	if (!array_is_created(&t->ext_rec_updates))
+		return;
+	array = array_idx_modifiable(&t->ext_rec_updates, ext_id);
+	if (!array_is_created(array))
+		return;
+
+	old_array = *array;
+	i_zero(array);
+	mail_index_seq_array_alloc(array, new_record_size);
+
+	/* copy the records' beginnings. leave the end zero-filled. */
+	for (i = 0; i < array_count(&old_array); i++) {
+		const void *old_record = array_idx(&old_array, i);
+
+		memcpy(array_append_space(array), old_record,
+		       old_array.arr.element_size);
+	}
+	array_free(&old_array);
+}
+
 void mail_index_ext_resize(struct mail_index_transaction *t, uint32_t ext_id,
 			   uint32_t hdr_size, uint16_t record_size,
 			   uint16_t record_align)
 {
+	const struct mail_index_registered_ext *rext;
+	const struct mail_transaction_ext_intro *resizes;
+	unsigned int resizes_count;
 	struct mail_transaction_ext_intro intro;
-	uint32_t old_record_size, old_record_align, old_header_size;
+	uint32_t old_record_size = 0, old_record_align, old_header_size;
 
-	memset(&intro, 0, sizeof(intro));
+	i_zero(&intro);
+	rext = array_idx(&t->view->index->extensions, ext_id);
 
 	/* get ext_id from transaction's map if it's there */
 	if (!mail_index_map_get_ext_idx(t->view->map, ext_id, &intro.ext_id)) {
 		/* have to create it */
-		const struct mail_index_registered_ext *rext;
-
 		intro.ext_id = (uint32_t)-1;
-		rext = array_idx(&t->view->index->extensions, ext_id);
-		old_record_size = rext->record_size;
 		old_record_align = rext->record_align;
 		old_header_size = rext->hdr_size;
 	} else {
 		const struct mail_index_ext *ext;
 
 		ext = array_idx(&t->view->map->extensions, intro.ext_id);
-		old_record_size = ext->record_size;
 		old_record_align = ext->record_align;
 		old_header_size = ext->hdr_size;
 	}
 
-	/* allow only header size changes if extension records have already
-	   been changed in transaction */
-	i_assert(!array_is_created(&t->ext_rec_updates) ||
-		 record_size == (uint16_t)-1 ||
-		 (old_record_size == record_size &&
-		  old_record_align == record_align));
+	/* get the record size. if there are any existing record updates,
+	   they're using the registered size, not the map's existing
+	   record_size. */
+	if (array_is_created(&t->ext_resizes))
+		resizes = array_get(&t->ext_resizes, &resizes_count);
+	else {
+		resizes = NULL;
+		resizes_count = 0;
+	}
+	if (ext_id < resizes_count && resizes[ext_id].name_size != 0) {
+		/* already resized once. use the resized value. */
+		old_record_size = resizes[ext_id].record_size;
+	} else {
+		/* use the registered values. */
+		old_record_size = rext->record_size;
+	}
+
+	if (record_size != old_record_size && record_size != (uint16_t)-1) {
+		/* if record_size grows, we'll just resize the existing
+		   ext_rec_updates array. it's not possible to shrink
+		   record_size without data loss. */
+		i_assert(record_size > old_record_size);
+		mail_index_ext_rec_updates_resize(t, ext_id, record_size);
+	}
 
 	t->log_ext_updates = TRUE;
 
@@ -779,7 +836,7 @@ void mail_index_ext_reset(struct mail_index_transaction *t, uint32_t ext_id,
 
 	i_assert(reset_id != 0);
 
-	memset(&reset, 0, sizeof(reset));
+	i_zero(&reset);
 	reset.new_reset_id = reset_id;
 	reset.preserve_data = !clear_data;
 
@@ -978,6 +1035,7 @@ void mail_index_update_ext(struct mail_index_transaction *t, uint32_t seq,
 		rext = array_idx(&index->extensions, ext_id);
 		record_size = rext->record_size;
 	}
+	i_assert(record_size > 0);
 
 	if (!array_is_created(&t->ext_rec_updates))
 		i_array_init(&t->ext_rec_updates, ext_id + 2);
@@ -1100,8 +1158,10 @@ void mail_index_update_keywords(struct mail_index_transaction *t, uint32_t seq,
 	i_assert(seq > 0 &&
 		 (seq <= mail_index_view_get_messages_count(t->view) ||
 		  seq <= t->last_new_seq));
-	i_assert(keywords->count > 0 || modify_type == MODIFY_REPLACE);
 	i_assert(keywords->index == t->view->index);
+
+	if (keywords->count == 0 && modify_type != MODIFY_REPLACE)
+		return;
 
 	update_minmax_flagupdate_seq(t, seq, seq);
 
@@ -1258,6 +1318,22 @@ void mail_index_reset(struct mail_index_transaction *t)
 	mail_index_transaction_reset(t);
 
 	t->reset = TRUE;
+}
+
+void mail_index_unset_fscked(struct mail_index_transaction *t)
+{
+	struct mail_index_header new_hdr =
+		*mail_index_get_header(t->view);
+
+	i_assert(t->view->index->log_sync_locked);
+
+	/* remove fsck'd-flag if it exists. */
+	if ((new_hdr.flags & MAIL_INDEX_HDR_FLAG_FSCKD) != 0) {
+		new_hdr.flags &= ~MAIL_INDEX_HDR_FLAG_FSCKD;
+		mail_index_update_header(t,
+			offsetof(struct mail_index_header, flags),
+			&new_hdr.flags, sizeof(new_hdr.flags), FALSE);
+	}
 }
 
 void mail_index_set_deleted(struct mail_index_transaction *t)

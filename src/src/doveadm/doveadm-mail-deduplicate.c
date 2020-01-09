@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "hash.h"
@@ -18,7 +18,8 @@ struct deduplicate_cmd_context {
 	bool by_msgid;
 };
 
-static int cmd_deduplicate_uidlist(struct mailbox *box, struct uidlist *uidlist)
+static int cmd_deduplicate_uidlist(struct doveadm_mail_cmd_context *_ctx,
+				   struct mailbox *box, struct uidlist *uidlist)
 {
 	struct mailbox_transaction_context *trans;
 	struct mail_search_context *search_ctx;
@@ -47,10 +48,20 @@ static int cmd_deduplicate_uidlist(struct mailbox *box, struct uidlist *uidlist)
 
 	while (mailbox_search_next(search_ctx, &mail))
 		mail_expunge(mail);
-	if (mailbox_search_deinit(&search_ctx) < 0)
+	if (mailbox_search_deinit(&search_ctx) < 0) {
+		i_error("Searching mailbox '%s' failed: %s",
+			mailbox_get_vname(box),
+			mailbox_get_last_internal_error(box, NULL));
+		doveadm_mail_failed_mailbox(_ctx, box);
 		ret = -1;
-	if (mailbox_transaction_commit(&trans) < 0)
+	}
+	if (mailbox_transaction_commit(&trans) < 0) {
+		i_error("Committing mailbox '%s' transaction failed: %s",
+			mailbox_get_vname(box),
+			mailbox_get_last_internal_error(box, NULL));
+		doveadm_mail_failed_mailbox(_ctx, box);
 		ret = -1;
+	}
 	return ret;
 }
 
@@ -71,7 +82,7 @@ cmd_deduplicate_box(struct doveadm_mail_cmd_context *_ctx,
 	struct uidlist *value;
 	int ret = 0;
 
-	if (doveadm_mail_iter_init(_ctx, info, search_args, 0, NULL,
+	if (doveadm_mail_iter_init(_ctx, info, search_args, 0, NULL, FALSE,
 				   &iter) < 0)
 		return -1;
 
@@ -80,21 +91,23 @@ cmd_deduplicate_box(struct doveadm_mail_cmd_context *_ctx,
 	while (doveadm_mail_iter_next(iter, &mail)) {
 		if (ctx->by_msgid) {
 			if (mail_get_first_header(mail, "Message-ID", &key) < 0) {
-				errstr = mailbox_get_last_error(mail->box, &error);
+				errstr = mailbox_get_last_internal_error(mail->box, &error);
 				if (error == MAIL_ERROR_NOTFOUND)
 					continue;
 				i_error("Couldn't lookup Message-ID: for UID=%u: %s",
 					mail->uid, errstr);
+				doveadm_mail_failed_error(_ctx, error);
 				ret = -1;
 				break;
 			}
 		} else {
 			if (mail_get_special(mail, MAIL_FETCH_GUID, &key) < 0) {
-				errstr = mailbox_get_last_error(mail->box, &error);
+				errstr = mailbox_get_last_internal_error(mail->box, &error);
 				if (error == MAIL_ERROR_NOTFOUND)
 					continue;
 				i_error("Couldn't lookup GUID: for UID=%u: %s",
 					mail->uid, errstr);
+				doveadm_mail_failed_error(_ctx, error);
 				ret = -1;
 				break;
 			}
@@ -122,7 +135,7 @@ cmd_deduplicate_box(struct doveadm_mail_cmd_context *_ctx,
 		iter = hash_table_iterate_init(hash);
 		while (hash_table_iterate(iter, hash, &key, &value)) {
 			T_BEGIN {
-				if (cmd_deduplicate_uidlist(box, value) < 0)
+				if (cmd_deduplicate_uidlist(_ctx, box, value) < 0)
 					ret = -1;
 			} T_END;
 		}
@@ -133,6 +146,9 @@ cmd_deduplicate_box(struct doveadm_mail_cmd_context *_ctx,
 	pool_unref(&pool);
 
 	if (mailbox_sync(box, 0) < 0) {
+		i_error("Syncing mailbox '%s' failed: %s",
+			mailbox_get_vname(box),
+			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_mailbox(_ctx, box);
 		ret = -1;
 	}
@@ -198,6 +214,13 @@ static struct doveadm_mail_cmd_context *cmd_deduplicate_alloc(void)
 	return &ctx->ctx;
 }
 
-struct doveadm_mail_cmd cmd_deduplicate = {
-	cmd_deduplicate_alloc, "deduplicate", "[-m] <search query>"
+struct doveadm_cmd_ver2 doveadm_cmd_deduplicate_ver2 = {
+	.name = "deduplicate",
+	.mail_cmd = cmd_deduplicate_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "[-m] <search query>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('m', "by-msgid", CMD_PARAM_BOOL, 0)
+DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

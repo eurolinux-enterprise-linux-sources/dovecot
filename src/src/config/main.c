@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "module-dir.h"
@@ -42,6 +42,7 @@ int main(int argc, char *argv[])
 
 	config_filter_deinit(&config_filter);
 	module_dir_unload(&modules);
+	config_parser_deinit();
 	master_service_deinit(&master_service);
         return 0;
 }

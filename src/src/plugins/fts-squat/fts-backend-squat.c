@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -11,7 +11,6 @@
 #include "squat-trie.h"
 #include "fts-squat-plugin.h"
 
-#include <stdlib.h>
 
 #define SQUAT_FILE_PREFIX "dovecot.index.search"
 
@@ -97,7 +96,7 @@ static void fts_backend_squat_deinit(struct fts_backend *_backend)
 	i_free(backend);
 }
 
-static void
+static int
 fts_backend_squat_set_box(struct squat_fts_backend *backend,
 			  struct mailbox *box)
 {
@@ -106,12 +105,22 @@ fts_backend_squat_set_box(struct squat_fts_backend *backend,
 	struct mailbox_status status;
 	const char *path;
 	enum squat_index_flags flags = 0;
+        int ret;
 
 	if (backend->box == box)
-		return;
+        {
+		if (backend->refresh) {
+                        ret = squat_trie_refresh(backend->trie);
+                        if (ret < 0)
+				return ret;
+			backend->refresh = FALSE;
+		}
+		return 0;
+	}
 	fts_backend_squat_unset_box(backend);
+	backend->refresh = FALSE;
 	if (box == NULL)
-		return;
+		return 0;
 
 	perm = mailbox_get_permissions(box);
 	storage = mailbox_get_storage(box);
@@ -138,6 +147,7 @@ fts_backend_squat_set_box(struct squat_fts_backend *backend,
 	if (backend->full_len != 0)
 		squat_trie_set_full_len(backend->trie, backend->full_len);
 	backend->box = box;
+	return squat_trie_open(backend->trie);
 }
 
 static int
@@ -147,7 +157,9 @@ fts_backend_squat_get_last_uid(struct fts_backend *_backend,
 	struct squat_fts_backend *backend =
 		(struct squat_fts_backend *)_backend;
 
-	fts_backend_squat_set_box(backend, box);
+	int ret = fts_backend_squat_set_box(backend, box);
+	if (ret < 0)
+		return -1;
 	return squat_trie_get_last_uid(backend->trie, last_uid_r);
 }
 
@@ -255,9 +267,9 @@ fts_backend_squat_update_set_mailbox(struct fts_backend_update_context *_ctx,
 
 	if (fts_backend_squat_build_deinit(ctx) < 0)
 		ctx->failed = TRUE;
-	fts_backend_squat_set_box(backend, box);
-
-	if (box != NULL) {
+	if (fts_backend_squat_set_box(backend, box) < 0)
+		ctx->failed = TRUE;
+	else if (box != NULL) {
 		if (squat_trie_build_init(backend->trie, &ctx->build_ctx) < 0)
 			ctx->failed = TRUE;
 	}
@@ -430,20 +442,19 @@ static int squat_lookup_arg(struct squat_fts_backend *backend,
 
 static int
 fts_backend_squat_lookup(struct fts_backend *_backend, struct mailbox *box,
-			 struct mail_search_arg *args, bool and_args,
+			 struct mail_search_arg *args,
+			 enum fts_lookup_flags flags,
 			 struct fts_result *result)
 {
 	struct squat_fts_backend *backend =
 		(struct squat_fts_backend *)_backend;
+	bool and_args = (flags & FTS_LOOKUP_FLAG_AND_ARGS) != 0;
 	bool first = TRUE;
 	int ret;
 
-	fts_backend_squat_set_box(backend, box);
-	if (backend->refresh) {
-		if (squat_trie_refresh(backend->trie) < 0)
-			return -1;
-		backend->refresh = FALSE;
-	}
+	ret = fts_backend_squat_set_box(backend, box);
+	if (ret < 0)
+		return -1;
 
 	for (; args != NULL; args = args->next) {
 		ret = squat_lookup_arg(backend, args, first ? FALSE : and_args,

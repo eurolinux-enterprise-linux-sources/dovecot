@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "hostpid.h"
@@ -75,6 +75,9 @@ fs_list_get_path(struct mailbox_list *_list, const char *name,
 	i_assert(mailbox_list_is_valid_name(_list, name, &error));
 
 	if (mailbox_list_try_get_absolute_path(_list, &name)) {
+		if (type == MAILBOX_LIST_PATH_TYPE_INDEX &&
+		    *set->index_dir == '\0')
+			return 0;
 		*path_r = name;
 		return 1;
 	}
@@ -126,6 +129,8 @@ fs_list_get_path(struct mailbox_list *_list, const char *name,
 			return 0;
 		*path_r = fs_list_get_path_to(set, set->index_pvt_dir, name);
 		return 1;
+	case MAILBOX_LIST_PATH_TYPE_LIST_INDEX:
+		i_unreached();
 	}
 
 	if (type == MAILBOX_LIST_PATH_TYPE_ALT_DIR ||
@@ -250,21 +255,22 @@ static int fs_list_delete_mailbox(struct mailbox_list *list, const char *name)
 	const char *path;
 	int ret;
 
+	ret = mailbox_list_get_path(list, name,
+				    MAILBOX_LIST_PATH_TYPE_MAILBOX, &path);
+	if (ret < 0)
+		return -1;
+	i_assert(ret > 0);
+
 	if ((list->flags & MAILBOX_LIST_FLAG_MAILBOX_FILES) != 0) {
-		ret = mailbox_list_get_path(list, name,
-					    MAILBOX_LIST_PATH_TYPE_MAILBOX,
-					    &path);
-		if (ret < 0)
-			return -1;
-		i_assert(ret > 0);
 		ret = mailbox_list_delete_mailbox_file(list, name, path);
 	} else {
 		ret = fs_list_delete_maildir(list, name);
 	}
+	if (ret == 0 && list->set.no_noselect)
+		mailbox_list_delete_until_root(list, path, MAILBOX_LIST_PATH_TYPE_MAILBOX);
 
-	if (ret == 0 || (list->props & MAILBOX_LIST_PROP_AUTOCREATE_DIRS) != 0)
-		mailbox_list_delete_finish(list, name);
-	return ret;
+	i_assert(ret <= 0);
+	return mailbox_list_delete_finish_ret(list, name, ret == 0);
 }
 
 static int fs_list_rmdir(struct mailbox_list *list, const char *name,
@@ -285,12 +291,32 @@ static int fs_list_delete_dir(struct mailbox_list *list, const char *name)
 {
 	const char *path, *child_name, *child_path, *p;
 	char sep;
+	int ret;
 
 	if (mailbox_list_get_path(list, name, MAILBOX_LIST_PATH_TYPE_DIR,
 				  &path) <= 0)
 		i_unreached();
-	if (fs_list_rmdir(list, name, path) == 0)
-		return 0;
+	ret = fs_list_rmdir(list, name, path);
+	if (!list->set.iter_from_index_dir) {
+		/* it should exist only in the mail directory */
+		if (ret == 0)
+			return 0;
+	} else if (ret == 0 || errno == ENOENT) {
+		/* the primary list location is the index directory, but it
+		   exists in both index and mail directories. */
+		if (mailbox_list_get_path(list, name, MAILBOX_LIST_PATH_TYPE_INDEX,
+					  &path) <= 0)
+			i_unreached();
+		if (fs_list_rmdir(list, name, path) == 0)
+			return 0;
+		if (ret == 0 && errno == ENOENT) {
+			/* partial existence: exists in _DIR, but not in
+			   _INDEX. return success anyway. */
+			return 0;
+		}
+		/* a) both directories didn't exist
+		   b) index directory couldn't be rmdir()ed for some reason */
+	}
 
 	if (errno == ENOENT || errno == ENOTDIR) {
 		mailbox_list_set_error(list, MAIL_ERROR_NOTFOUND,
@@ -501,28 +527,24 @@ struct mailbox_list fs_mailbox_list = {
 	.props = 0,
 	.mailbox_name_max_length = MAILBOX_LIST_NAME_MAX_LENGTH,
 
-	{
-		fs_list_alloc,
-		NULL,
-		fs_list_deinit,
-		NULL,
-		fs_list_get_hierarchy_sep,
-		mailbox_list_default_get_vname,
-		mailbox_list_default_get_storage_name,
-		fs_list_get_path,
-		fs_list_get_temp_prefix,
-		fs_list_join_refpattern,
-		fs_list_iter_init,
-		fs_list_iter_next,
-		fs_list_iter_deinit,
-		fs_list_get_mailbox_flags,
-		NULL,
-		mailbox_list_subscriptions_refresh,
-		fs_list_set_subscribed,
-		fs_list_delete_mailbox,
-		fs_list_delete_dir,
-		mailbox_list_delete_symlink_default,
-		fs_list_rename_mailbox,
-		NULL, NULL, NULL, NULL
+	.v = {
+		.alloc = fs_list_alloc,
+		.deinit = fs_list_deinit,
+		.get_hierarchy_sep = fs_list_get_hierarchy_sep,
+		.get_vname = mailbox_list_default_get_vname,
+		.get_storage_name = mailbox_list_default_get_storage_name,
+		.get_path = fs_list_get_path,
+		.get_temp_prefix = fs_list_get_temp_prefix,
+		.join_refpattern = fs_list_join_refpattern,
+		.iter_init = fs_list_iter_init,
+		.iter_next = fs_list_iter_next,
+		.iter_deinit = fs_list_iter_deinit,
+		.get_mailbox_flags = fs_list_get_mailbox_flags,
+		.subscriptions_refresh = mailbox_list_subscriptions_refresh,
+		.set_subscribed = fs_list_set_subscribed,
+		.delete_mailbox = fs_list_delete_mailbox,
+		.delete_dir = fs_list_delete_dir,
+		.delete_symlink = mailbox_list_delete_symlink_default,
+		.rename_mailbox = fs_list_rename_mailbox,
 	}
 };

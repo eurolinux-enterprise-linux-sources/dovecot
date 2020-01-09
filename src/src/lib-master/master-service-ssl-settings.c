@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "settings-parser.h"
@@ -6,6 +6,10 @@
 #include "master-service-ssl-settings.h"
 
 #include <stddef.h>
+
+#ifdef HAVE_OPENSSL
+#include <openssl/ssl.h>
+#endif
 
 #undef DEF
 #define DEF(type, name) \
@@ -19,6 +23,8 @@ static const struct setting_define master_service_ssl_setting_defines[] = {
 	DEF(SET_STR, ssl_ca),
 	DEF(SET_STR, ssl_cert),
 	DEF(SET_STR, ssl_key),
+	DEF(SET_STR, ssl_alt_cert),
+	DEF(SET_STR, ssl_alt_key),
 	DEF(SET_STR, ssl_key_password),
 	DEF(SET_STR, ssl_cipher_list),
 	DEF(SET_STR, ssl_protocols),
@@ -28,6 +34,7 @@ static const struct setting_define master_service_ssl_setting_defines[] = {
 	DEF(SET_BOOL, ssl_require_crl),
 	DEF(SET_BOOL, verbose_ssl),
 	DEF(SET_BOOL, ssl_prefer_server_ciphers),
+	DEF(SET_STR, ssl_options), /* parsed as a string to set bools */
 
 	SETTING_DEFINE_LIST_END
 };
@@ -41,15 +48,22 @@ static const struct master_service_ssl_settings master_service_ssl_default_setti
 	.ssl_ca = "",
 	.ssl_cert = "",
 	.ssl_key = "",
+	.ssl_alt_cert = "",
+	.ssl_alt_key = "",
 	.ssl_key_password = "",
 	.ssl_cipher_list = "ALL:!LOW:!SSLv2:!EXP:!aNULL",
-	.ssl_protocols = "!SSLv2",
+#ifdef SSL_TXT_SSLV2
+	.ssl_protocols = "!SSLv2 !SSLv3",
+#else
+	.ssl_protocols = "!SSLv3",
+#endif
 	.ssl_cert_username_field = "commonName",
 	.ssl_crypto_device = "",
 	.ssl_verify_client_cert = FALSE,
 	.ssl_require_crl = TRUE,
 	.verbose_ssl = FALSE,
-	.ssl_prefer_server_ciphers = FALSE
+	.ssl_prefer_server_ciphers = FALSE,
+	.ssl_options = "",
 };
 
 const struct setting_parser_info master_service_ssl_setting_parser_info = {
@@ -98,6 +112,27 @@ master_service_ssl_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 		*error_r = "ssl_verify_client_cert set, but ssl_ca not";
 		return FALSE;
 	}
+
+	/* Now explode the ssl_options string into individual flags */
+	/* First set them all to defaults */
+	set->parsed_opts.compression = TRUE;
+	set->parsed_opts.tickets = TRUE;
+
+	/* Then modify anything specified in the string */
+	const char **opts = t_strsplit_spaces(set->ssl_options, ", ");
+	const char *opt;
+	while ((opt = *opts++) != NULL) {
+		if (strcasecmp(opt, "no_compression") == 0) {
+			set->parsed_opts.compression = FALSE;
+		} else if (strcasecmp(opt, "no_ticket") == 0) {
+			set->parsed_opts.tickets = FALSE;
+		} else {
+			*error_r = t_strdup_printf("ssl_options: unknown flag: '%s'",
+						   opt);
+			return FALSE;
+		}
+	}
+
 	return TRUE;
 #endif
 }

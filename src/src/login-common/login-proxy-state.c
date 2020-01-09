@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -66,8 +66,16 @@ static void login_proxy_state_close(struct login_proxy_state *state)
 void login_proxy_state_deinit(struct login_proxy_state **_state)
 {
 	struct login_proxy_state *state = *_state;
+	struct hash_iterate_context *iter;
+	struct login_proxy_record *rec;
 
 	*_state = NULL;
+
+	/* sanity check: */
+	iter = hash_table_iterate_init(state->hash);
+	while (hash_table_iterate(iter, state->hash, &rec, &rec))
+		i_assert(rec->num_waiting_connections == 0);
+	hash_table_iterate_deinit(&iter);
 
 	if (state->to_reopen != NULL)
 		timeout_remove(&state->to_reopen);
@@ -79,11 +87,11 @@ void login_proxy_state_deinit(struct login_proxy_state **_state)
 
 struct login_proxy_record *
 login_proxy_state_get(struct login_proxy_state *state,
-		      const struct ip_addr *ip, unsigned int port)
+		      const struct ip_addr *ip, in_port_t port)
 {
 	struct login_proxy_record *rec, key;
 
-	memset(&key, 0, sizeof(key));
+	i_zero(&key);
 	key.ip = *ip;
 	key.port = port;
 
@@ -124,12 +132,13 @@ static int login_proxy_state_notify_open(struct login_proxy_state *state)
 static bool login_proxy_state_try_notify(struct login_proxy_state *state,
 					 const char *user)
 {
-	unsigned int len;
+	size_t len;
 	ssize_t ret;
 
 	if (state->notify_fd == -1) {
 		if (login_proxy_state_notify_open(state) < 0)
 			return TRUE;
+		i_assert(state->notify_fd != -1);
 	}
 
 	T_BEGIN {

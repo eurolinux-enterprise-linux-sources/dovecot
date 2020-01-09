@@ -6,6 +6,9 @@
 /* Define if you have buggy CMSG macros */
 #undef BUGGY_CMSG_MACROS
 
+/* Built-in Cassandra support */
+#undef BUILD_CASSANDRA
+
 /* Build with CDB support */
 #undef BUILD_CDB
 
@@ -69,11 +72,20 @@
 /* How to define flexible array members in structs */
 #undef FLEXIBLE_ARRAY_MEMBER
 
+/* Build with ASN1_STRING_get0_data() support */
+#undef HAVE_ASN1_STRING_GET0_DATA
+
 /* Define to 1 if you have the `backtrace_symbols' function. */
 #undef HAVE_BACKTRACE_SYMBOLS
 
 /* Define if you have bzlib library */
 #undef HAVE_BZLIB
+
+/* Build with Cassandra support */
+#undef HAVE_CASSANDRA
+
+/* Cassandra supports speculative execution policy */
+#undef HAVE_CASSANDRA_SPECULATIVE_POLICY
 
 /* Define to 1 if you have the `clearenv' function. */
 #undef HAVE_CLEARENV
@@ -93,6 +105,12 @@
 /* Define to 1 if you have the <dlfcn.h> header file. */
 #undef HAVE_DLFCN_H
 
+/* Build with EVP_MD_CTX_new() support */
+#undef HAVE_EVP_MD_CTX_NEW
+
+/* Build with EVP_PKEY_get0_*() support */
+#undef HAVE_EVP_PKEY_get0
+
 /* Define to 1 if you have the <execinfo.h> header file. */
 #undef HAVE_EXECINFO_H
 
@@ -110,6 +128,15 @@
 
 /* Define if you have FreeBSD-compatible sendfile() */
 #undef HAVE_FREEBSD_SENDFILE
+
+/* Define if you want exttextcat support for FTS */
+#undef HAVE_FTS_EXTTEXTCAT
+
+/* Define if you want stemming support for FTS */
+#undef HAVE_FTS_STEMMER
+
+/* Define if you want textcat support for FTS */
+#undef HAVE_FTS_TEXTCAT
 
 /* Define to 1 if you have the <gc/gc.h> header file. */
 #undef HAVE_GC_GC_H
@@ -166,11 +193,17 @@
    */
 #undef HAVE_GSSKRB5_REGISTER_ACCEPTOR_IDENTITY
 
+/* Build with HMAC_CTX_new() support */
+#undef HAVE_HMAC_CTX_NEW
+
 /* Define if you have the iconv() function and it works. */
 #undef HAVE_ICONV
 
 /* Define to 1 if you have the `inet_aton' function. */
 #undef HAVE_INET_ATON
+
+/* Define to 1 if you have the `inotify_init' function. */
+#undef HAVE_INOTIFY_INIT
 
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
@@ -194,8 +227,17 @@
 /* libcap is installed for cap_init() */
 #undef HAVE_LIBCAP
 
+/* Define to 1 if you have the <libexttextcat/textcat.h> header file. */
+#undef HAVE_LIBEXTTEXTCAT_TEXTCAT_H
+
 /* Define to 1 if you have the <libgen.h> header file. */
 #undef HAVE_LIBGEN_H
+
+/* Define if you want ICU normalization support for FTS */
+#undef HAVE_LIBICU
+
+/* Define to 1 if you have the <libtextcat/textcat.h> header file. */
+#undef HAVE_LIBTEXTCAT_TEXTCAT_H
 
 /* Define if you have libwrap */
 #undef HAVE_LIBWRAP
@@ -215,14 +257,11 @@
 /* Define to 1 if you have the `lockf' function. */
 #undef HAVE_LOCKF
 
-/* Define if you want textcat (Debian version) support for CLucene */
-#undef HAVE_LUCENE_EXTTEXTCAT
+/* Define if you have lz4 library */
+#undef HAVE_LZ4
 
-/* Define if you want stemming support for CLucene */
-#undef HAVE_LUCENE_STEMMER
-
-/* Define if you want textcat support for CLucene */
-#undef HAVE_LUCENE_TEXTCAT
+/* Define if you have LZ4_compress_default */
+#undef HAVE_LZ4_COMPRESS_DEFAULT
 
 /* Define if you have lzma library */
 #undef HAVE_LZMA
@@ -261,14 +300,26 @@
    certificate */
 #undef HAVE_MYSQL_SSL_VERIFY_SERVER_CERT
 
+/* Build with OBJ_length() support */
+#undef HAVE_OBJ_LENGTH
+
 /* Define if you don't have C99 compatible vsnprintf() call */
 #undef HAVE_OLD_VSNPRINTF
 
 /* Build with OpenSSL support */
 #undef HAVE_OPENSSL
 
+/* Define if OpenSSL performs thread cleanup automatically */
+#undef HAVE_OPENSSL_AUTO_THREAD_DEINIT
+
+/* OpenSSL supports OPENSSL_cleanup() */
+#undef HAVE_OPENSSL_CLEANUP
+
 /* Define to 1 if you have the <openssl/err.h> header file. */
 #undef HAVE_OPENSSL_ERR_H
+
+/* Define if you have ERR_remove_thread_state */
+#undef HAVE_OPENSSL_ERR_REMOVE_THREAD_STATE
 
 /* Define if you have openssl/rand.h */
 #undef HAVE_OPENSSL_RAND_H
@@ -324,6 +375,9 @@
 /* Define if you wish to retrieve quota of NFS mounted mailboxes */
 #undef HAVE_RQUOTA
 
+/* Build with RSA_generate_key_ex() support */
+#undef HAVE_RSA_GENERATE_KEY_EX
+
 /* Define to 1 if you have the <sasl.h> header file. */
 #undef HAVE_SASL_H
 
@@ -369,11 +423,23 @@
 /* Build with SSL/TLS support */
 #undef HAVE_SSL
 
+/* Define if you have SSL_clear_options */
+#undef HAVE_SSL_CLEAR_OPTIONS
+
 /* Build with OpenSSL compression */
 #undef HAVE_SSL_COMPRESSION
 
+/* Build with SSL_COMP_free_compression_methods() support */
+#undef HAVE_SSL_COMP_FREE_COMPRESSION_METHODS
+
+/* Define if you have SSL_CTX_set_min_proto_version */
+#undef HAVE_SSL_CTX_SET_MIN_PROTO_VERSION
+
 /* Build with TLS hostname support */
 #undef HAVE_SSL_GET_SERVERNAME
+
+/* Define if CRYPTO_set_mem_functions has new style parameters */
+#undef HAVE_SSL_NEW_MEM_FUNCS
 
 /* Define if you have statfs.f_mntfromname */
 #undef HAVE_STATFS_MNTFROMNAME
@@ -404,24 +470,6 @@
 
 /* Define to 1 if you have the <string.h> header file. */
 #undef HAVE_STRING_H
-
-/* Define if you have strtoimax function */
-#undef HAVE_STRTOIMAX
-
-/* Define to 1 if you have the `strtoll' function. */
-#undef HAVE_STRTOLL
-
-/* Define to 1 if you have the `strtoq' function. */
-#undef HAVE_STRTOQ
-
-/* Define to 1 if you have the `strtoull' function. */
-#undef HAVE_STRTOULL
-
-/* Define if you have strtoumax function */
-#undef HAVE_STRTOUMAX
-
-/* Define to 1 if you have the `strtouq' function. */
-#undef HAVE_STRTOUQ
 
 /* Define if struct sqblk.dqb_curblocks exists */
 #undef HAVE_STRUCT_DQBLK_CURBLOCKS
@@ -486,6 +534,9 @@
 /* Define to 1 if you have the <sys/vmount.h> header file. */
 #undef HAVE_SYS_VMOUNT_H
 
+/* Define to 1 if you have the `timegm' function. */
+#undef HAVE_TIMEGM
+
 /* Define if you have struct tm->tm_gmtoff */
 #undef HAVE_TM_GMTOFF
 
@@ -549,9 +600,6 @@
 /* Implement I/O loop with BSD kqueue() */
 #undef IOLOOP_KQUEUE
 
-/* Use Linux dnotify */
-#undef IOLOOP_NOTIFY_DNOTIFY
-
 /* Use Linux inotify */
 #undef IOLOOP_NOTIFY_INOTIFY
 
@@ -573,8 +621,7 @@
 /* Define if you have ldap_start_tls_s */
 #undef LDAP_HAVE_START_TLS_S
 
-/* Define to the sub-directory in which libtool stores uninstalled libraries.
-   */
+/* Define to the sub-directory where libtool stores uninstalled libraries. */
 #undef LT_OBJDIR
 
 /* List of compiled in mail storages */
@@ -646,7 +693,7 @@
 /* Build with vpopmail support */
 #undef PASSDB_VPOPMAIL
 
-/* Defint if pread/pwrite implementation is broken */
+/* Define if pread/pwrite implementation is broken */
 #undef PREAD_BROKEN
 
 /* Define if pread/pwrite needs _XOPEN_SOURCE 500 */
@@ -679,11 +726,17 @@
 /* Maximum value of ssize_t */
 #undef SSIZE_T_MAX
 
+/* C99 static array */
+#undef STATIC_ARRAY
+
 /* reasonable mntctl buffer size */
 #undef STATIC_MTAB_SIZE
 
 /* Define to 1 if you have the ANSI C header files. */
 #undef STDC_HEADERS
+
+/* Points to textcat pkgdatadir containing the language files */
+#undef TEXTCAT_DATADIR
 
 /* max. time_t bits gmtime() can handle */
 #undef TIME_T_MAX_BITS
@@ -733,7 +786,7 @@
 /* A 'va_copy' style function */
 #undef VA_COPY
 
-/* 'va_lists' cannot be copies as values */
+/* 'va_lists' cannot be copied as values */
 #undef VA_COPY_AS_ARRAY
 
 /* Version number of package */

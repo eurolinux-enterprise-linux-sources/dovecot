@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -19,7 +19,7 @@ static struct file_listener_settings *director_unix_listeners[] = {
 };
 static buffer_t director_unix_listeners_buf = {
 	director_unix_listeners,
-	sizeof(director_unix_listeners), { 0, }
+	sizeof(director_unix_listeners), { NULL, }
 };
 static struct file_listener_settings director_fifo_listeners_array[] = {
 	{ "login/proxy-notify", 0, "", "" }
@@ -29,7 +29,7 @@ static struct file_listener_settings *director_fifo_listeners[] = {
 };
 static buffer_t director_fifo_listeners_buf = {
 	director_fifo_listeners,
-	sizeof(director_fifo_listeners), { 0, }
+	sizeof(director_fifo_listeners), { NULL, }
 };
 /* </settings checks> */
 
@@ -71,8 +71,16 @@ static const struct setting_define director_setting_defines[] = {
 	DEF(SET_STR, director_servers),
 	DEF(SET_STR, director_mail_servers),
 	DEF(SET_STR, director_username_hash),
+	DEF(SET_STR, director_flush_socket),
+	DEF(SET_TIME, director_ping_idle_timeout),
+	DEF(SET_TIME, director_ping_max_timeout),
 	DEF(SET_TIME, director_user_expire),
-	DEF(SET_UINT, director_doveadm_port),
+	DEF(SET_TIME, director_user_kick_delay),
+	DEF(SET_IN_PORT, director_doveadm_port),
+	DEF(SET_BOOL, director_consistent_hashing),
+	DEF(SET_UINT, director_max_parallel_moves),
+	DEF(SET_UINT, director_max_parallel_kicks),
+	DEF(SET_SIZE, director_output_buffer_size),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -83,8 +91,15 @@ const struct director_settings director_default_settings = {
 	.director_servers = "",
 	.director_mail_servers = "",
 	.director_username_hash = "%Lu",
+	.director_flush_socket = "",
+	.director_ping_idle_timeout = 30,
+	.director_ping_max_timeout = 60,
 	.director_user_expire = 60*15,
-	.director_doveadm_port = 0
+	.director_user_kick_delay = 2,
+	.director_doveadm_port = 0,
+	.director_max_parallel_moves = 100,
+	.director_max_parallel_kicks = 100,
+	.director_output_buffer_size = 10 * 1024 * 1024,
 };
 
 const struct setting_parser_info director_setting_parser_info = {

@@ -1,9 +1,13 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "net.h"
+#include "str.h"
 #include "iostream-openssl.h"
 
 #include <openssl/x509v3.h>
+#include <openssl/err.h>
+#include <arpa/inet.h>
 
 enum {
 	DOVECOT_SSL_PROTO_SSLv2		= 0x01,
@@ -14,13 +18,74 @@ enum {
 	DOVECOT_SSL_PROTO_ALL		= 0x1f
 };
 
+#ifdef HAVE_SSL_CTX_SET_MIN_PROTO_VERSION
+static const struct {
+	const char *name;
+	int version;
+} protocol_versions[] = {
+	{ SSL_TXT_SSLV3, SSL3_VERSION },
+	{ SSL_TXT_TLSV1, TLS1_VERSION },
+	{ SSL_TXT_TLSV1_1, TLS1_1_VERSION },
+	{ SSL_TXT_TLSV1_2, TLS1_2_VERSION },
+};
+int ssl_protocols_to_min_protocol(const char *ssl_protocols,
+				  int *min_protocol_r, const char **error_r)
+{
+	/* Array where -1 = disable, 0 = not found, 1 = enable */
+	int protos[N_ELEMENTS(protocol_versions)];
+	memset(protos, 0, sizeof(protos));
+	bool explicit_enable = FALSE;
+
+	const char *const *tmp = t_strsplit_spaces(ssl_protocols, ", ");
+	for (; *tmp != NULL; tmp++) {
+		const char *p = *tmp;
+		bool enable = TRUE;
+		if (p[0] == '!') {
+			enable = FALSE;
+			++p;
+		}
+		for (unsigned i = 0; i < N_ELEMENTS(protocol_versions); i++) {
+			if (strcmp(p, protocol_versions[i].name) == 0) {
+				if (enable) {
+					protos[i] = 1;
+					explicit_enable = TRUE;
+				} else {
+					protos[i] = -1;
+				}
+				goto found;
+			}
+		}
+		*error_r = t_strdup_printf("Unrecognized protocol '%s'", p);
+		return -1;
+
+		found:;
+	}
+
+	unsigned min = N_ELEMENTS(protocol_versions);
+	for (unsigned i = 0; i < N_ELEMENTS(protocol_versions); i++) {
+		if (explicit_enable) {
+			if (protos[i] > 0)
+				min = I_MIN(min, i);
+		} else if (protos[i] == 0)
+			min = I_MIN(min, i);
+	}
+	if (min == N_ELEMENTS(protocol_versions)) {
+		*error_r = "All protocols disabled";
+		return -1;
+	}
+
+	*min_protocol_r = protocol_versions[min].version;
+	return 0;
+}
+#endif /* HAVE_SSL_CTX_SET_MIN_PROTO_VERSION */
+
 int openssl_get_protocol_options(const char *protocols)
 {
 	const char *const *tmp;
 	int proto, op = 0, include = 0, exclude = 0;
 	bool neg;
 
-	tmp = t_strsplit_spaces(protocols, " ");
+	tmp = t_strsplit_spaces(protocols, ", ");
 	for (; *tmp != NULL; tmp++) {
 		const char *name = *tmp;
 
@@ -30,11 +95,17 @@ int openssl_get_protocol_options(const char *protocols)
 			name++;
 			neg = TRUE;
 		}
+#ifdef SSL_TXT_SSLV2
 		if (strcasecmp(name, SSL_TXT_SSLV2) == 0)
 			proto = DOVECOT_SSL_PROTO_SSLv2;
-		else if (strcasecmp(name, SSL_TXT_SSLV3) == 0)
+		else
+#endif
+#ifdef SSL_TXT_SSLV3
+		if (strcasecmp(name, SSL_TXT_SSLV3) == 0)
 			proto = DOVECOT_SSL_PROTO_SSLv3;
-		else if (strcasecmp(name, SSL_TXT_TLSV1) == 0)
+		else
+#endif
+		if (strcasecmp(name, SSL_TXT_TLSV1) == 0)
 			proto = DOVECOT_SSL_PROTO_TLSv1;
 #ifdef SSL_TXT_TLSV1_1
 		else if (strcasecmp(name, SSL_TXT_TLSV1_1) == 0)
@@ -76,7 +147,7 @@ static const char *asn1_string_to_c(ASN1_STRING *asn_str)
 	unsigned int len;
 
 	len = ASN1_STRING_length(asn_str);
-	cstr = t_strndup(ASN1_STRING_data(asn_str), len);
+	cstr = t_strndup(ASN1_STRING_get0_data(asn_str), len);
 	if (strlen(cstr) != len) {
 		/* NULs in the name - could be some MITM attack.
 		   never allow. */
@@ -91,6 +162,23 @@ static const char *get_general_dns_name(const GENERAL_NAME *name)
 		return "";
 
 	return asn1_string_to_c(name->d.ia5);
+}
+
+static int get_general_ip_addr(const GENERAL_NAME *name, struct ip_addr *ip_r)
+{
+	if (ASN1_STRING_type(name->d.ip) != V_ASN1_OCTET_STRING)
+		return 0;
+	const unsigned char *data = ASN1_STRING_get0_data(name->d.ip);
+
+	if (name->d.ip->length == sizeof(ip_r->u.ip4.s_addr)) {
+		ip_r->family = AF_INET;
+		memcpy(&ip_r->u.ip4.s_addr, data, sizeof(ip_r->u.ip4.s_addr));
+	} else if (name->d.ip->length == sizeof(ip_r->u.ip6.s6_addr)) {
+		ip_r->family = AF_INET6;
+		memcpy(ip_r->u.ip6.s6_addr, data, sizeof(ip_r->u.ip6.s6_addr));
+	} else
+		return -1;
+	return 0;
 }
 
 static const char *get_cname(X509 *cert)
@@ -132,6 +220,7 @@ int openssl_cert_match_name(SSL *ssl, const char *verify_name)
 	X509 *cert;
 	STACK_OF(GENERAL_NAME) *gnames;
 	const GENERAL_NAME *gn;
+	struct ip_addr ip;
 	const char *dnsname;
 	bool dns_names = FALSE;
 	unsigned int i, count;
@@ -143,12 +232,30 @@ int openssl_cert_match_name(SSL *ssl, const char *verify_name)
 	/* verify against SubjectAltNames */
 	gnames = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
 	count = gnames == NULL ? 0 : sk_GENERAL_NAME_num(gnames);
+
+	i_zero(&ip);
+	/* try to convert verify_name to IP */
+	if (inet_pton(AF_INET6, verify_name, &ip.u.ip6) == 1)
+		ip.family = AF_INET6;
+	else if (inet_pton(AF_INET, verify_name, &ip.u.ip4) == 1)
+		ip.family = AF_INET;
+	else
+		i_zero(&ip);
+
 	for (i = 0; i < count; i++) {
 		gn = sk_GENERAL_NAME_value(gnames, i);
+
 		if (gn->type == GEN_DNS) {
 			dns_names = TRUE;
 			dnsname = get_general_dns_name(gn);
 			if (openssl_hostname_equals(dnsname, verify_name))
+				break;
+		} else if (gn->type == GEN_IPADD) {
+			struct ip_addr ip_2;
+			i_zero(&ip_2);
+			dns_names = TRUE;
+			if (get_general_ip_addr(gn, &ip_2) == 0 &&
+			    net_ip_compare(&ip, &ip_2))
 				break;
 		}
 	}
@@ -164,4 +271,96 @@ int openssl_cert_match_name(SSL *ssl, const char *verify_name)
 		ret = -1;
 	X509_free(cert);
 	return ret;
+}
+
+static const char *ssl_err2str(unsigned long err, const char *data, int flags)
+{
+	const char *ret;
+	char *buf;
+	size_t err_size = 256;
+
+	buf = t_malloc(err_size);
+	buf[err_size-1] = '\0';
+	ERR_error_string_n(err, buf, err_size-1);
+	ret = buf;
+
+	if ((flags & ERR_TXT_STRING) != 0)
+		ret = t_strdup_printf("%s: %s", buf, data);
+	return ret;
+}
+
+const char *openssl_iostream_error(void)
+{
+	string_t *errstr = NULL;
+	unsigned long err;
+	const char *data, *final_error;
+	int flags;
+
+	while ((err = ERR_get_error_line_data(NULL, NULL, &data, &flags)) != 0) {
+		if (ERR_GET_REASON(err) == ERR_R_MALLOC_FAILURE)
+			i_fatal_status(FATAL_OUTOFMEM, "OpenSSL malloc() failed");
+		if (ERR_peek_error() == 0)
+			break;
+		if (errstr == NULL)
+			errstr = t_str_new(128);
+		else
+			str_append(errstr, ", ");
+		str_append(errstr, ssl_err2str(err, data, flags));
+	}
+	if (err == 0) {
+		if (errno != 0)
+			final_error = strerror(errno);
+		else
+			final_error = "Unknown error";
+	} else {
+		final_error = ssl_err2str(err, data, flags);
+	}
+	if (errstr == NULL)
+		return final_error;
+	else {
+		str_printfa(errstr, ", %s", final_error);
+		return str_c(errstr);
+	}
+}
+
+const char *openssl_iostream_key_load_error(void)
+{
+       unsigned long err = ERR_peek_error();
+
+       if (ERR_GET_LIB(err) == ERR_LIB_X509 &&
+           ERR_GET_REASON(err) == X509_R_KEY_VALUES_MISMATCH)
+               return "Key is for a different cert than ssl_cert";
+       else
+               return openssl_iostream_error();
+}
+
+static bool is_pem_key(const char *cert)
+{
+	return strstr(cert, "PRIVATE KEY---") != NULL;
+}
+
+const char *
+openssl_iostream_use_certificate_error(const char *cert, const char *set_name)
+{
+	unsigned long err;
+
+	err = ERR_peek_error();
+	if (ERR_GET_LIB(err) != ERR_LIB_PEM ||
+	    ERR_GET_REASON(err) != PEM_R_NO_START_LINE)
+		return openssl_iostream_error();
+	else if (is_pem_key(cert)) {
+		return "The file contains a private key "
+			"(you've mixed ssl_cert and ssl_key settings)";
+	} else if (set_name != NULL && strchr(cert, '\n') == NULL) {
+		return t_strdup_printf("There is no valid PEM certificate. "
+			"(You probably forgot '<' from %s=<%s)", set_name, cert);
+	} else {
+		return "There is no valid PEM certificate.";
+	}
+}
+
+void openssl_iostream_clear_errors(void)
+{
+	while (ERR_get_error() != 0)
+		;
 }

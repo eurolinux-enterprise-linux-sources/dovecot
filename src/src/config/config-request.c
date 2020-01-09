@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -116,6 +116,13 @@ bool config_export_type(string_t *str, const void *value,
 		}
 		break;
 	}
+	case SET_IN_PORT: {
+		const in_port_t *val = value, *dval = default_value;
+
+		if (dump_default || dval == NULL || *val != *dval)
+			str_printfa(str, "%u", *val);
+		break;
+	}
 	case SET_STR_VARS: {
 		const char *const *val = value, *sval;
 		const char *const *_dval = default_value;
@@ -146,7 +153,7 @@ bool config_export_type(string_t *str, const void *value,
 	}
 	case SET_ENUM: {
 		const char *const *val = value;
-		unsigned int len = strlen(*val);
+		size_t len = strlen(*val);
 
 		if (dump_default)
 			str_append(str, *val);
@@ -199,8 +206,9 @@ settings_export(struct config_export_context *ctx,
 {
 	const struct setting_define *def;
 	const void *value, *default_value, *change_value;
-	void *const *children = NULL, *const *change_children = NULL;
-	unsigned int i, count, count2, prefix_len;
+	void *const *children, *const *change_children = NULL;
+	unsigned int i, count, count2;
+	size_t prefix_len;
 	const char *str;
 	char *key;
 	bool dump, dump_default = FALSE;
@@ -237,7 +245,7 @@ settings_export(struct config_export_context *ctx,
 		}
 
 		dump = FALSE;
-		count = 0;
+		count = 0; children = NULL;
 		str_truncate(ctx->value, 0);
 		switch (def->type) {
 		case SET_BOOL:
@@ -245,6 +253,7 @@ settings_export(struct config_export_context *ctx,
 		case SET_UINT:
 		case SET_UINT_OCT:
 		case SET_TIME:
+		case SET_IN_PORT:
 		case SET_STR_VARS:
 		case SET_STR:
 		case SET_ENUM:
@@ -325,6 +334,7 @@ settings_export(struct config_export_context *ctx,
 			}
 		}
 
+		i_assert(count == 0 || children != NULL);
 		prefix_len = str_len(ctx->prefix);
 		for (i = 0; i < count; i++) {
 			str_append(ctx->prefix, def->key);
@@ -357,8 +367,8 @@ config_export_init(const char *const *modules, enum config_dump_scope scope,
 	ctx->callback = callback;
 	ctx->context = context;
 	ctx->scope = scope;
-	ctx->value = t_str_new(256);
-	ctx->prefix = t_str_new(64);
+	ctx->value = str_new(pool, 256);
+	ctx->prefix = str_new(pool, 64);
 	hash_table_create(&ctx->keys, ctx->pool, 0, str_hash, strcmp);
 	return ctx;
 }
@@ -390,6 +400,24 @@ void config_export_get_output(struct config_export_context *ctx,
 	*output_r = ctx->output;
 }
 
+const char *
+config_export_get_import_environment(struct config_export_context *ctx)
+{
+	enum setting_type stype;
+	unsigned int i;
+
+	for (i = 0; ctx->parsers[i].root != NULL; i++) {
+		if (ctx->parsers[i].root == &master_service_setting_parser_info) {
+			const char *const *value =
+				settings_parse_get_value(ctx->parsers[i].parser,
+					"import_environment", &stype);
+			i_assert(value != NULL);
+			return *value;
+		}
+	}
+	i_unreached();
+}
+
 static void config_export_free(struct config_export_context *ctx)
 {
 	if (ctx->dup_parsers != NULL)
@@ -419,9 +447,11 @@ int config_export_finish(struct config_export_context **_ctx)
 					       ctx->modules, parser->root))
 			continue;
 
-		settings_export(ctx, parser->root, FALSE,
-				settings_parser_get(parser->parser),
-				settings_parser_get_changes(parser->parser));
+		T_BEGIN {
+			settings_export(ctx, parser->root, FALSE,
+					settings_parser_get(parser->parser),
+					settings_parser_get_changes(parser->parser));
+		} T_END;
 
 		if ((ctx->flags & CONFIG_DUMP_FLAG_CHECK_SETTINGS) != 0) {
 			settings_parse_var_skip(parser->parser);

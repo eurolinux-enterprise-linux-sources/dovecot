@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -12,13 +12,13 @@
 #include "write-full.h"
 #include "index-mail.h"
 #include "mail-copy.h"
+#include "index-pop3-uidl.h"
 #include "dbox-attachment.h"
 #include "dbox-save.h"
 #include "sdbox-storage.h"
 #include "sdbox-file.h"
 #include "sdbox-sync.h"
 
-#include <stdlib.h>
 
 struct sdbox_save_context {
 	struct dbox_save_context ctx;
@@ -38,7 +38,7 @@ sdbox_save_file_get_file(struct mailbox_transaction_context *t, uint32_t seq)
 {
 	struct sdbox_save_context *ctx =
 		(struct sdbox_save_context *)t->save_ctx;
-	struct dbox_file *const *files;
+	struct dbox_file *const *files, *file;
 	unsigned int count;
 
 	i_assert(seq >= ctx->first_saved_seq);
@@ -47,7 +47,9 @@ sdbox_save_file_get_file(struct mailbox_transaction_context *t, uint32_t seq)
 	i_assert(count > 0);
 	i_assert(seq - ctx->first_saved_seq < count);
 
-	return files[seq - ctx->first_saved_seq];
+	file = files[seq - ctx->first_saved_seq];
+	i_assert(((struct sdbox_file *)file)->written_to_disk);
+	return file;
 }
 
 struct mail_save_context *
@@ -144,6 +146,7 @@ static int dbox_save_mail_write_metadata(struct dbox_save_context *ctx,
 		dbox_file_set_syscall_error(file, "pwrite()");
 		return -1;
 	}
+	sfile->written_to_disk = TRUE;
 
 	/* remember the attachment paths until commit time */
 	extrefs_arr = index_attachment_save_get_extrefs(&ctx->ctx);
@@ -192,7 +195,7 @@ static int dbox_save_finish_write(struct mail_save_context *_ctx)
 	} T_END;
 
 	if (ctx->ctx.failed) {
-		mail_index_expunge(ctx->ctx.trans, ctx->ctx.seq);
+		index_storage_save_abort_last(&ctx->ctx.ctx, ctx->ctx.seq);
 		dbox_file_append_rollback(&ctx->append_ctx);
 		dbox_file_unlink(*files);
 		dbox_file_unref(files);
@@ -243,10 +246,35 @@ static int dbox_save_assign_uids(struct sdbox_save_context *ctx,
 
 		ret = seq_range_array_iter_nth(&iter, n++, &uid);
 		i_assert(ret);
-		if (sdbox_file_assign_uid(sfile, uid) < 0)
+		if (sdbox_file_assign_uid(sfile, uid, FALSE) < 0)
 			return -1;
+		if (ctx->ctx.highest_pop3_uidl_seq == i+1) {
+			index_pop3_uidl_set_max_uid(&ctx->mbox->box,
+				ctx->ctx.trans, uid);
+		}
 	}
 	i_assert(!seq_range_array_iter_nth(&iter, n, &uid));
+	return 0;
+}
+
+static int dbox_save_assign_stub_uids(struct sdbox_save_context *ctx)
+{
+	struct dbox_file *const *files;
+	unsigned int i, count;
+
+	files = array_get(&ctx->files, &count);
+	for (i = 0; i < count; i++) {
+		struct sdbox_file *sfile = (struct sdbox_file *)files[i];
+		uint32_t uid;
+
+		mail_index_lookup_uid(ctx->ctx.trans->view,
+				      ctx->first_saved_seq + i, &uid);
+		i_assert(uid != 0);
+
+		if (sdbox_file_assign_uid(sfile, uid, TRUE) < 0)
+			return -1;
+	}
+
 	return 0;
 }
 
@@ -278,8 +306,6 @@ int sdbox_transaction_save_commit_pre(struct mail_save_context *_ctx)
 
 	if (array_count(&ctx->files) == 0) {
 		/* the mail must be freed in the commit_pre() */
-		if (ctx->ctx.mail != NULL)
-			mail_free(&ctx->ctx.mail);
 		return 0;
 	}
 
@@ -293,17 +319,23 @@ int sdbox_transaction_save_commit_pre(struct mail_save_context *_ctx)
 	dbox_save_update_header_flags(&ctx->ctx, ctx->sync_ctx->sync_view,
 		ctx->mbox->hdr_ext_id, offsetof(struct sdbox_index_header, flags));
 
-	/* assign UIDs for new messages */
 	hdr = mail_index_get_header(ctx->sync_ctx->sync_view);
-	mail_index_append_finish_uids(ctx->ctx.trans, hdr->next_uid,
-				      &_t->changes->saved_uids);
-	if (dbox_save_assign_uids(ctx, &_t->changes->saved_uids) < 0) {
-		sdbox_transaction_save_rollback(_ctx);
-		return -1;
-	}
 
-	if (ctx->ctx.mail != NULL)
-		mail_free(&ctx->ctx.mail);
+	if ((_ctx->transaction->flags & MAILBOX_TRANSACTION_FLAG_FILL_IN_STUB) == 0) {
+		/* assign UIDs for new messages */
+		mail_index_append_finish_uids(ctx->ctx.trans, hdr->next_uid,
+					      &_t->changes->saved_uids);
+		if (dbox_save_assign_uids(ctx, &_t->changes->saved_uids) < 0) {
+			sdbox_transaction_save_rollback(_ctx);
+			return -1;
+		}
+	} else {
+		/* assign UIDs that we stashed away */
+		if (dbox_save_assign_stub_uids(ctx) < 0) {
+			sdbox_transaction_save_rollback(_ctx);
+			return -1;
+		}
+	}
 
 	_t->changes->uid_validity = hdr->uid_validity;
 	return 0;
@@ -336,21 +368,21 @@ void sdbox_transaction_save_commit_post(struct mail_save_context *_ctx,
 				"fdatasync_path(%s) failed: %m", box_path);
 		}
 	}
-	sdbox_transaction_save_rollback(_ctx);
+	i_assert(ctx->ctx.finished);
+	dbox_save_unref_files(ctx);
+	i_free(ctx);
 }
 
 void sdbox_transaction_save_rollback(struct mail_save_context *_ctx)
 {
 	struct sdbox_save_context *ctx = (struct sdbox_save_context *)_ctx;
 
+	ctx->ctx.failed = TRUE;
 	if (!ctx->ctx.finished)
 		sdbox_save_cancel(_ctx);
 	dbox_save_unref_files(ctx);
 
 	if (ctx->sync_ctx != NULL)
 		(void)sdbox_sync_finish(&ctx->sync_ctx, FALSE);
-
-	if (ctx->ctx.mail != NULL)
-		mail_free(&ctx->ctx.mail);
 	i_free(ctx);
 }

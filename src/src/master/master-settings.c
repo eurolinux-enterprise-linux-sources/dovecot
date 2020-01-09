@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "common.h"
 #include "array.h"
@@ -62,9 +62,10 @@ static const struct setting_parser_info file_listener_setting_parser_info = {
 static const struct setting_define inet_listener_setting_defines[] = {
 	DEF(SET_STR, name),
 	DEF(SET_STR, address),
-	DEF(SET_UINT, port),
+	DEF(SET_IN_PORT, port),
 	DEF(SET_BOOL, ssl),
 	DEF(SET_BOOL, reuse_port),
+	DEF(SET_BOOL, haproxy),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -74,7 +75,8 @@ static const struct inet_listener_settings inet_listener_default_settings = {
 	.address = "",
 	.port = 0,
 	.ssl = FALSE,
-	.reuse_port = FALSE
+	.reuse_port = FALSE,
+	.haproxy = FALSE
 };
 
 static const struct setting_parser_info inet_listener_setting_parser_info = {
@@ -176,7 +178,6 @@ static const struct setting_define master_setting_defines[] = {
 	DEF(SET_STR, state_dir),
 	DEF(SET_STR, libexec_dir),
 	DEF(SET_STR, instance_name),
-	DEF(SET_STR, import_environment),
 	DEF(SET_STR, protocols),
 	DEF(SET_STR, listen),
 	DEF(SET_ENUM, ssl),
@@ -199,25 +200,11 @@ static const struct setting_define master_setting_defines[] = {
 	SETTING_DEFINE_LIST_END
 };
 
-/* <settings checks> */
-#ifdef HAVE_SYSTEMD
-#  define ENV_SYSTEMD " LISTEN_PID LISTEN_FDS"
-#else
-#  define ENV_SYSTEMD ""
-#endif
-#ifdef DEBUG
-#  define ENV_GDB " GDB DEBUG_SILENT"
-#else
-#  define ENV_GDB ""
-#endif
-/* </settings checks> */
-
 static const struct master_settings master_default_settings = {
 	.base_dir = PKG_RUNDIR,
 	.state_dir = PKG_STATEDIR,
 	.libexec_dir = PKG_LIBEXECDIR,
 	.instance_name = PACKAGE,
-	.import_environment = "TZ CORE_OUTOFMEM CORE_ERROR" ENV_SYSTEMD ENV_GDB,
 	.protocols = "imap pop3 lmtp",
 	.listen = "*, ::",
 	.ssl = "yes:no:required",
@@ -275,20 +262,26 @@ expand_user(const char **user, enum service_user_default *default_r,
 	}
 }
 
-static void
+static bool
 fix_file_listener_paths(ARRAY_TYPE(file_listener_settings) *l,
 			pool_t pool, const struct master_settings *master_set,
-			ARRAY_TYPE(const_string) *all_listeners)
+			ARRAY_TYPE(const_string) *all_listeners,
+			const char **error_r)
 {
 	struct file_listener_settings *const *sets;
-	unsigned int base_dir_len = strlen(master_set->base_dir);
+	size_t base_dir_len = strlen(master_set->base_dir);
 	enum service_user_default user_default;
 
 	if (!array_is_created(l))
-		return;
+		return TRUE;
 
 	array_foreach(l, sets) {
 		struct file_listener_settings *set = *sets;
+
+		if (set->path[0] == '\0') {
+			*error_r = "path must not be empty";
+			return FALSE;
+		}
 
 		expand_user(&set->user, &user_default, master_set);
 		if (*set->path != '/') {
@@ -303,6 +296,7 @@ fix_file_listener_paths(ARRAY_TYPE(file_listener_settings) *l,
 		if (set->mode != 0)
 			array_append(all_listeners, &set->path, 1);
 	}
+	return TRUE;
 }
 
 static void add_inet_listeners(ARRAY_TYPE(inet_listener_settings) *l,
@@ -318,7 +312,7 @@ static void add_inet_listeners(ARRAY_TYPE(inet_listener_settings) *l,
 		struct inet_listener_settings *set = *sets;
 
 		if (set->port != 0) {
-			str = t_strdup_printf("%d:%s", set->port, set->address);
+			str = t_strdup_printf("%u:%s", set->port, set->address);
 			array_append(all_listeners, &str, 1);
 		}
 	}
@@ -413,8 +407,9 @@ master_settings_verify(void *_set, pool_t pool, const char **error_r)
 	const char *const *strings;
 	ARRAY_TYPE(const_string) all_listeners;
 	struct passwd pw;
-	unsigned int i, j, count, len, client_limit, process_limit;
+	unsigned int i, j, count, client_limit, process_limit;
 	unsigned int max_auth_client_processes, max_anvil_client_processes;
+	size_t len;
 #ifdef CONFIG_BINARY
 	const struct service_settings *default_service;
 #else
@@ -422,6 +417,11 @@ master_settings_verify(void *_set, pool_t pool, const char **error_r)
 	const char *max_client_limit_source = "default_client_limit";
 	unsigned int max_client_limit = set->default_client_limit;
 #endif
+
+	if (*set->listen == '\0') {
+		*error_r = "listen can't be set empty";
+		return FALSE;
+	}
 
 	len = strlen(set->base_dir);
 	if (len > 0 && set->base_dir[len-1] == '/') {
@@ -568,10 +568,18 @@ master_settings_verify(void *_set, pool_t pool, const char **error_r)
 		    strcmp(service->name, "auth") == 0)
 			max_anvil_client_processes += process_limit;
 
-		fix_file_listener_paths(&service->unix_listeners,
-					pool, set, &all_listeners);
-		fix_file_listener_paths(&service->fifo_listeners,
-					pool, set, &all_listeners);
+		if (!fix_file_listener_paths(&service->unix_listeners, pool,
+					     set, &all_listeners, error_r)) {
+			*error_r = t_strdup_printf("service(%s): unix_listener: %s",
+						   service->name, *error_r);
+			return FALSE;
+		}
+		if (!fix_file_listener_paths(&service->fifo_listeners, pool,
+					     set, &all_listeners, error_r)) {
+			*error_r = t_strdup_printf("service(%s): fifo_listener: %s",
+						   service->name, *error_r);
+			return FALSE;
+		}
 		add_inet_listeners(&service->inet_listeners, &all_listeners);
 	}
 
@@ -644,6 +652,7 @@ settings_have_auth_unix_listeners_in(const struct master_settings *set,
 {
 	struct service_settings *const *services;
 	struct file_listener_settings *const *uls;
+	size_t dir_len = strlen(dir);
 
 	array_foreach(&set->services, services) {
 		struct service_settings *service = *services;
@@ -652,7 +661,8 @@ settings_have_auth_unix_listeners_in(const struct master_settings *set,
 			array_foreach(&service->unix_listeners, uls) {
 				struct file_listener_settings *u = *uls;
 
-				if (strncmp(u->path, dir, strlen(dir)) == 0)
+				if (strncmp(u->path, dir, dir_len) == 0 &&
+				    u->path[dir_len] == '/')
 					return TRUE;
 			}
 		}
@@ -666,7 +676,7 @@ static void unlink_sockets(const char *path, const char *prefix)
 	struct dirent *dp;
 	struct stat st;
 	string_t *str;
-	unsigned int prefix_len;
+	size_t prefix_len;
 
 	dirp = opendir(path);
 	if (dirp == NULL) {
@@ -697,8 +707,8 @@ static void unlink_sockets(const char *path, const char *prefix)
 		   listening in them. do this only at startup, because
 		   when SIGHUPing a child process might catch the new
 		   connection before it notices that it's supposed
-		   to die. null_fd == -1 check is a bit kludgy, but works.. */
-		if (null_fd == -1) {
+		   to die. */
+		if (!startup_finished) {
 			int fd = net_connect_unix(str_c(str));
 			if (fd != -1 || errno != ECONNREFUSED) {
 				i_fatal("Dovecot is already running? "
@@ -707,8 +717,7 @@ static void unlink_sockets(const char *path, const char *prefix)
 			}
 		}
 
-		if (unlink(str_c(str)) < 0 && errno != ENOENT)
-			i_error("unlink(%s) failed: %m", str_c(str));
+		i_unlink_if_exists(str_c(str));
 	}
 	(void)closedir(dirp);
 }

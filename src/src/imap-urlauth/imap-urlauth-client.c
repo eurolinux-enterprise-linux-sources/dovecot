@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "imap-urlauth-common.h"
 #include "array.h"
@@ -19,7 +19,6 @@
 #include "master-service.h"
 #include "master-interface.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
@@ -342,9 +341,7 @@ void client_destroy(struct client *client, const char *reason)
 	
 	o_stream_destroy(&client->output);
 
-	net_disconnect(client->fd_in);
-	if (client->fd_in != client->fd_out)
-		net_disconnect(client->fd_out);
+	fd_close_maybe_stdio(&client->fd_in, &client->fd_out);
 
 	if (client->username != NULL)
 		i_free(client->username);

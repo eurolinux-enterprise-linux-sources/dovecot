@@ -1,10 +1,9 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "module-dir.h"
 #include "iostream-ssl-private.h"
 
-#include <stdlib.h>
 
 static bool ssl_module_loaded = FALSE;
 #ifdef HAVE_SSL
@@ -15,11 +14,15 @@ static const struct iostream_ssl_vfuncs *ssl_vfuncs = NULL;
 #ifdef HAVE_SSL
 static void ssl_module_unload(void)
 {
-	module_dir_deinit(ssl_module);
-	ssl_vfuncs->global_deinit();
 	module_dir_unload(&ssl_module);
 }
 #endif
+
+void iostream_ssl_module_init(const struct iostream_ssl_vfuncs *vfuncs)
+{
+	ssl_vfuncs = vfuncs;
+	ssl_module_loaded = TRUE;
+}
 
 static int ssl_module_load(const char **error_r)
 {
@@ -27,21 +30,27 @@ static int ssl_module_load(const char **error_r)
 	const char *plugin_name = "ssl_iostream_openssl";
 	struct module_dir_load_settings mod_set;
 
-	memset(&mod_set, 0, sizeof(mod_set));
+	i_zero(&mod_set);
 	mod_set.abi_version = DOVECOT_ABI_VERSION;
 	mod_set.setting_name = "<built-in lib-ssl-iostream lookup>";
+	mod_set.require_init_funcs = TRUE;
 	ssl_module = module_dir_load(MODULE_DIR, plugin_name, &mod_set);
-
-	ssl_vfuncs = module_get_symbol(ssl_module, "ssl_vfuncs");
-	if (ssl_vfuncs == NULL) {
-		*error_r = t_strdup_printf("%s: Broken plugin: "
-			"ssl_vfuncs symbol not found", plugin_name);
+	if (module_dir_try_load_missing(&ssl_module, MODULE_DIR, plugin_name,
+					&mod_set, error_r) < 0)
+		return -1;
+	module_dir_init(ssl_module);
+	if (!ssl_module_loaded) {
+		*error_r = t_strdup_printf(
+			"%s didn't call iostream_ssl_module_init() - SSL not initialized",
+			plugin_name);
 		module_dir_unload(&ssl_module);
 		return -1;
 	}
 
-	lib_atexit(ssl_module_unload);
-	ssl_module_loaded = TRUE;
+	/* Destroy SSL module after (most of) the others. Especially lib-fs
+	   backends may still want to access SSL module in their own
+	   atexit-callbacks. */
+	lib_atexit_priority(ssl_module_unload, LIB_ATEXIT_PRIORITY_LOW);
 	return 0;
 #else
 	*error_r = "SSL support not compiled in";
@@ -79,13 +88,14 @@ void ssl_iostream_context_deinit(struct ssl_iostream_context **_ctx)
 	ssl_vfuncs->context_deinit(ctx);
 }
 
-int ssl_iostream_generate_params(buffer_t *output, const char **error_r)
+int ssl_iostream_generate_params(buffer_t *output, unsigned int dh_length,
+				 const char **error_r)
 {
 	if (!ssl_module_loaded) {
 		if (ssl_module_load(error_r) < 0)
 			return -1;
 	}
-	return ssl_vfuncs->generate_params(output, error_r);
+	return ssl_vfuncs->generate_params(output, dh_length, error_r);
 }
 
 int ssl_iostream_context_import_params(struct ssl_iostream_context *ctx,
@@ -100,7 +110,9 @@ int io_stream_create_ssl_client(struct ssl_iostream_context *ctx, const char *ho
 				struct ssl_iostream **iostream_r,
 				const char **error_r)
 {
-	return ssl_vfuncs->create(ctx, host, set, input, output,
+	struct ssl_iostream_settings set_copy = *set;
+	set_copy.verify_remote_cert = TRUE;
+	return ssl_vfuncs->create(ctx, host, &set_copy, input, output,
 				  iostream_r, error_r);
 }
 

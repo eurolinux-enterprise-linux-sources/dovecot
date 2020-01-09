@@ -7,6 +7,7 @@
 #include "hash-format.h"
 #include "net.h"
 #include "unichar.h"
+#include "hash-method.h"
 #include "settings-parser.h"
 #include "all-settings.h"
 #include <stddef.h>
@@ -32,11 +33,27 @@ struct mail_storage_settings {
 	const char *mail_cache_fields;
 	const char *mail_always_cache_fields;
 	const char *mail_never_cache_fields;
+	const char *mail_server_comment;
+	const char *mail_server_admin;
 	unsigned int mail_cache_min_mail_count;
+	unsigned int mail_cache_unaccessed_field_drop;
+	uoff_t mail_cache_record_max_size;
+	uoff_t mail_cache_compress_min_size;
+	unsigned int mail_cache_compress_delete_percentage;
+	unsigned int mail_cache_compress_continued_percentage;
+	unsigned int mail_cache_compress_header_continue_count;
+	uoff_t mail_index_rewrite_min_log_bytes;
+	uoff_t mail_index_rewrite_max_log_bytes;
+	uoff_t mail_index_log_rotate_min_size;
+	uoff_t mail_index_log_rotate_max_size;
+	unsigned int mail_index_log_rotate_min_age;
+	unsigned int mail_index_log2_max_age;
 	unsigned int mailbox_idle_check_interval;
 	unsigned int mail_max_keyword_length;
 	unsigned int mail_max_lock_timeout;
 	unsigned int mail_temp_scan_interval;
+	unsigned int mail_vsize_bg_after_count;
+	unsigned int mail_sort_max_read_count;
 	bool mail_save_crlf;
 	const char *mail_fsync;
 	bool mmap_disable;
@@ -44,6 +61,8 @@ struct mail_storage_settings {
 	bool mail_nfs_storage;
 	bool mail_nfs_index;
 	bool mailbox_list_index;
+	bool mailbox_list_index_very_dirty_syncs;
+	bool mailbox_list_index_include_inbox;
 	bool mail_debug;
 	bool mail_full_filesystem_access;
 	bool maildir_stat_dirs;
@@ -54,9 +73,14 @@ struct mail_storage_settings {
 	const char *ssl_client_ca_dir;
 	const char *ssl_client_ca_file;
 	const char *ssl_crypto_device;
+	const char *mail_attachment_detection_options;
 
 	enum file_lock_method parsed_lock_method;
 	enum fsync_mode parsed_fsync_mode;
+
+	const char *const *parsed_mail_attachment_content_type_filter;
+	bool parsed_mail_attachment_exclude_inlined;
+	bool parsed_mail_attachment_detection_add_flags_on_save;
 };
 struct mail_namespace_settings {
 	const char *name;
@@ -72,6 +96,7 @@ struct mail_namespace_settings {
 	bool subscriptions;
 	bool ignore_on_failure;
 	bool disabled;
+	unsigned int order;
 
 	ARRAY(struct mailbox_settings *) mailboxes;
 	struct mail_user_settings *user_set;
@@ -81,6 +106,9 @@ struct mailbox_settings {
 	const char *autocreate;
 	const char *special_use;
 	const char *driver;
+	const char *comment;
+	unsigned int autoexpunge;
+	unsigned int autoexpunge_max_mails;
 };
 struct mail_user_settings {
 	const char *base_dir;
@@ -107,9 +135,14 @@ struct mail_user_settings {
 	ARRAY(const char *) plugin_envs;
 };
 /* ../../src/lib-storage/index/pop3c/pop3c-settings.h */
+/* <settings checks> */
+enum pop3c_features {
+        POP3C_FEATURE_NO_PIPELINING = 0x1,
+};
+/* </settings checks> */
 struct pop3c_settings {
 	const char *pop3c_host;
-	unsigned int pop3c_port;
+	in_port_t pop3c_port;
 
 	const char *pop3c_user;
 	const char *pop3c_master_user;
@@ -120,6 +153,9 @@ struct pop3c_settings {
 
 	const char *pop3c_rawlog_dir;
 	bool pop3c_quick_received_date;
+
+	const char *pop3c_features;
+	enum pop3c_features parsed_features;
 };
 /* ../../src/lib-storage/index/mbox/mbox-settings.h */
 struct mbox_settings {
@@ -138,22 +174,36 @@ struct maildir_settings {
 	bool maildir_copy_with_hardlinks;
 	bool maildir_very_dirty_syncs;
 	bool maildir_broken_filename_sizes;
+	bool maildir_empty_new;
 };
 /* ../../src/lib-storage/index/imapc/imapc-settings.h */
 /* <settings checks> */
 enum imapc_features {
-	IMAPC_FEATURE_RFC822_SIZE	= 0x01,
-	IMAPC_FEATURE_GUID_FORCED	= 0x02,
-	IMAPC_FEATURE_FETCH_HEADERS	= 0x04
+	IMAPC_FEATURE_RFC822_SIZE		= 0x01,
+	IMAPC_FEATURE_GUID_FORCED		= 0x02,
+	IMAPC_FEATURE_FETCH_HEADERS		= 0x04,
+	IMAPC_FEATURE_GMAIL_MIGRATION		= 0x08,
+	IMAPC_FEATURE_SEARCH			= 0x10,
+	IMAPC_FEATURE_ZIMBRA_WORKAROUNDS	= 0x20,
+	IMAPC_FEATURE_NO_EXAMINE		= 0x40,
+	IMAPC_FEATURE_PROXYAUTH			= 0x80,
+	IMAPC_FEATURE_FETCH_MSN_WORKAROUNDS	= 0x100,
+	IMAPC_FEATURE_FETCH_FIX_BROKEN_MAILS	= 0x200,
+	IMAPC_FEATURE_MODSEQ			= 0x400,
+	IMAPC_FEATURE_DELAY_LOGIN		= 0x800,
+	IMAPC_FEATURE_FETCH_BODYSTRUCTURE	= 0x1000,
+	IMAPC_FEATURE_FETCH_EMPTY_IS_EXPUNGED	= 0x4000,
+	IMAPC_FEATURE_NO_MSN_UPDATES		= 0x8000,
 };
 /* </settings checks> */
 struct imapc_settings {
 	const char *imapc_host;
-	unsigned int imapc_port;
+	in_port_t imapc_port;
 
 	const char *imapc_user;
 	const char *imapc_master_user;
 	const char *imapc_password;
+	const char *imapc_sasl_mechanisms;
 
 	const char *imapc_ssl;
 	bool imapc_ssl_verify;
@@ -161,13 +211,23 @@ struct imapc_settings {
 	const char *imapc_features;
 	const char *imapc_rawlog_dir;
 	const char *imapc_list_prefix;
+	unsigned int imapc_cmd_timeout;
 	unsigned int imapc_max_idle_time;
+	unsigned int imapc_connection_retry_count;
+	unsigned int imapc_connection_retry_interval;
+	uoff_t imapc_max_line_length;
+
+	const char *pop3_deleted_flag;
 
 	enum imapc_features parsed_features;
+	unsigned int throttle_init_msecs;
+	unsigned int throttle_max_msecs;
+	unsigned int throttle_shrink_min_msecs;
 };
 /* ../../src/lib-storage/index/dbox-multi/mdbox-settings.h */
 struct mdbox_settings {
 	bool mdbox_preallocate_space;
+	bool mdbox_purge_preserve_alt;
 	uoff_t mdbox_rotate_size;
 	unsigned int mdbox_rotate_interval;
 };
@@ -211,9 +271,10 @@ ARRAY_DEFINE_TYPE(file_listener_settings, struct file_listener_settings *);
 struct inet_listener_settings {
 	const char *name;
 	const char *address;
-	unsigned int port;
+	in_port_t port;
 	bool ssl;
 	bool reuse_port;
+	bool haproxy;
 };
 ARRAY_DEFINE_TYPE(inet_listener_settings, struct inet_listener_settings *);
 struct service_settings {
@@ -258,16 +319,26 @@ struct master_service_ssl_settings {
 	const char *ssl;
 	const char *ssl_ca;
 	const char *ssl_cert;
+	const char *ssl_alt_cert;
 	const char *ssl_key;
+	const char *ssl_alt_key;
 	const char *ssl_key_password;
 	const char *ssl_cipher_list;
 	const char *ssl_protocols;
 	const char *ssl_cert_username_field;
 	const char *ssl_crypto_device;
+	const char *ssl_options;
+
 	bool ssl_verify_client_cert;
 	bool ssl_require_crl;
 	bool verbose_ssl;
 	bool ssl_prefer_server_ciphers;
+
+	/* These are derived from ssl_options, not set directly */
+	struct {
+		bool compression;
+		bool tickets;
+	} parsed_opts;
 };
 /* ../../src/lib-master/master-service-settings.h */
 extern const struct setting_parser_info master_service_setting_parser_info;
@@ -279,10 +350,14 @@ struct master_service_settings {
 	const char *debug_log_path;
 	const char *log_timestamp;
 	const char *syslog_facility;
+	const char *import_environment;
 	uoff_t config_cache_size;
 	bool version_ignore;
 	bool shutdown_clients;
 	bool verbose_proctitle;
+
+	const char *haproxy_trusted_networks;
+	unsigned int haproxy_timeout;
 };
 /* ../../src/lib-lda/lda-settings.h */
 extern const struct setting_parser_info lda_setting_parser_info;
@@ -312,7 +387,7 @@ struct dict_sql_settings {
 extern const struct setting_parser_info mailbox_setting_parser_info;
 extern const struct setting_parser_info mail_namespace_setting_parser_info;
 /* <settings checks> */
-static bool mail_storage_settings_check(void *_set, pool_t pool ATTR_UNUSED,
+static bool mail_storage_settings_check(void *_set, pool_t pool,
 					const char **error_r)
 {
 	struct mail_storage_settings *set = _set;
@@ -352,6 +427,11 @@ static bool mail_storage_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 				    &set->parsed_lock_method)) {
 		*error_r = t_strdup_printf("Unknown lock_method: %s",
 					   set->lock_method);
+		return FALSE;
+	}
+
+	if (set->mail_cache_compress_delete_percentage > 100) {
+		*error_r = "mail_cache_compress_delete_percentage can't be over 100";
 		return FALSE;
 	}
 
@@ -408,6 +488,39 @@ static bool mail_storage_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 		return FALSE;
 	}
 #endif
+
+	// FIXME: check set->mail_server_admin syntax (RFC 5464, Section 6.2.2)
+
+	/* parse mail_attachment_indicator_options */
+	if (*set->mail_attachment_detection_options != '\0') {
+		ARRAY_TYPE(const_string) content_types;
+		p_array_init(&content_types, pool, 2);
+
+		const char *const *options =
+			t_strsplit_spaces(set->mail_attachment_detection_options, " ");
+
+		while(*options != NULL) {
+			const char *opt = *options;
+
+			if (strcmp(opt, "add-flags-on-save") == 0) {
+				set->parsed_mail_attachment_detection_add_flags_on_save = TRUE;
+			} else if (strcmp(opt, "exclude-inlined") == 0) {
+				set->parsed_mail_attachment_exclude_inlined = TRUE;
+			} else if (strncmp(opt, "content-type=", 13) == 0) {
+				const char *value = p_strdup(pool, opt+13);
+				array_append(&content_types, &value, 1);
+			} else {
+				*error_r = t_strdup_printf("mail_attachment_detection_options: "
+					"Unknown option: %s", opt);
+				return FALSE;
+			}
+			options++;
+		}
+
+		array_append_zero(&content_types);
+		set->parsed_mail_attachment_content_type_filter = array_idx(&content_types, 0);
+	}
+
 	return TRUE;
 }
 
@@ -554,16 +667,33 @@ static const struct setting_define mail_storage_setting_defines[] = {
 	DEF(SET_STR_VARS, mail_attachment_dir),
 	DEF(SET_STR, mail_attachment_hash),
 	DEF(SET_SIZE, mail_attachment_min_size),
+	DEF(SET_STR, mail_attachment_detection_options),
 	DEF(SET_STR_VARS, mail_attribute_dict),
 	DEF(SET_UINT, mail_prefetch_count),
 	DEF(SET_STR, mail_cache_fields),
 	DEF(SET_STR, mail_always_cache_fields),
 	DEF(SET_STR, mail_never_cache_fields),
+	DEF(SET_STR, mail_server_comment),
+	DEF(SET_STR, mail_server_admin),
 	DEF(SET_UINT, mail_cache_min_mail_count),
+	DEF(SET_TIME, mail_cache_unaccessed_field_drop),
+	DEF(SET_SIZE, mail_cache_record_max_size),
+	DEF(SET_SIZE, mail_cache_compress_min_size),
+	DEF(SET_UINT, mail_cache_compress_delete_percentage),
+	DEF(SET_UINT, mail_cache_compress_continued_percentage),
+	DEF(SET_UINT, mail_cache_compress_header_continue_count),
+	DEF(SET_SIZE, mail_index_rewrite_min_log_bytes),
+	DEF(SET_SIZE, mail_index_rewrite_max_log_bytes),
+	DEF(SET_SIZE, mail_index_log_rotate_min_size),
+	DEF(SET_SIZE, mail_index_log_rotate_max_size),
+	DEF(SET_TIME, mail_index_log_rotate_min_age),
+	DEF(SET_TIME, mail_index_log2_max_age),
 	DEF(SET_TIME, mailbox_idle_check_interval),
 	DEF(SET_UINT, mail_max_keyword_length),
 	DEF(SET_TIME, mail_max_lock_timeout),
 	DEF(SET_TIME, mail_temp_scan_interval),
+	DEF(SET_UINT, mail_vsize_bg_after_count),
+	DEF(SET_UINT, mail_sort_max_read_count),
 	DEF(SET_BOOL, mail_save_crlf),
 	DEF(SET_ENUM, mail_fsync),
 	DEF(SET_BOOL, mmap_disable),
@@ -571,6 +701,8 @@ static const struct setting_define mail_storage_setting_defines[] = {
 	DEF(SET_BOOL, mail_nfs_storage),
 	DEF(SET_BOOL, mail_nfs_index),
 	DEF(SET_BOOL, mailbox_list_index),
+	DEF(SET_BOOL, mailbox_list_index_very_dirty_syncs),
+	DEF(SET_BOOL, mailbox_list_index_include_inbox),
 	DEF(SET_BOOL, mail_debug),
 	DEF(SET_BOOL, mail_full_filesystem_access),
 	DEF(SET_BOOL, maildir_stat_dirs),
@@ -590,16 +722,33 @@ const struct mail_storage_settings mail_storage_default_settings = {
 	.mail_attachment_dir = "",
 	.mail_attachment_hash = "%{sha1}",
 	.mail_attachment_min_size = 1024*128,
+	.mail_attachment_detection_options = "",
 	.mail_attribute_dict = "",
 	.mail_prefetch_count = 0,
 	.mail_cache_fields = "flags",
 	.mail_always_cache_fields = "",
 	.mail_never_cache_fields = "imap.envelope",
+	.mail_server_comment = "",
+	.mail_server_admin = "",
 	.mail_cache_min_mail_count = 0,
+	.mail_cache_unaccessed_field_drop = 60*60*24*30,
+	.mail_cache_record_max_size = 64 * 1024,
+	.mail_cache_compress_min_size = 32 * 1024,
+	.mail_cache_compress_delete_percentage = 20,
+	.mail_cache_compress_continued_percentage = 200,
+	.mail_cache_compress_header_continue_count = 4,
+	.mail_index_rewrite_min_log_bytes = 8 * 1024,
+	.mail_index_rewrite_max_log_bytes = 128 * 1024,
+	.mail_index_log_rotate_min_size = 32 * 1024,
+	.mail_index_log_rotate_max_size = 1024 * 1024,
+	.mail_index_log_rotate_min_age = 5 * 60,
+	.mail_index_log2_max_age = 3600 * 24 * 2,
 	.mailbox_idle_check_interval = 30,
 	.mail_max_keyword_length = 50,
 	.mail_max_lock_timeout = 0,
 	.mail_temp_scan_interval = 7*24*60*60,
+	.mail_vsize_bg_after_count = 0,
+	.mail_sort_max_read_count = 0,
 	.mail_save_crlf = FALSE,
 	.mail_fsync = "optimized:never:always",
 	.mmap_disable = FALSE,
@@ -607,6 +756,8 @@ const struct mail_storage_settings mail_storage_default_settings = {
 	.mail_nfs_storage = FALSE,
 	.mail_nfs_index = FALSE,
 	.mailbox_list_index = FALSE,
+	.mailbox_list_index_very_dirty_syncs = FALSE,
+	.mailbox_list_index_include_inbox = FALSE,
 	.mail_debug = FALSE,
 	.mail_full_filesystem_access = FALSE,
 	.maildir_stat_dirs = FALSE,
@@ -639,6 +790,9 @@ static const struct setting_define mailbox_setting_defines[] = {
 	{ SET_ENUM, "auto", offsetof(struct mailbox_settings, autocreate), NULL } ,
 	DEF(SET_STR, special_use),
 	DEF(SET_STR, driver),
+	DEF(SET_STR, comment),
+	DEF(SET_TIME, autoexpunge),
+	DEF(SET_UINT, autoexpunge_max_mails),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -648,7 +802,10 @@ const struct mailbox_settings mailbox_default_settings = {
 		MAILBOX_SET_AUTO_CREATE":"
 		MAILBOX_SET_AUTO_SUBSCRIBE,
 	.special_use = "",
-	.driver = ""
+	.driver = "",
+	.comment = "",
+	.autoexpunge = 0,
+	.autoexpunge_max_mails = 0
 };
 const struct setting_parser_info mailbox_setting_parser_info = {
 	.defines = mailbox_setting_defines,
@@ -685,6 +842,7 @@ static const struct setting_define mail_namespace_setting_defines[] = {
 	DEF(SET_BOOL, subscriptions),
 	DEF(SET_BOOL, ignore_on_failure),
 	DEF(SET_BOOL, disabled),
+	DEF(SET_UINT, order),
 
 	DEFLIST_UNIQUE(mailboxes, "mailbox", &mailbox_setting_parser_info),
 
@@ -704,6 +862,7 @@ const struct mail_namespace_settings mail_namespace_default_settings = {
 	.subscriptions = TRUE,
 	.ignore_on_failure = FALSE,
 	.disabled = FALSE,
+	.order = 0,
 
 	.mailboxes = ARRAY_INIT
 };
@@ -794,23 +953,59 @@ const struct setting_parser_info mail_user_setting_parser_info = {
 };
 /* ../../src/lib-storage/index/pop3c/pop3c-settings.c */
 /* <settings checks> */
+struct pop3c_feature_list {
+	const char *name;
+	enum pop3c_features num;
+};
+
+static const struct pop3c_feature_list pop3c_feature_list[] = {
+	{ "no-pipelining", POP3C_FEATURE_NO_PIPELINING },
+	{ NULL, 0 }
+};
+
+static int
+pop3c_settings_parse_features(struct pop3c_settings *set,
+			      const char **error_r)
+{
+	enum pop3c_features features = 0;
+	const struct pop3c_feature_list *list;
+	const char *const *str;
+
+	str = t_strsplit_spaces(set->pop3c_features, " ,");
+	for (; *str != NULL; str++) {
+		list = pop3c_feature_list;
+		for (; list->name != NULL; list++) {
+			if (strcasecmp(*str, list->name) == 0) {
+				features |= list->num;
+				break;
+			}
+		}
+		if (list->name == NULL) {
+			*error_r = t_strdup_printf("pop3c_features: "
+				"Unknown feature: %s", *str);
+			return -1;
+		}
+	}
+	set->parsed_features = features;
+	return 0;
+}
+
 static bool pop3c_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 				 const char **error_r)
 {
 	struct pop3c_settings *set = _set;
 
-	if (set->pop3c_port == 0 || set->pop3c_port > 65535) {
-		*error_r = "invalid pop3c_port";
+	if (pop3c_settings_parse_features(set, error_r) < 0)
 		return FALSE;
-	}
 	return TRUE;
 }
+/* </settings checks> */
 #undef DEF
 #define DEF(type, name) \
 	{ type, #name, offsetof(struct pop3c_settings, name), NULL }
 static const struct setting_define pop3c_setting_defines[] = {
 	DEF(SET_STR, pop3c_host),
-	DEF(SET_UINT, pop3c_port),
+	DEF(SET_IN_PORT, pop3c_port),
 
 	DEF(SET_STR_VARS, pop3c_user),
 	DEF(SET_STR_VARS, pop3c_master_user),
@@ -821,6 +1016,8 @@ static const struct setting_define pop3c_setting_defines[] = {
 
 	DEF(SET_STR, pop3c_rawlog_dir),
 	DEF(SET_BOOL, pop3c_quick_received_date),
+
+	DEF(SET_STR, pop3c_features),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -836,7 +1033,9 @@ static const struct pop3c_settings pop3c_default_settings = {
 	.pop3c_ssl_verify = TRUE,
 
 	.pop3c_rawlog_dir = "",
-	.pop3c_quick_received_date = FALSE
+	.pop3c_quick_received_date = FALSE,
+
+	.pop3c_features = ""
 };
 static const struct setting_parser_info pop3c_setting_parser_info = {
 	.module_name = "pop3c",
@@ -849,7 +1048,7 @@ static const struct setting_parser_info pop3c_setting_parser_info = {
 	.parent_offset = (size_t)-1,
 	.parent = &mail_user_setting_parser_info,
 
-	.check_func = pop3c_settings_check
+        .check_func = pop3c_settings_check
 };
 /* ../../src/lib-storage/index/mbox/mbox-settings.c */
 #undef DEF
@@ -898,13 +1097,15 @@ static const struct setting_define maildir_setting_defines[] = {
 	DEF(SET_BOOL, maildir_copy_with_hardlinks),
 	DEF(SET_BOOL, maildir_very_dirty_syncs),
 	DEF(SET_BOOL, maildir_broken_filename_sizes),
+	DEF(SET_BOOL, maildir_empty_new),
 
 	SETTING_DEFINE_LIST_END
 };
 static const struct maildir_settings maildir_default_settings = {
 	.maildir_copy_with_hardlinks = TRUE,
 	.maildir_very_dirty_syncs = FALSE,
-	.maildir_broken_filename_sizes = FALSE
+	.maildir_broken_filename_sizes = FALSE,
+	.maildir_empty_new = FALSE
 };
 static const struct setting_parser_info maildir_setting_parser_info = {
 	.module_name = "maildir",
@@ -928,8 +1129,37 @@ static const struct imapc_feature_list imapc_feature_list[] = {
 	{ "rfc822.size", IMAPC_FEATURE_RFC822_SIZE },
 	{ "guid-forced", IMAPC_FEATURE_GUID_FORCED },
 	{ "fetch-headers", IMAPC_FEATURE_FETCH_HEADERS },
+	{ "gmail-migration", IMAPC_FEATURE_GMAIL_MIGRATION },
+	{ "search", IMAPC_FEATURE_SEARCH },
+	{ "zimbra-workarounds", IMAPC_FEATURE_ZIMBRA_WORKAROUNDS },
+	{ "no-examine", IMAPC_FEATURE_NO_EXAMINE },
+	{ "proxyauth", IMAPC_FEATURE_PROXYAUTH },
+	{ "fetch-msn-workarounds", IMAPC_FEATURE_FETCH_MSN_WORKAROUNDS },
+	{ "fetch-fix-broken-mails", IMAPC_FEATURE_FETCH_FIX_BROKEN_MAILS },
+	{ "modseq", IMAPC_FEATURE_MODSEQ },
+	{ "delay-login", IMAPC_FEATURE_DELAY_LOGIN },
+	{ "fetch-bodystructure", IMAPC_FEATURE_FETCH_BODYSTRUCTURE },
+	{ "fetch-empty-is-expunged", IMAPC_FEATURE_FETCH_EMPTY_IS_EXPUNGED },
+	{ "no-msn-updates", IMAPC_FEATURE_NO_MSN_UPDATES },
 	{ NULL, 0 }
 };
+
+static int
+imapc_settings_parse_throttle(struct imapc_settings *set,
+			      const char *throttle_str, const char **error_r)
+{
+	const char *const *tmp;
+
+	tmp = t_strsplit(throttle_str, ":");
+	if (str_array_length(tmp) != 3 ||
+	    str_to_uint(tmp[0], &set->throttle_init_msecs) < 0 ||
+	    str_to_uint(tmp[1], &set->throttle_max_msecs) < 0 ||
+	    str_to_uint(tmp[2], &set->throttle_shrink_min_msecs) < 0) {
+		*error_r = "imapc_features: Invalid throttle settings";
+		return -1;
+	}
+	return 0;
+}
 
 static int
 imapc_settings_parse_features(struct imapc_settings *set,
@@ -948,6 +1178,11 @@ imapc_settings_parse_features(struct imapc_settings *set,
 				break;
 			}
 		}
+		if (strncasecmp(*str, "throttle:", 9) == 0) {
+			if (imapc_settings_parse_throttle(set, *str + 9, error_r) < 0)
+				return -1;
+			continue;
+		}
 		if (list->name == NULL) {
 			*error_r = t_strdup_printf("imapc_features: "
 				"Unknown feature: %s", *str);
@@ -963,10 +1198,6 @@ static bool imapc_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 {
 	struct imapc_settings *set = _set;
 
-	if (set->imapc_port == 0 || set->imapc_port > 65535) {
-		*error_r = "invalid imapc_port";
-		return FALSE;
-	}
 	if (set->imapc_max_idle_time == 0) {
 		*error_r = "imapc_max_idle_time must not be 0";
 		return FALSE;
@@ -980,11 +1211,12 @@ static bool imapc_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 	{ type, #name, offsetof(struct imapc_settings, name), NULL }
 static const struct setting_define imapc_setting_defines[] = {
 	DEF(SET_STR, imapc_host),
-	DEF(SET_UINT, imapc_port),
+	DEF(SET_IN_PORT, imapc_port),
 
 	DEF(SET_STR_VARS, imapc_user),
 	DEF(SET_STR_VARS, imapc_master_user),
 	DEF(SET_STR, imapc_password),
+	DEF(SET_STR, imapc_sasl_mechanisms),
 
 	DEF(SET_ENUM, imapc_ssl),
 	DEF(SET_BOOL, imapc_ssl_verify),
@@ -992,7 +1224,13 @@ static const struct setting_define imapc_setting_defines[] = {
 	DEF(SET_STR, imapc_features),
 	DEF(SET_STR, imapc_rawlog_dir),
 	DEF(SET_STR, imapc_list_prefix),
+	DEF(SET_TIME, imapc_cmd_timeout),
 	DEF(SET_TIME, imapc_max_idle_time),
+	DEF(SET_UINT, imapc_connection_retry_count),
+	DEF(SET_TIME, imapc_connection_retry_interval),
+	DEF(SET_SIZE, imapc_max_line_length),
+
+	DEF(SET_STR, pop3_deleted_flag),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -1003,6 +1241,7 @@ static const struct imapc_settings imapc_default_settings = {
 	.imapc_user = "",
 	.imapc_master_user = "",
 	.imapc_password = "",
+	.imapc_sasl_mechanisms = "",
 
 	.imapc_ssl = "no:imaps:starttls",
 	.imapc_ssl_verify = TRUE,
@@ -1010,7 +1249,13 @@ static const struct imapc_settings imapc_default_settings = {
 	.imapc_features = "",
 	.imapc_rawlog_dir = "",
 	.imapc_list_prefix = "",
-	.imapc_max_idle_time = 60*29
+	.imapc_cmd_timeout = 5*60,
+	.imapc_max_idle_time = 60*29,
+	.imapc_connection_retry_count = 1,
+	.imapc_connection_retry_interval = 1,
+	.imapc_max_line_length = 0,
+
+	.pop3_deleted_flag = ""
 };
 static const struct setting_parser_info imapc_setting_parser_info = {
 	.module_name = "imapc",
@@ -1031,6 +1276,7 @@ static const struct setting_parser_info imapc_setting_parser_info = {
 	{ type, #name, offsetof(struct mdbox_settings, name), NULL }
 static const struct setting_define mdbox_setting_defines[] = {
 	DEF(SET_BOOL, mdbox_preallocate_space),
+	DEF(SET_BOOL, mdbox_purge_preserve_alt),
 	DEF(SET_SIZE, mdbox_rotate_size),
 	DEF(SET_TIME, mdbox_rotate_interval),
 
@@ -1038,6 +1284,7 @@ static const struct setting_define mdbox_setting_defines[] = {
 };
 static const struct mdbox_settings mdbox_default_settings = {
 	.mdbox_preallocate_space = FALSE,
+	.mdbox_purge_preserve_alt = FALSE,
 	.mdbox_rotate_size = 2*1024*1024,
 	.mdbox_rotate_interval = 0
 };
@@ -1077,7 +1324,7 @@ static const struct setting_define lda_setting_defines[] = {
 	SETTING_DEFINE_LIST_END
 };
 static const struct lda_settings lda_default_settings = {
-	.postmaster_address = "",
+	.postmaster_address = "postmaster@%d",
 	.hostname = "",
 	.submission_host = "",
 	.sendmail_path = "/usr/sbin/sendmail",
@@ -1112,6 +1359,7 @@ const struct setting_parser_info lda_setting_parser_info = {
 };
 /* ../../src/lib-dict/dict-sql-settings.c */
 #define DEF_STR(name) DEF_STRUCT_STR(name, dict_sql_map)
+#define DEF_BOOL(name) DEF_STRUCT_BOOL(name, dict_sql_map)
 /* ../../src/stats/stats-settings.h */
 extern const struct setting_parser_info stats_setting_parser_info;
 struct stats_settings {
@@ -1122,6 +1370,10 @@ struct stats_settings {
 	unsigned int user_min_time;
 	unsigned int domain_min_time;
 	unsigned int ip_min_time;
+
+	unsigned int carbon_interval;
+	const char *carbon_server;
+	const char *carbon_name;
 };
 /* ../../src/ssl-params/ssl-params-settings.h */
 struct ssl_params_settings {
@@ -1142,7 +1394,7 @@ struct replicator_settings {
 extern const struct setting_parser_info aggregator_setting_parser_info;
 struct aggregator_settings {
 	const char *replicator_host;
-	unsigned int replicator_port;
+	in_port_t replicator_port;
 };
 /* ../../src/pop3/pop3-settings.h */
 extern const struct setting_parser_info pop3_setting_parser_info;
@@ -1151,9 +1403,14 @@ enum pop3_client_workarounds {
 	WORKAROUND_OUTLOOK_NO_NULS		= 0x01,
 	WORKAROUND_OE_NS_EOH			= 0x02
 };
+enum pop3_delete_type {
+	POP3_DELETE_TYPE_EXPUNGE = 0,
+	POP3_DELETE_TYPE_FLAG,
+};
 /* </settings checks> */
 struct pop3_settings {
 	bool verbose_proctitle;
+	const char *rawlog_dir;
 
 	/* pop3: */
 	bool pop3_no_flag_updates;
@@ -1166,11 +1423,36 @@ struct pop3_settings {
 	const char *pop3_logout_format;
 	const char *pop3_uidl_duplicates;
 	const char *pop3_deleted_flag;
+	const char *pop3_delete_type;
 
 	enum pop3_client_workarounds parsed_workarounds;
+	enum pop3_delete_type parsed_delete_type;
 };
 /* ../../src/pop3-login/pop3-login-settings.h */
 extern const struct setting_parser_info *pop3_login_setting_roots[];
+/* ../../src/plugins/quota/quota-status-settings.h */
+extern const struct setting_parser_info quota_status_setting_parser_info;
+struct quota_status_settings {
+	char *recipient_delimiter;
+};
+/* ../../src/plugins/mail-crypt/fs-crypt-settings.h */
+extern const struct setting_parser_info fs_crypt_setting_parser_info;
+struct fs_crypt_settings {
+	ARRAY(const char *) plugin_envs;
+};
+/* ../../src/plugins/dict-ldap/dict-ldap-settings.h */
+struct dict_ldap_settings {
+	const char *uri;
+	const char *bind_dn;
+	const char *password;
+	unsigned int timeout;
+	unsigned int max_idle_time;
+	unsigned int debug;
+	unsigned int max_attribute_count;
+	bool require_ssl;
+	bool start_tls;
+	ARRAY(struct dict_ldap_map) maps;
+};
 /* ../../src/master/master-settings.h */
 extern const struct setting_parser_info master_setting_parser_info;
 struct master_settings {
@@ -1178,7 +1460,6 @@ struct master_settings {
 	const char *state_dir;
 	const char *libexec_dir;
 	const char *instance_name;
-	const char *import_environment;
 	const char *protocols;
 	const char *listen;
 	const char *ssl;
@@ -1202,9 +1483,14 @@ extern const struct setting_parser_info **login_set_roots;
 extern const struct setting_parser_info login_setting_parser_info;
 struct login_settings {
 	const char *login_trusted_networks;
+	const char *login_source_ips;
 	const char *login_greeting;
 	const char *login_log_format_elements, *login_log_format;
 	const char *login_access_sockets;
+	const char *login_proxy_notify_path;
+	const char *login_plugin_dir;
+	const char *login_plugins;
+	unsigned int login_proxy_max_disconnect_delay;
 	const char *director_username_hash;
 
 	const char *ssl_client_cert;
@@ -1226,13 +1512,24 @@ struct login_settings {
 };
 /* ../../src/lmtp/lmtp-settings.h */
 extern const struct setting_parser_info lmtp_setting_parser_info;
+/* <settings checks> */
+enum lmtp_hdr_delivery_address {
+	LMTP_HDR_DELIVERY_ADDRESS_NONE,
+	LMTP_HDR_DELIVERY_ADDRESS_FINAL,
+	LMTP_HDR_DELIVERY_ADDRESS_ORIGINAL
+};
+/* </settings checks> */
 struct lmtp_settings {
 	bool lmtp_proxy;
 	bool lmtp_save_to_detail_mailbox;
 	bool lmtp_rcpt_check_quota;
+	unsigned int lmtp_user_concurrency_limit;
 	const char *lmtp_address_translate;
+	const char *lmtp_hdr_delivery_address;
 	const char *login_greeting;
 	const char *login_trusted_networks;
+
+	enum lmtp_hdr_delivery_address parsed_lmtp_hdr_delivery_address;
 };
 /* ../../src/imap/imap-settings.h */
 extern const struct setting_parser_info imap_setting_parser_info;
@@ -1242,9 +1539,16 @@ enum imap_client_workarounds {
 	WORKAROUND_TB_EXTRA_MAILBOX_SEP		= 0x08,
 	WORKAROUND_TB_LSUB_FLAGS		= 0x10
 };
+
+enum imap_client_fetch_failure {
+	IMAP_CLIENT_FETCH_FAILURE_DISCONNECT_IMMEDIATELY,
+	IMAP_CLIENT_FETCH_FAILURE_DISCONNECT_AFTER,
+	IMAP_CLIENT_FETCH_FAILURE_NO_AFTER,
+};
 /* </settings checks> */
 struct imap_settings {
 	bool verbose_proctitle;
+	const char *rawlog_dir;
 
 	/* imap: */
 	uoff_t imap_max_line_length;
@@ -1254,13 +1558,16 @@ struct imap_settings {
 	const char *imap_logout_format;
 	const char *imap_id_send;
 	const char *imap_id_log;
+	const char *imap_fetch_failure;
 	bool imap_metadata;
+	unsigned int imap_hibernate_timeout;
 
 	/* imap urlauth: */
 	const char *imap_urlauth_host;
-	unsigned int imap_urlauth_port;
+	in_port_t imap_urlauth_port;
 
 	enum imap_client_workarounds parsed_workarounds;
+	enum imap_client_fetch_failure parsed_fetch_failure;
 };
 /* ../../src/imap-urlauth/imap-urlauth-worker-settings.h */
 extern const struct setting_parser_info imap_urlauth_worker_setting_parser_info;
@@ -1269,7 +1576,7 @@ struct imap_urlauth_worker_settings {
 
 	/* imap_urlauth: */
 	const char *imap_urlauth_host;
-	unsigned int imap_urlauth_port;
+	in_port_t imap_urlauth_port;
 };
 /* ../../src/imap-urlauth/imap-urlauth-settings.h */
 extern const struct setting_parser_info imap_urlauth_setting_parser_info;
@@ -1294,25 +1601,39 @@ struct imap_login_settings {
 	const char *imap_capability;
 	const char *imap_id_send;
 	const char *imap_id_log;
+	bool imap_id_retain;
 };
 /* ../../src/doveadm/doveadm-settings.h */
 extern const struct setting_parser_info doveadm_setting_parser_info;
+/* <settings checks> */
+enum dsync_features {
+	DSYNC_FEATURE_EMPTY_HDR_WORKAROUND = 0x1,
+};
+/* </settings checks> */
 struct doveadm_settings {
 	const char *base_dir;
 	const char *libexec_dir;
 	const char *mail_plugins;
 	const char *mail_plugin_dir;
+	bool auth_debug;
 	const char *auth_socket_path;
 	const char *doveadm_socket_path;
 	unsigned int doveadm_worker_count;
-	unsigned int doveadm_port;
+	in_port_t doveadm_port;
+	const char *doveadm_username;
 	const char *doveadm_password;
 	const char *doveadm_allowed_commands;
 	const char *dsync_alt_char;
 	const char *dsync_remote_cmd;
 	const char *ssl_client_ca_dir;
 	const char *ssl_client_ca_file;
-
+	const char *director_username_hash;
+	const char *doveadm_api_key;
+	const char *dsync_features;
+	const char *dsync_hashed_headers;
+	unsigned int dsync_commit_msgs_interval;
+	const char *doveadm_http_rawlog_dir;
+	enum dsync_features parsed_features;
 	ARRAY(const char *) plugin_envs;
 };
 /* ../../src/director/director-settings.h */
@@ -1323,23 +1644,37 @@ struct director_settings {
 	const char *director_servers;
 	const char *director_mail_servers;
 	const char *director_username_hash;
+	const char *director_flush_socket;
+
+	unsigned int director_ping_idle_timeout;
+	unsigned int director_ping_max_timeout;
 	unsigned int director_user_expire;
-	unsigned int director_doveadm_port;
+	unsigned int director_user_kick_delay;
+	in_port_t director_doveadm_port;
+	bool director_consistent_hashing;
+	unsigned int director_max_parallel_moves;
+	unsigned int director_max_parallel_kicks;
+	uoff_t director_output_buffer_size;
 };
 /* ../../src/dict/dict-settings.h */
 extern const struct setting_parser_info dict_setting_parser_info;
-struct dict_settings {
+struct dict_server_settings {
 	const char *base_dir;
+	bool verbose_proctitle;
+
 	const char *dict_db_config;
 	ARRAY(const char *) dicts;
 };
 /* ../../src/auth/auth-settings.h */
 extern const struct setting_parser_info auth_setting_parser_info;
 struct auth_passdb_settings {
+	const char *name;
 	const char *driver;
 	const char *args;
 	const char *default_fields;
 	const char *override_fields;
+	const char *mechanisms;
+	const char *username_filter;
 
 	const char *skip;
 	const char *result_success;
@@ -1348,8 +1683,10 @@ struct auth_passdb_settings {
 	bool deny;
 	bool pass; /* deprecated, use result_success=continue instead */
 	bool master;
+	const char *auth_verbose;
 };
 struct auth_userdb_settings {
+	const char *name;
 	const char *driver;
 	const char *args;
 	const char *default_fields;
@@ -1359,6 +1696,7 @@ struct auth_userdb_settings {
 	const char *result_success;
 	const char *result_failure;
 	const char *result_internalfail;
+	const char *auth_verbose;
 };
 struct auth_settings {
 	const char *mechanisms;
@@ -1367,6 +1705,7 @@ struct auth_settings {
 	uoff_t cache_size;
 	unsigned int cache_ttl;
 	unsigned int cache_negative_ttl;
+	bool cache_verify_password_with_worker;
 	const char *username_chars;
 	const char *username_translation;
 	const char *username_format;
@@ -1378,6 +1717,19 @@ struct auth_settings {
 	const char *proxy_self;
 	unsigned int failure_delay;
 
+	const char *policy_server_url;
+	const char *policy_server_api_header;
+	unsigned int policy_server_timeout_msecs;
+	const char *policy_hash_mech;
+	const char *policy_hash_nonce;
+	const char *policy_request_attributes;
+	bool policy_reject_on_fail;
+	bool policy_check_before_auth;
+	bool policy_check_after_auth;
+	bool policy_report_after_auth;
+	unsigned int policy_hash_truncate;
+
+	bool stats;
 	bool verbose, debug, debug_passwords;
 	const char *verbose_passwords;
 	bool ssl_require_client_cert;
@@ -1391,6 +1743,9 @@ struct auth_settings {
 	ARRAY(struct auth_userdb_settings *) userdbs;
 
 	const char *base_dir;
+	const char *ssl_client_ca_dir;
+	const char *ssl_client_ca_file;
+
 	bool verbose_proctitle;
 	unsigned int first_valid_uid;
 	unsigned int last_valid_uid;
@@ -1437,17 +1792,19 @@ static struct file_listener_settings *stats_unix_listeners[] = {
 	&stats_unix_listeners_array[0]
 };
 static buffer_t stats_unix_listeners_buf = {
-	stats_unix_listeners, sizeof(stats_unix_listeners), { 0, }
+	stats_unix_listeners, sizeof(stats_unix_listeners), { NULL, }
 };
 static struct file_listener_settings stats_fifo_listeners_array[] = {
-	{ "stats-mail", 0600, "", "" }
+	{ "stats-mail", 0600, "", "" },
+	{ "stats-user", 0600, "", "" }
 };
 static struct file_listener_settings *stats_fifo_listeners[] = {
-	&stats_fifo_listeners_array[0]
+	&stats_fifo_listeners_array[0],
+	&stats_fifo_listeners_array[1]
 };
 static buffer_t stats_fifo_listeners_buf = {
 	stats_fifo_listeners,
-	sizeof(stats_fifo_listeners), { 0, }
+	sizeof(stats_fifo_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings stats_service_settings = {
@@ -1474,7 +1831,9 @@ struct service_settings stats_service_settings = {
 			      sizeof(stats_unix_listeners[0]) } },
 	.fifo_listeners = { { &stats_fifo_listeners_buf,
 			      sizeof(stats_fifo_listeners[0]) } },
-	.inet_listeners = ARRAY_INIT
+	.inet_listeners = ARRAY_INIT,
+
+	.process_limit_1 = TRUE
 };
 #undef DEF
 #define DEF(type, name) \
@@ -1486,7 +1845,9 @@ static const struct setting_define stats_setting_defines[] = {
 	DEF(SET_TIME, user_min_time),
 	DEF(SET_TIME, domain_min_time),
 	DEF(SET_TIME, ip_min_time),
-
+	DEF(SET_STR, carbon_server),
+	DEF(SET_TIME, carbon_interval),
+	DEF(SET_STR, carbon_name),
 	SETTING_DEFINE_LIST_END
 };
 const struct stats_settings stats_default_settings = {
@@ -1496,7 +1857,11 @@ const struct stats_settings stats_default_settings = {
 	.session_min_time = 60*15,
 	.user_min_time = 60*60,
 	.domain_min_time = 60*60*12,
-	.ip_min_time = 60*60*12
+	.ip_min_time = 60*60*12,
+
+	.carbon_interval = 30,
+	.carbon_server = "",
+	.carbon_name = ""
 };
 const struct setting_parser_info stats_setting_parser_info = {
 	.module_name = "stats",
@@ -1519,7 +1884,7 @@ static struct file_listener_settings *ssl_params_unix_listeners[] = {
 	&ssl_params_unix_listeners_array[1]
 };
 static buffer_t ssl_params_unix_listeners_buf = {
-	ssl_params_unix_listeners, sizeof(ssl_params_unix_listeners), { 0, }
+	ssl_params_unix_listeners, sizeof(ssl_params_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings ssl_params_service_settings = {
@@ -1585,7 +1950,7 @@ static struct file_listener_settings *replicator_unix_listeners[] = {
 	&replicator_unix_listeners_array[1]
 };
 static buffer_t replicator_unix_listeners_buf = {
-	replicator_unix_listeners, sizeof(replicator_unix_listeners), { 0, }
+	replicator_unix_listeners, sizeof(replicator_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings replicator_service_settings = {
@@ -1611,7 +1976,9 @@ struct service_settings replicator_service_settings = {
 	.unix_listeners = { { &replicator_unix_listeners_buf,
 			      sizeof(replicator_unix_listeners[0]) } },
 	.fifo_listeners = ARRAY_INIT,
-	.inet_listeners = ARRAY_INIT
+	.inet_listeners = ARRAY_INIT,
+
+	.process_limit_1 = TRUE
 };
 #undef DEF
 #define DEF(type, name) \
@@ -1653,7 +2020,7 @@ static struct file_listener_settings *aggregator_unix_listeners[] = {
 	&aggregator_unix_listeners_array[0]
 };
 static buffer_t aggregator_unix_listeners_buf = {
-	aggregator_unix_listeners, sizeof(aggregator_unix_listeners), { 0, }
+	aggregator_unix_listeners, sizeof(aggregator_unix_listeners), { NULL, }
 };
 
 static struct file_listener_settings aggregator_fifo_listeners_array[] = {
@@ -1663,7 +2030,7 @@ static struct file_listener_settings *aggregator_fifo_listeners[] = {
 	&aggregator_fifo_listeners_array[0]
 };
 static buffer_t aggregator_fifo_listeners_buf = {
-	aggregator_fifo_listeners, sizeof(aggregator_fifo_listeners), { 0, }
+	aggregator_fifo_listeners, sizeof(aggregator_fifo_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings aggregator_service_settings = {
@@ -1697,7 +2064,7 @@ struct service_settings aggregator_service_settings = {
 	{ type, #name, offsetof(struct aggregator_settings, name), NULL }
 static const struct setting_define aggregator_setting_defines[] = {
 	DEF(SET_STR, replicator_host),
-	DEF(SET_UINT, replicator_port),
+	DEF(SET_IN_PORT, replicator_port),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -1724,7 +2091,7 @@ static struct file_listener_settings *pop3_unix_listeners[] = {
 	&pop3_unix_listeners_array[0]
 };
 static buffer_t pop3_unix_listeners_buf = {
-	pop3_unix_listeners, sizeof(pop3_unix_listeners), { 0, }
+	pop3_unix_listeners, sizeof(pop3_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 /* <settings checks> */
@@ -1773,6 +2140,24 @@ pop3_settings_verify(void *_set, pool_t pool ATTR_UNUSED, const char **error_r)
 
 	if (pop3_settings_parse_workarounds(set, error_r) < 0)
 		return FALSE;
+	if (strcmp(set->pop3_delete_type, "default") == 0) {
+		if (set->pop3_deleted_flag[0] == '\0')
+			set->parsed_delete_type = POP3_DELETE_TYPE_EXPUNGE;
+		else
+			set->parsed_delete_type = POP3_DELETE_TYPE_FLAG;
+	} else if (strcmp(set->pop3_delete_type, "expunge") == 0) {
+		set->parsed_delete_type = POP3_DELETE_TYPE_EXPUNGE;
+	} else if (strcmp(set->pop3_delete_type, "flag") == 0) {
+		if (set->pop3_deleted_flag[0] == '\0') {
+			*error_r = "pop3_delete_type=flag, but pop3_deleted_flag not set";
+			return FALSE;
+		}
+		set->parsed_delete_type = POP3_DELETE_TYPE_FLAG;
+	} else {
+		*error_r = t_strdup_printf("pop3_delete_type: Unknown value '%s'",
+					   set->pop3_delete_type);
+		return FALSE;
+	}
 	return TRUE;
 }
 /* </settings checks> */
@@ -1809,6 +2194,7 @@ struct service_settings pop3_service_settings = {
 	{ SET_DEFLIST, name, offsetof(struct pop3_settings, field), defines }
 static const struct setting_define pop3_setting_defines[] = {
 	DEF(SET_BOOL, verbose_proctitle),
+	DEF(SET_STR_VARS, rawlog_dir),
 
 	DEF(SET_BOOL, pop3_no_flag_updates),
 	DEF(SET_BOOL, pop3_enable_last),
@@ -1820,11 +2206,13 @@ static const struct setting_define pop3_setting_defines[] = {
 	DEF(SET_STR, pop3_logout_format),
 	DEF(SET_ENUM, pop3_uidl_duplicates),
 	DEF(SET_STR, pop3_deleted_flag),
+	DEF(SET_ENUM, pop3_delete_type),
 
 	SETTING_DEFINE_LIST_END
 };
 static const struct pop3_settings pop3_default_settings = {
 	.verbose_proctitle = FALSE,
+	.rawlog_dir = "",
 
 	.pop3_no_flag_updates = FALSE,
 	.pop3_enable_last = FALSE,
@@ -1835,7 +2223,8 @@ static const struct pop3_settings pop3_default_settings = {
 	.pop3_client_workarounds = "",
 	.pop3_logout_format = "top=%t/%p, retr=%r/%b, del=%d/%m, size=%s",
 	.pop3_uidl_duplicates = "allow:rename",
-	.pop3_deleted_flag = ""
+	.pop3_deleted_flag = "",
+	.pop3_delete_type = "default:expunge:flag"
 };
 static const struct setting_parser_info *pop3_setting_dependencies[] = {
 	&mail_user_setting_parser_info,
@@ -1865,7 +2254,7 @@ static struct inet_listener_settings *pop3_login_inet_listeners[] = {
 	&pop3_login_inet_listeners_array[1]
 };
 static buffer_t pop3_login_inet_listeners_buf = {
-	pop3_login_inet_listeners, sizeof(pop3_login_inet_listeners), { 0, }
+	pop3_login_inet_listeners, sizeof(pop3_login_inet_listeners), { NULL, }
 };
 
 /* </settings checks> */
@@ -1915,21 +2304,68 @@ const struct setting_parser_info *pop3_login_setting_roots[] = {
 	&pop3_login_setting_parser_info,
 	NULL
 };
+/* ../../src/plugins/quota/quota-status-settings.c */
+#undef DEF
+#define DEF(type, name) \
+	{ type, #name, offsetof(struct quota_status_settings, name), NULL }
+static const struct setting_define quota_status_setting_defines[] = {
+	DEF(SET_STR, recipient_delimiter),
+
+	SETTING_DEFINE_LIST_END
+};
+static const struct quota_status_settings quota_status_default_settings = {
+	.recipient_delimiter = "+",
+};
+static const struct setting_parser_info *quota_status_setting_dependencies[] = {
+	NULL
+};
+const struct setting_parser_info quota_status_setting_parser_info = {
+	.module_name = "mail",
+	.defines = quota_status_setting_defines,
+	.defaults = &quota_status_default_settings,
+
+	.type_offset = (size_t)-1,
+	.struct_size = sizeof(struct quota_status_settings),
+
+	.parent_offset = (size_t)-1,
+	.dependencies = quota_status_setting_dependencies
+};
+/* ../../src/plugins/mail-crypt/fs-crypt-settings.c */
+#undef DEF
+#define DEF(type, name) \
+	{ type, #name, offsetof(struct fs_crypt_settings, name), NULL }
+static const struct setting_define fs_crypt_setting_defines[] = {
+	{ SET_STRLIST, "plugin", offsetof(struct fs_crypt_settings, plugin_envs), NULL },
+
+	SETTING_DEFINE_LIST_END
+};
+const struct fs_crypt_settings fs_crypt_default_settings = {
+	.plugin_envs = ARRAY_INIT
+};
+static const struct setting_parser_info *fs_crypt_setting_dependencies[] = {
+	NULL
+};
+const struct setting_parser_info fs_crypt_setting_parser_info = {
+	.module_name = "fs-crypt",
+	.defines = fs_crypt_setting_defines,
+	.defaults = &fs_crypt_default_settings,
+
+	.type_offset = (size_t)-1,
+	.struct_size = sizeof(struct fs_crypt_settings),
+
+	.parent_offset = (size_t)-1,
+	.dependencies = fs_crypt_setting_dependencies
+};
+/* ../../src/plugins/dict-ldap/dict-ldap-settings.c */
+#undef DEF_STR
+#undef DEF_BOOL
+#undef DEF_UINT
+#define DEF_STR(name) DEF_STRUCT_STR(name, dict_ldap_map)
+#define DEF_BOOL(name) DEF_STRUCT_BOOL(name, dict_ldap_map)
+#define DEF_UINT(name) DEF_STRUCT_UINT(name ,dict_ldap_map)
 /* ../../src/master/master-settings.c */
 extern const struct setting_parser_info service_setting_parser_info;
 extern const struct setting_parser_info service_setting_parser_info;
-/* <settings checks> */
-#ifdef HAVE_SYSTEMD
-#  define ENV_SYSTEMD " LISTEN_PID LISTEN_FDS"
-#else
-#  define ENV_SYSTEMD ""
-#endif
-#ifdef DEBUG
-#  define ENV_GDB " GDB DEBUG_SILENT"
-#else
-#  define ENV_GDB ""
-#endif
-/* </settings checks> */
 /* <settings checks> */
 static void
 expand_user(const char **user, enum service_user_default *default_r,
@@ -1949,20 +2385,26 @@ expand_user(const char **user, enum service_user_default *default_r,
 	}
 }
 
-static void
+static bool
 fix_file_listener_paths(ARRAY_TYPE(file_listener_settings) *l,
 			pool_t pool, const struct master_settings *master_set,
-			ARRAY_TYPE(const_string) *all_listeners)
+			ARRAY_TYPE(const_string) *all_listeners,
+			const char **error_r)
 {
 	struct file_listener_settings *const *sets;
-	unsigned int base_dir_len = strlen(master_set->base_dir);
+	size_t base_dir_len = strlen(master_set->base_dir);
 	enum service_user_default user_default;
 
 	if (!array_is_created(l))
-		return;
+		return TRUE;
 
 	array_foreach(l, sets) {
 		struct file_listener_settings *set = *sets;
+
+		if (set->path[0] == '\0') {
+			*error_r = "path must not be empty";
+			return FALSE;
+		}
 
 		expand_user(&set->user, &user_default, master_set);
 		if (*set->path != '/') {
@@ -1977,6 +2419,7 @@ fix_file_listener_paths(ARRAY_TYPE(file_listener_settings) *l,
 		if (set->mode != 0)
 			array_append(all_listeners, &set->path, 1);
 	}
+	return TRUE;
 }
 
 static void add_inet_listeners(ARRAY_TYPE(inet_listener_settings) *l,
@@ -1992,7 +2435,7 @@ static void add_inet_listeners(ARRAY_TYPE(inet_listener_settings) *l,
 		struct inet_listener_settings *set = *sets;
 
 		if (set->port != 0) {
-			str = t_strdup_printf("%d:%s", set->port, set->address);
+			str = t_strdup_printf("%u:%s", set->port, set->address);
 			array_append(all_listeners, &str, 1);
 		}
 	}
@@ -2087,8 +2530,9 @@ master_settings_verify(void *_set, pool_t pool, const char **error_r)
 	const char *const *strings;
 	ARRAY_TYPE(const_string) all_listeners;
 	struct passwd pw;
-	unsigned int i, j, count, len, client_limit, process_limit;
+	unsigned int i, j, count, client_limit, process_limit;
 	unsigned int max_auth_client_processes, max_anvil_client_processes;
+	size_t len;
 #ifdef CONFIG_BINARY
 	const struct service_settings *default_service;
 #else
@@ -2096,6 +2540,11 @@ master_settings_verify(void *_set, pool_t pool, const char **error_r)
 	const char *max_client_limit_source = "default_client_limit";
 	unsigned int max_client_limit = set->default_client_limit;
 #endif
+
+	if (*set->listen == '\0') {
+		*error_r = "listen can't be set empty";
+		return FALSE;
+	}
 
 	len = strlen(set->base_dir);
 	if (len > 0 && set->base_dir[len-1] == '/') {
@@ -2242,10 +2691,18 @@ master_settings_verify(void *_set, pool_t pool, const char **error_r)
 		    strcmp(service->name, "auth") == 0)
 			max_anvil_client_processes += process_limit;
 
-		fix_file_listener_paths(&service->unix_listeners,
-					pool, set, &all_listeners);
-		fix_file_listener_paths(&service->fifo_listeners,
-					pool, set, &all_listeners);
+		if (!fix_file_listener_paths(&service->unix_listeners, pool,
+					     set, &all_listeners, error_r)) {
+			*error_r = t_strdup_printf("service(%s): unix_listener: %s",
+						   service->name, *error_r);
+			return FALSE;
+		}
+		if (!fix_file_listener_paths(&service->fifo_listeners, pool,
+					     set, &all_listeners, error_r)) {
+			*error_r = t_strdup_printf("service(%s): fifo_listener: %s",
+						   service->name, *error_r);
+			return FALSE;
+		}
 		add_inet_listeners(&service->inet_listeners, &all_listeners);
 	}
 
@@ -2320,9 +2777,10 @@ static const struct setting_parser_info file_listener_setting_parser_info = {
 static const struct setting_define inet_listener_setting_defines[] = {
 	DEF(SET_STR, name),
 	DEF(SET_STR, address),
-	DEF(SET_UINT, port),
+	DEF(SET_IN_PORT, port),
 	DEF(SET_BOOL, ssl),
 	DEF(SET_BOOL, reuse_port),
+	DEF(SET_BOOL, haproxy),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -2331,7 +2789,8 @@ static const struct inet_listener_settings inet_listener_default_settings = {
 	.address = "",
 	.port = 0,
 	.ssl = FALSE,
-	.reuse_port = FALSE
+	.reuse_port = FALSE,
+	.haproxy = FALSE
 };
 static const struct setting_parser_info inet_listener_setting_parser_info = {
 	.defines = inet_listener_setting_defines,
@@ -2426,7 +2885,6 @@ static const struct setting_define master_setting_defines[] = {
 	DEF(SET_STR, state_dir),
 	DEF(SET_STR, libexec_dir),
 	DEF(SET_STR, instance_name),
-	DEF(SET_STR, import_environment),
 	DEF(SET_STR, protocols),
 	DEF(SET_STR, listen),
 	DEF(SET_ENUM, ssl),
@@ -2453,7 +2911,6 @@ struct master_settings master_default_settings = {
 	.state_dir = PKG_STATEDIR,
 	.libexec_dir = PKG_LIBEXECDIR,
 	.instance_name = PACKAGE,
-	.import_environment = "TZ CORE_OUTOFMEM CORE_ERROR" ENV_SYSTEMD ENV_GDB,
 	.protocols = "imap pop3 lmtp",
 	.listen = "*, ::",
 	.ssl = "yes:no:required",
@@ -2512,10 +2969,15 @@ static bool login_settings_check(void *_set, pool_t pool,
 	{ type, #name, offsetof(struct login_settings, name), NULL }
 static const struct setting_define login_setting_defines[] = {
 	DEF(SET_STR, login_trusted_networks),
+	DEF(SET_STR, login_source_ips),
 	DEF(SET_STR_VARS, login_greeting),
 	DEF(SET_STR, login_log_format_elements),
 	DEF(SET_STR, login_log_format),
 	DEF(SET_STR, login_access_sockets),
+	DEF(SET_STR_VARS, login_proxy_notify_path),
+	DEF(SET_STR, login_plugin_dir),
+	DEF(SET_STR, login_plugins),
+	DEF(SET_TIME, login_proxy_max_disconnect_delay),
 	DEF(SET_STR, director_username_hash),
 
 	DEF(SET_STR, ssl_client_cert),
@@ -2535,10 +2997,15 @@ static const struct setting_define login_setting_defines[] = {
 };
 static const struct login_settings login_default_settings = {
 	.login_trusted_networks = "",
+	.login_source_ips = "",
 	.login_greeting = PACKAGE_NAME" ready.",
 	.login_log_format_elements = "user=<%u> method=%m rip=%r lip=%l mpid=%e %c session=<%{session}>",
 	.login_log_format = "%$: %s",
 	.login_access_sockets = "",
+	.login_proxy_notify_path = "proxy-notify",
+	.login_plugin_dir = MODULEDIR"/login",
+	.login_plugins = "",
+	.login_proxy_max_disconnect_delay = 0,
 	.director_username_hash = "%u",
 
 	.ssl_client_cert = "",
@@ -2576,7 +3043,7 @@ static struct file_listener_settings *log_unix_listeners[] = {
 };
 static buffer_t log_unix_listeners_buf = {
 	log_unix_listeners,
-	sizeof(log_unix_listeners), { 0, }
+	sizeof(log_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings log_service_settings = {
@@ -2615,8 +3082,31 @@ static struct file_listener_settings *lmtp_unix_listeners[] = {
 	&lmtp_unix_listeners_array[0]
 };
 static buffer_t lmtp_unix_listeners_buf = {
-	lmtp_unix_listeners, sizeof(lmtp_unix_listeners), { 0, }
+	lmtp_unix_listeners, sizeof(lmtp_unix_listeners), { NULL, }
 };
+/* </settings checks> */
+/* <settings checks> */
+static bool lmtp_settings_check(void *_set, pool_t pool ATTR_UNUSED,
+				const char **error_r)
+{
+	struct lmtp_settings *set = _set;
+
+	if (strcmp(set->lmtp_hdr_delivery_address, "none") == 0) {
+		set->parsed_lmtp_hdr_delivery_address =
+			LMTP_HDR_DELIVERY_ADDRESS_NONE;
+	} else if (strcmp(set->lmtp_hdr_delivery_address, "final") == 0) {
+		set->parsed_lmtp_hdr_delivery_address =
+			LMTP_HDR_DELIVERY_ADDRESS_FINAL;
+	} else if (strcmp(set->lmtp_hdr_delivery_address, "original") == 0) {
+		set->parsed_lmtp_hdr_delivery_address =
+			LMTP_HDR_DELIVERY_ADDRESS_ORIGINAL;
+	} else {
+		*error_r = t_strdup_printf("Unknown lmtp_hdr_delivery_address: %s",
+					   set->lmtp_hdr_delivery_address);
+		return FALSE;
+	}
+	return TRUE;
+}
 /* </settings checks> */
 struct service_settings lmtp_service_settings = {
 	.name = "lmtp",
@@ -2650,7 +3140,9 @@ static const struct setting_define lmtp_setting_defines[] = {
 	DEF(SET_BOOL, lmtp_proxy),
 	DEF(SET_BOOL, lmtp_save_to_detail_mailbox),
 	DEF(SET_BOOL, lmtp_rcpt_check_quota),
+	DEF(SET_UINT, lmtp_user_concurrency_limit),
 	DEF(SET_STR, lmtp_address_translate),
+	DEF(SET_ENUM, lmtp_hdr_delivery_address),
 	DEF(SET_STR_VARS, login_greeting),
 	DEF(SET_STR, login_trusted_networks),
 
@@ -2660,7 +3152,9 @@ static const struct lmtp_settings lmtp_default_settings = {
 	.lmtp_proxy = FALSE,
 	.lmtp_save_to_detail_mailbox = FALSE,
 	.lmtp_rcpt_check_quota = FALSE,
+	.lmtp_user_concurrency_limit = 0,
 	.lmtp_address_translate = "",
+	.lmtp_hdr_delivery_address = "final:none:original",
 	.login_greeting = PACKAGE_NAME" ready.",
 	.login_trusted_networks = ""
 };
@@ -2678,6 +3172,7 @@ const struct setting_parser_info lmtp_setting_parser_info = {
 
 	.parent_offset = (size_t)-1,
 
+	.check_func = lmtp_settings_check,
 	.dependencies = lmtp_setting_dependencies
 };
 /* ../../src/ipc/ipc-settings.c */
@@ -2691,7 +3186,7 @@ static struct file_listener_settings *ipc_unix_listeners[] = {
 	&ipc_unix_listeners_array[1]
 };
 static buffer_t ipc_unix_listeners_buf = {
-	ipc_unix_listeners, sizeof(ipc_unix_listeners), { 0, }
+	ipc_unix_listeners, sizeof(ipc_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings ipc_service_settings = {
@@ -2717,7 +3212,9 @@ struct service_settings ipc_service_settings = {
 	.unix_listeners = { { &ipc_unix_listeners_buf,
 			      sizeof(ipc_unix_listeners[0]) } },
 	.fifo_listeners = ARRAY_INIT,
-	.inet_listeners = ARRAY_INIT
+	.inet_listeners = ARRAY_INIT,
+
+	.process_limit_1 = TRUE
 };
 /* ../../src/indexer/indexer-worker-settings.c */
 /* <settings checks> */
@@ -2728,7 +3225,7 @@ static struct file_listener_settings *indexer_worker_unix_listeners[] = {
 	&indexer_worker_unix_listeners_array[0]
 };
 static buffer_t indexer_worker_unix_listeners_buf = {
-	indexer_worker_unix_listeners, sizeof(indexer_worker_unix_listeners), { 0, }
+	indexer_worker_unix_listeners, sizeof(indexer_worker_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings indexer_worker_service_settings = {
@@ -2766,7 +3263,7 @@ static struct file_listener_settings *indexer_unix_listeners[] = {
 	&indexer_unix_listeners_array[0]
 };
 static buffer_t indexer_unix_listeners_buf = {
-	indexer_unix_listeners, sizeof(indexer_unix_listeners), { 0, }
+	indexer_unix_listeners, sizeof(indexer_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings indexer_service_settings = {
@@ -2792,18 +3289,22 @@ struct service_settings indexer_service_settings = {
 	.unix_listeners = { { &indexer_unix_listeners_buf,
 			      sizeof(indexer_unix_listeners[0]) } },
 	.fifo_listeners = ARRAY_INIT,
-	.inet_listeners = ARRAY_INIT
+	.inet_listeners = ARRAY_INIT,
+
+	.process_limit_1 = TRUE
 };
 /* ../../src/imap/imap-settings.c */
 /* <settings checks> */
 static struct file_listener_settings imap_unix_listeners_array[] = {
-	{ "login/imap", 0666, "", "" }
+	{ "login/imap", 0666, "", "" },
+	{ "imap-master", 0600, "", "" }
 };
 static struct file_listener_settings *imap_unix_listeners[] = {
-	&imap_unix_listeners_array[0]
+	&imap_unix_listeners_array[0],
+	&imap_unix_listeners_array[1]
 };
 static buffer_t imap_unix_listeners_buf = {
-	imap_unix_listeners, sizeof(imap_unix_listeners), { 0, }
+	imap_unix_listeners, sizeof(imap_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 /* <settings checks> */
@@ -2854,6 +3355,18 @@ imap_settings_verify(void *_set, pool_t pool ATTR_UNUSED, const char **error_r)
 
 	if (imap_settings_parse_workarounds(set, error_r) < 0)
 		return FALSE;
+
+	if (strcmp(set->imap_fetch_failure, "disconnect-immediately") == 0)
+		set->parsed_fetch_failure = IMAP_CLIENT_FETCH_FAILURE_DISCONNECT_IMMEDIATELY;
+	else if (strcmp(set->imap_fetch_failure, "disconnect-after") == 0)
+		set->parsed_fetch_failure = IMAP_CLIENT_FETCH_FAILURE_DISCONNECT_AFTER;
+	else if (strcmp(set->imap_fetch_failure, "no-after") == 0)
+		set->parsed_fetch_failure = IMAP_CLIENT_FETCH_FAILURE_NO_AFTER;
+	else {
+		*error_r = t_strdup_printf("Unknown imap_fetch_failure: %s",
+					   set->imap_fetch_failure);
+		return FALSE;
+	}
 	return TRUE;
 }
 /* </settings checks> */
@@ -2890,6 +3403,7 @@ struct service_settings imap_service_settings = {
 	{ SET_DEFLIST, name, offsetof(struct imap_settings, field), defines }
 static const struct setting_define imap_setting_defines[] = {
 	DEF(SET_BOOL, verbose_proctitle),
+	DEF(SET_STR_VARS, rawlog_dir),
 
 	DEF(SET_SIZE, imap_max_line_length),
 	DEF(SET_TIME, imap_idle_notify_interval),
@@ -2898,15 +3412,18 @@ static const struct setting_define imap_setting_defines[] = {
 	DEF(SET_STR, imap_logout_format),
 	DEF(SET_STR, imap_id_send),
 	DEF(SET_STR, imap_id_log),
+	DEF(SET_ENUM, imap_fetch_failure),
 	DEF(SET_BOOL, imap_metadata),
+	DEF(SET_TIME, imap_hibernate_timeout),
 
 	DEF(SET_STR, imap_urlauth_host),
-	DEF(SET_UINT, imap_urlauth_port),
+	DEF(SET_IN_PORT, imap_urlauth_port),
 
 	SETTING_DEFINE_LIST_END
 };
 static const struct imap_settings imap_default_settings = {
 	.verbose_proctitle = FALSE,
+	.rawlog_dir = "",
 
 	/* RFC-2683 recommends at least 8000 bytes. Some clients however don't
 	   break large message sets to multiple commands, so we're pretty
@@ -2918,13 +3435,16 @@ static const struct imap_settings imap_default_settings = {
 	.imap_logout_format = "in=%i out=%o",
 	.imap_id_send = "name *",
 	.imap_id_log = "",
+	.imap_fetch_failure = "disconnect-immediately:disconnect-after:no-after",
 	.imap_metadata = FALSE,
+	.imap_hibernate_timeout = 0,
 
 	.imap_urlauth_host = "",
 	.imap_urlauth_port = 143
 };
 static const struct setting_parser_info *imap_setting_dependencies[] = {
 	&mail_user_setting_parser_info,
+	&lda_setting_parser_info,
 	NULL
 };
 const struct setting_parser_info imap_setting_parser_info = {
@@ -2949,7 +3469,7 @@ static struct file_listener_settings *imap_urlauth_worker_unix_listeners[] = {
 	&imap_urlauth_worker_unix_listeners_array[0]
 };
 static buffer_t imap_urlauth_worker_unix_listeners_buf = {
-	imap_urlauth_worker_unix_listeners, sizeof(imap_urlauth_worker_unix_listeners), { 0, }
+	imap_urlauth_worker_unix_listeners, sizeof(imap_urlauth_worker_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings imap_urlauth_worker_service_settings = {
@@ -2984,7 +3504,7 @@ static const struct setting_define imap_urlauth_worker_setting_defines[] = {
 	DEF(SET_BOOL, verbose_proctitle),
 
 	DEF(SET_STR, imap_urlauth_host),
-	DEF(SET_UINT, imap_urlauth_port),
+	DEF(SET_IN_PORT, imap_urlauth_port),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -3019,7 +3539,7 @@ static struct file_listener_settings *imap_urlauth_unix_listeners[] = {
 	&imap_urlauth_unix_listeners_array[0]
 };
 static buffer_t imap_urlauth_unix_listeners_buf = {
-	imap_urlauth_unix_listeners, sizeof(imap_urlauth_unix_listeners), { 0, }
+	imap_urlauth_unix_listeners, sizeof(imap_urlauth_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings imap_urlauth_service_settings = {
@@ -3099,7 +3619,7 @@ static struct file_listener_settings *imap_urlauth_login_unix_listeners[] = {
 };
 static buffer_t imap_urlauth_login_unix_listeners_buf = {
 	imap_urlauth_login_unix_listeners,
-		sizeof(imap_urlauth_login_unix_listeners), { 0, }
+		sizeof(imap_urlauth_login_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings imap_urlauth_login_service_settings = {
@@ -3159,7 +3679,7 @@ static struct inet_listener_settings *imap_login_inet_listeners[] = {
 	&imap_login_inet_listeners_array[1]
 };
 static buffer_t imap_login_inet_listeners_buf = {
-	imap_login_inet_listeners, sizeof(imap_login_inet_listeners), { 0, }
+	imap_login_inet_listeners, sizeof(imap_login_inet_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings imap_login_service_settings = {
@@ -3194,13 +3714,15 @@ static const struct setting_define imap_login_setting_defines[] = {
 	DEF(SET_STR, imap_capability),
 	DEF(SET_STR, imap_id_send),
 	DEF(SET_STR, imap_id_log),
+	DEF(SET_BOOL, imap_id_retain),
 
 	SETTING_DEFINE_LIST_END
 };
 static const struct imap_login_settings imap_login_default_settings = {
 	.imap_capability = "",
 	.imap_id_send = "name *",
-	.imap_id_log = ""
+	.imap_id_log = "",
+	.imap_id_retain = FALSE,
 };
 static const struct setting_parser_info *imap_login_setting_dependencies[] = {
 	&login_setting_parser_info,
@@ -3222,6 +3744,43 @@ const struct setting_parser_info *imap_login_setting_roots[] = {
 	&imap_login_setting_parser_info,
 	NULL
 };
+/* ../../src/imap-hibernate/imap-hibernate-settings.c */
+/* <settings checks> */
+static struct file_listener_settings imap_hibernate_unix_listeners_array[] = {
+	{ "imap-hibernate", 0600, "", "" }
+};
+static struct file_listener_settings *imap_hibernate_unix_listeners[] = {
+	&imap_hibernate_unix_listeners_array[0]
+};
+static buffer_t imap_hibernate_unix_listeners_buf = {
+	imap_hibernate_unix_listeners, sizeof(imap_hibernate_unix_listeners), { NULL, }
+};
+/* </settings checks> */
+struct service_settings imap_hibernate_service_settings = {
+	.name = "imap-hibernate",
+	.protocol = "imap",
+	.type = "",
+	.executable = "imap-hibernate",
+	.user = "$default_internal_user",
+	.group = "",
+	.privileged_group = "",
+	.extra_groups = "",
+	.chroot = "",
+
+	.drop_priv_before_exec = FALSE,
+
+	.process_min_avail = 0,
+	.process_limit = 0,
+	.client_limit = 0,
+	.service_count = 0,
+	.idle_kill = 0,
+	.vsz_limit = (uoff_t)-1,
+
+	.unix_listeners = { { &imap_hibernate_unix_listeners_buf,
+			      sizeof(imap_hibernate_unix_listeners[0]) } },
+	.fifo_listeners = ARRAY_INIT,
+	.inet_listeners = ARRAY_INIT
+};
 /* ../../src/doveadm/doveadm-settings.c */
 /* <settings checks> */
 static struct file_listener_settings doveadm_unix_listeners_array[] = {
@@ -3231,10 +3790,47 @@ static struct file_listener_settings *doveadm_unix_listeners[] = {
 	&doveadm_unix_listeners_array[0]
 };
 static buffer_t doveadm_unix_listeners_buf = {
-	doveadm_unix_listeners, sizeof(doveadm_unix_listeners), { 0, }
+	doveadm_unix_listeners, sizeof(doveadm_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 /* <settings checks> */
+struct dsync_feature_list {
+	const char *name;
+	enum dsync_features num;
+};
+
+static const struct dsync_feature_list dsync_feature_list[] = {
+	{ "empty-header-workaround", DSYNC_FEATURE_EMPTY_HDR_WORKAROUND },
+	{ NULL, 0 }
+};
+
+static int
+dsync_settings_parse_features(struct doveadm_settings *set,
+			      const char **error_r)
+{
+	enum dsync_features features = 0;
+	const struct dsync_feature_list *list;
+	const char *const *str;
+
+	str = t_strsplit_spaces(set->dsync_features, " ,");
+	for (; *str != NULL; str++) {
+		list = dsync_feature_list;
+		for (; list->name != NULL; list++) {
+			if (strcasecmp(*str, list->name) == 0) {
+				features |= list->num;
+				break;
+			}
+		}
+		if (list->name == NULL) {
+			*error_r = t_strdup_printf("dsync_features: "
+				"Unknown feature: %s", *str);
+			return -1;
+		}
+	}
+	set->parsed_features = features;
+	return 0;
+}
+
 static bool doveadm_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 				   const char **error_r)
 {
@@ -3244,10 +3840,16 @@ static bool doveadm_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 	fix_base_path(set, pool, &set->auth_socket_path);
 	fix_base_path(set, pool, &set->doveadm_socket_path);
 #endif
+	if (*set->dsync_hashed_headers == '\0') {
+		*error_r = "dsync_hashed_headers must not be empty";
+		return FALSE;
+	}
 	if (*set->dsync_alt_char == '\0') {
 		*error_r = "dsync_alt_char must not be empty";
 		return FALSE;
 	}
+	if (dsync_settings_parse_features(set, error_r) != 0)
+		return FALSE;
 	return TRUE;
 }
 /* </settings checks> */
@@ -3284,17 +3886,25 @@ static const struct setting_define doveadm_setting_defines[] = {
 	DEF(SET_STR, libexec_dir),
 	DEF(SET_STR, mail_plugins),
 	DEF(SET_STR, mail_plugin_dir),
+	DEF(SET_BOOL, auth_debug),
 	DEF(SET_STR, auth_socket_path),
 	DEF(SET_STR, doveadm_socket_path),
 	DEF(SET_UINT, doveadm_worker_count),
-	DEF(SET_UINT, doveadm_port),
+	DEF(SET_IN_PORT, doveadm_port),
 	{ SET_ALIAS, "doveadm_proxy_port", 0, NULL },
+	DEF(SET_STR, doveadm_username),
 	DEF(SET_STR, doveadm_password),
 	DEF(SET_STR, doveadm_allowed_commands),
 	DEF(SET_STR, dsync_alt_char),
 	DEF(SET_STR, dsync_remote_cmd),
 	DEF(SET_STR, ssl_client_ca_dir),
 	DEF(SET_STR, ssl_client_ca_file),
+	DEF(SET_STR, director_username_hash),
+	DEF(SET_STR, doveadm_api_key),
+	DEF(SET_STR, dsync_features),
+	DEF(SET_UINT, dsync_commit_msgs_interval),
+	DEF(SET_STR, doveadm_http_rawlog_dir),
+	DEF(SET_STR, dsync_hashed_headers),
 
 	{ SET_STRLIST, "plugin", offsetof(struct doveadm_settings, plugin_envs), NULL },
 
@@ -3305,16 +3915,24 @@ const struct doveadm_settings doveadm_default_settings = {
 	.libexec_dir = PKG_LIBEXECDIR,
 	.mail_plugins = "",
 	.mail_plugin_dir = MODULEDIR,
+	.auth_debug = FALSE,
 	.auth_socket_path = "auth-userdb",
 	.doveadm_socket_path = "doveadm-server",
 	.doveadm_worker_count = 0,
 	.doveadm_port = 0,
+	.doveadm_username = "doveadm",
 	.doveadm_password = "",
 	.doveadm_allowed_commands = "",
 	.dsync_alt_char = "_",
 	.dsync_remote_cmd = "ssh -l%{login} %{host} doveadm dsync-server -u%u -U",
+	.dsync_features = "",
+	.dsync_hashed_headers = "Date Message-ID",
+	.dsync_commit_msgs_interval = 100,
 	.ssl_client_ca_dir = "",
 	.ssl_client_ca_file = "",
+	.director_username_hash = "%Lu",
+	.doveadm_api_key = "",
+	.doveadm_http_rawlog_dir = "",
 
 	.plugin_envs = ARRAY_INIT
 };
@@ -3343,7 +3961,7 @@ static struct file_listener_settings *dns_client_unix_listeners[] = {
 	&dns_client_unix_listeners_array[0]
 };
 static buffer_t dns_client_unix_listeners_buf = {
-	dns_client_unix_listeners, sizeof(dns_client_unix_listeners), { 0, }
+	dns_client_unix_listeners, sizeof(dns_client_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings dns_client_service_settings = {
@@ -3385,7 +4003,7 @@ static struct file_listener_settings *director_unix_listeners[] = {
 };
 static buffer_t director_unix_listeners_buf = {
 	director_unix_listeners,
-	sizeof(director_unix_listeners), { 0, }
+	sizeof(director_unix_listeners), { NULL, }
 };
 static struct file_listener_settings director_fifo_listeners_array[] = {
 	{ "login/proxy-notify", 0, "", "" }
@@ -3395,7 +4013,7 @@ static struct file_listener_settings *director_fifo_listeners[] = {
 };
 static buffer_t director_fifo_listeners_buf = {
 	director_fifo_listeners,
-	sizeof(director_fifo_listeners), { 0, }
+	sizeof(director_fifo_listeners), { NULL, }
 };
 /* </settings checks> */
 /* <settings checks> */
@@ -3448,8 +4066,16 @@ static const struct setting_define director_setting_defines[] = {
 	DEF(SET_STR, director_servers),
 	DEF(SET_STR, director_mail_servers),
 	DEF(SET_STR, director_username_hash),
+	DEF(SET_STR, director_flush_socket),
+	DEF(SET_TIME, director_ping_idle_timeout),
+	DEF(SET_TIME, director_ping_max_timeout),
 	DEF(SET_TIME, director_user_expire),
-	DEF(SET_UINT, director_doveadm_port),
+	DEF(SET_TIME, director_user_kick_delay),
+	DEF(SET_IN_PORT, director_doveadm_port),
+	DEF(SET_BOOL, director_consistent_hashing),
+	DEF(SET_UINT, director_max_parallel_moves),
+	DEF(SET_UINT, director_max_parallel_kicks),
+	DEF(SET_SIZE, director_output_buffer_size),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -3459,8 +4085,15 @@ const struct director_settings director_default_settings = {
 	.director_servers = "",
 	.director_mail_servers = "",
 	.director_username_hash = "%Lu",
+	.director_flush_socket = "",
+	.director_ping_idle_timeout = 30,
+	.director_ping_max_timeout = 60,
 	.director_user_expire = 60*15,
-	.director_doveadm_port = 0
+	.director_user_kick_delay = 2,
+	.director_doveadm_port = 0,
+	.director_max_parallel_moves = 100,
+	.director_max_parallel_kicks = 100,
+	.director_output_buffer_size = 10 * 1024 * 1024,
 };
 const struct setting_parser_info director_setting_parser_info = {
 	.module_name = "director",
@@ -3483,7 +4116,17 @@ static struct file_listener_settings *dict_unix_listeners[] = {
 	&dict_unix_listeners_array[0]
 };
 static buffer_t dict_unix_listeners_buf = {
-	dict_unix_listeners, sizeof(dict_unix_listeners), { 0, }
+	dict_unix_listeners, sizeof(dict_unix_listeners), { NULL, }
+};
+
+static struct file_listener_settings dict_async_unix_listeners_array[] = {
+	{ "dict-async", 0600, "", "" }
+};
+static struct file_listener_settings *dict_async_unix_listeners[] = {
+	&dict_async_unix_listeners_array[0]
+};
+static buffer_t dict_async_unix_listeners_buf = {
+	dict_async_unix_listeners, sizeof(dict_async_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings dict_service_settings = {
@@ -3511,18 +4154,47 @@ struct service_settings dict_service_settings = {
 	.fifo_listeners = ARRAY_INIT,
 	.inet_listeners = ARRAY_INIT
 };
+struct service_settings dict_async_service_settings = {
+	.name = "dict-async",
+	.protocol = "",
+	.type = "",
+	.executable = "dict",
+	.user = "$default_internal_user",
+	.group = "",
+	.privileged_group = "",
+	.extra_groups = "",
+	.chroot = "",
+
+	.drop_priv_before_exec = FALSE,
+
+	.process_min_avail = 0,
+	.process_limit = 0,
+	.client_limit = 0,
+	.service_count = 0,
+	.idle_kill = 0,
+	.vsz_limit = (uoff_t)-1,
+
+	.unix_listeners = { { &dict_async_unix_listeners_buf,
+			      sizeof(dict_async_unix_listeners[0]) } },
+	.fifo_listeners = ARRAY_INIT,
+	.inet_listeners = ARRAY_INIT
+};
 #undef DEF
 #define DEF(type, name) \
-	{ type, #name, offsetof(struct dict_settings, name), NULL }
+	{ type, #name, offsetof(struct dict_server_settings, name), NULL }
 static const struct setting_define dict_setting_defines[] = {
 	DEF(SET_STR, base_dir),
+	DEF(SET_BOOL, verbose_proctitle),
+
 	DEF(SET_STR, dict_db_config),
-	{ SET_STRLIST, "dict", offsetof(struct dict_settings, dicts), NULL },
+	{ SET_STRLIST, "dict", offsetof(struct dict_server_settings, dicts), NULL },
 
 	SETTING_DEFINE_LIST_END
 };
-const struct dict_settings dict_default_settings = {
+const struct dict_server_settings dict_default_settings = {
 	.base_dir = PKG_RUNDIR,
+	.verbose_proctitle = FALSE,
+
 	.dict_db_config = "",
 	.dicts = ARRAY_INIT
 };
@@ -3532,7 +4204,7 @@ const struct setting_parser_info dict_setting_parser_info = {
 	.defaults = &dict_default_settings,
 
 	.type_offset = (size_t)-1,
-	.struct_size = sizeof(struct dict_settings),
+	.struct_size = sizeof(struct dict_server_settings),
 
 	.parent_offset = (size_t)-1
 };
@@ -3545,7 +4217,7 @@ static struct file_listener_settings *config_unix_listeners[] = {
 	&config_unix_listeners_array[0]
 };
 static buffer_t config_unix_listeners_buf = {
-	config_unix_listeners, sizeof(config_unix_listeners), { 0, }
+	config_unix_listeners, sizeof(config_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings config_service_settings = {
@@ -3565,7 +4237,7 @@ struct service_settings config_service_settings = {
 	.process_limit = 0,
 	.client_limit = 0,
 	.service_count = 0,
-	.idle_kill = 0,
+	.idle_kill = UINT_MAX,
 	.vsz_limit = (uoff_t)-1,
 
 	.unix_listeners = { { &config_unix_listeners_buf,
@@ -3594,7 +4266,7 @@ static struct file_listener_settings *auth_unix_listeners[] = {
 	&auth_unix_listeners_array[5]
 };
 static buffer_t auth_unix_listeners_buf = {
-	auth_unix_listeners, sizeof(auth_unix_listeners), { 0, }
+	auth_unix_listeners, sizeof(auth_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 /* <settings checks> */
@@ -3605,7 +4277,7 @@ static struct file_listener_settings *auth_worker_unix_listeners[] = {
 	&auth_worker_unix_listeners_array[0]
 };
 static buffer_t auth_worker_unix_listeners_buf = {
-	auth_worker_unix_listeners, sizeof(auth_worker_unix_listeners), { 0, }
+	auth_worker_unix_listeners, sizeof(auth_worker_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 /* <settings checks> */
@@ -3641,7 +4313,7 @@ auth_settings_set_self_ips(struct auth_settings *set, pool_t pool,
 }
 
 static bool
-auth_verify_verbose_password(const struct auth_settings *set,
+auth_verify_verbose_password(struct auth_settings *set,
 			     const char **error_r)
 {
 	const char *p, *value = set->verbose_passwords;
@@ -3662,8 +4334,14 @@ auth_verify_verbose_password(const struct auth_settings *set,
 		return TRUE;
 	else if (strcmp(value, "sha1") == 0)
 		return TRUE;
-	else
+	else if (strcmp(value, "yes") == 0) {
+		/* just use it as alias for "plain" */
+		set->verbose_passwords = "plain";
+		return TRUE;
+	} else {
+		*error_r = "auth_verbose_passwords: Invalid value";
 		return FALSE;
+	}
 }
 
 static bool auth_settings_check(void *_set, pool_t pool,
@@ -3710,6 +4388,25 @@ static bool auth_settings_check(void *_set, pool_t pool,
 	}
 	set->realms_arr =
 		(const char *const *)p_strsplit_spaces(pool, set->realms, " ");
+
+	if (*set->policy_server_url != '\0') {
+		if (*set->policy_hash_nonce == '\0') {
+
+			*error_r = "auth_policy_hash_nonce must be set when policy server is used";
+			return FALSE;
+		}
+		const struct hash_method *digest = hash_method_lookup(set->policy_hash_mech);
+		if (digest == NULL) {
+			*error_r = "invalid auth_policy_hash_mech given";
+			return FALSE;
+		}
+		if (set->policy_hash_truncate > 0 && set->policy_hash_truncate >= digest->digest_size*8) {
+			*error_r = t_strdup_printf("policy_hash_truncate is not smaller than digest size (%u >= %u)",
+				set->policy_hash_truncate,
+				digest->digest_size*8);
+			return FALSE;
+		}
+	}
 
 	if (!auth_settings_set_self_ips(set, pool, error_r))
 		return FALSE;
@@ -3802,10 +4499,13 @@ struct service_settings auth_worker_service_settings = {
 #define DEF(type, name) \
 	{ type, #name, offsetof(struct auth_passdb_settings, name), NULL }
 static const struct setting_define auth_passdb_setting_defines[] = {
+	DEF(SET_STR, name),
 	DEF(SET_STR, driver),
 	DEF(SET_STR, args),
 	DEF(SET_STR, default_fields),
 	DEF(SET_STR, override_fields),
+	DEF(SET_STR, mechanisms),
+	DEF(SET_STR, username_filter),
 
 	DEF(SET_ENUM, skip),
 	DEF(SET_ENUM, result_success),
@@ -3815,14 +4515,18 @@ static const struct setting_define auth_passdb_setting_defines[] = {
 	DEF(SET_BOOL, deny),
 	DEF(SET_BOOL, pass),
 	DEF(SET_BOOL, master),
+	DEF(SET_ENUM, auth_verbose),
 
 	SETTING_DEFINE_LIST_END
 };
 static const struct auth_passdb_settings auth_passdb_default_settings = {
+	.name = "",
 	.driver = "",
 	.args = "",
 	.default_fields = "",
 	.override_fields = "",
+	.mechanisms = "",
+	.username_filter = "",
 
 	.skip = "never:authenticated:unauthenticated",
 	.result_success = "return-ok:return:return-fail:continue:continue-ok:continue-fail",
@@ -3831,13 +4535,14 @@ static const struct auth_passdb_settings auth_passdb_default_settings = {
 
 	.deny = FALSE,
 	.pass = FALSE,
-	.master = FALSE
+	.master = FALSE,
+	.auth_verbose = "default:yes:no"
 };
 const struct setting_parser_info auth_passdb_setting_parser_info = {
 	.defines = auth_passdb_setting_defines,
 	.defaults = &auth_passdb_default_settings,
 
-	.type_offset = (size_t)-1,
+	.type_offset = offsetof(struct auth_passdb_settings, name),
 	.struct_size = sizeof(struct auth_passdb_settings),
 
 	.parent_offset = (size_t)-1,
@@ -3849,6 +4554,7 @@ const struct setting_parser_info auth_passdb_setting_parser_info = {
 #define DEF(type, name) \
 	{ type, #name, offsetof(struct auth_userdb_settings, name), NULL }
 static const struct setting_define auth_userdb_setting_defines[] = {
+	DEF(SET_STR, name),
 	DEF(SET_STR, driver),
 	DEF(SET_STR, args),
 	DEF(SET_STR, default_fields),
@@ -3859,10 +4565,13 @@ static const struct setting_define auth_userdb_setting_defines[] = {
 	DEF(SET_ENUM, result_failure),
 	DEF(SET_ENUM, result_internalfail),
 
+	DEF(SET_ENUM, auth_verbose),
+
 	SETTING_DEFINE_LIST_END
 };
 static const struct auth_userdb_settings auth_userdb_default_settings = {
 	/* NOTE: when adding fields, update also auth.c:userdb_dummy_set */
+	.name = "",
 	.driver = "",
 	.args = "",
 	.default_fields = "",
@@ -3871,13 +4580,15 @@ static const struct auth_userdb_settings auth_userdb_default_settings = {
 	.skip = "never:found:notfound",
 	.result_success = "return-ok:return:return-fail:continue:continue-ok:continue-fail",
 	.result_failure = "continue:return:return-ok:return-fail:continue-ok:continue-fail",
-	.result_internalfail = "continue:return:return-ok:return-fail:continue-ok:continue-fail"
+	.result_internalfail = "continue:return:return-ok:return-fail:continue-ok:continue-fail",
+
+	.auth_verbose = "default:yes:no"
 };
 const struct setting_parser_info auth_userdb_setting_parser_info = {
 	.defines = auth_userdb_setting_defines,
 	.defaults = &auth_userdb_default_settings,
 
-	.type_offset = (size_t)-1,
+	.type_offset = offsetof(struct auth_userdb_settings, name),
 	.struct_size = sizeof(struct auth_userdb_settings),
 
 	.parent_offset = (size_t)-1,
@@ -3901,6 +4612,7 @@ static const struct setting_define auth_setting_defines[] = {
 	DEF(SET_SIZE, cache_size),
 	DEF(SET_TIME, cache_ttl),
 	DEF(SET_TIME, cache_negative_ttl),
+	DEF(SET_BOOL, cache_verify_password_with_worker),
 	DEF(SET_STR, username_chars),
 	DEF(SET_STR, username_translation),
 	DEF(SET_STR, username_format),
@@ -3912,6 +4624,19 @@ static const struct setting_define auth_setting_defines[] = {
 	DEF(SET_STR, proxy_self),
 	DEF(SET_TIME, failure_delay),
 
+	DEF(SET_STR, policy_server_url),
+	DEF(SET_STR, policy_server_api_header),
+	DEF(SET_UINT, policy_server_timeout_msecs),
+	DEF(SET_STR, policy_hash_mech),
+	DEF(SET_STR, policy_hash_nonce),
+	DEF(SET_STR, policy_request_attributes),
+	DEF(SET_BOOL, policy_reject_on_fail),
+	DEF(SET_BOOL, policy_check_before_auth),
+	DEF(SET_BOOL, policy_check_after_auth),
+	DEF(SET_BOOL, policy_report_after_auth),
+	DEF(SET_UINT, policy_hash_truncate),
+
+	DEF(SET_BOOL, stats),
 	DEF(SET_BOOL, verbose),
 	DEF(SET_BOOL, debug),
 	DEF(SET_BOOL, debug_passwords),
@@ -3930,6 +4655,9 @@ static const struct setting_define auth_setting_defines[] = {
 	DEF_NOPREFIX(SET_UINT, first_valid_uid),
 	DEF_NOPREFIX(SET_UINT, last_valid_uid),
 
+	DEF_NOPREFIX(SET_STR, ssl_client_ca_dir),
+	DEF_NOPREFIX(SET_STR, ssl_client_ca_file),
+
 	SETTING_DEFINE_LIST_END
 };
 static const struct auth_settings auth_default_settings = {
@@ -3939,6 +4667,7 @@ static const struct auth_settings auth_default_settings = {
 	.cache_size = 0,
 	.cache_ttl = 60*60,
 	.cache_negative_ttl = 60*60,
+	.cache_verify_password_with_worker = FALSE,
 	.username_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890.-_@",
 	.username_translation = "",
 	.username_format = "%Lu",
@@ -3950,12 +4679,28 @@ static const struct auth_settings auth_default_settings = {
 	.proxy_self = "",
 	.failure_delay = 2,
 
+	.policy_server_url = "",
+	.policy_server_api_header = "",
+	.policy_server_timeout_msecs = 2000,
+	.policy_hash_mech = "sha256",
+	.policy_hash_nonce = "",
+	.policy_request_attributes = "login=%{requested_username} pwhash=%{hashed_password} remote=%{rip} device_id=%{client_id} protocol=%s",
+	.policy_reject_on_fail = FALSE,
+	.policy_check_before_auth = TRUE,
+	.policy_check_after_auth = TRUE,
+	.policy_report_after_auth = TRUE,
+	.policy_hash_truncate = 12,
+
+	.stats = FALSE,
 	.verbose = FALSE,
 	.debug = FALSE,
 	.debug_passwords = FALSE,
 	.verbose_passwords = "no",
 	.ssl_require_client_cert = FALSE,
 	.ssl_username_from_cert = FALSE,
+	.ssl_client_ca_dir = "",
+	.ssl_client_ca_file = "",
+
 	.use_winbind = FALSE,
 
 	.worker_max_count = 30,
@@ -3991,7 +4736,7 @@ static struct file_listener_settings *anvil_unix_listeners[] = {
 	&anvil_unix_listeners_array[1]
 };
 static buffer_t anvil_unix_listeners_buf = {
-	anvil_unix_listeners, sizeof(anvil_unix_listeners), { 0, }
+	anvil_unix_listeners, sizeof(anvil_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 struct service_settings anvil_service_settings = {
@@ -4041,47 +4786,51 @@ static struct service_settings *config_all_services[] = {
 	&imap_urlauth_service_settings,
 	&imap_urlauth_login_service_settings,
 	&imap_login_service_settings,
+	&imap_hibernate_service_settings,
 	&doveadm_service_settings,
 	&dns_client_service_settings,
 	&director_service_settings,
 	&dict_service_settings,
+	&dict_async_service_settings,
 	&config_service_settings,
 	&auth_service_settings,
 	&auth_worker_service_settings,
 	&anvil_service_settings,
 };
 buffer_t config_all_services_buf = {
-	config_all_services, sizeof(config_all_services), { 0, }
+	config_all_services, sizeof(config_all_services), { NULL, }
 };
 const struct setting_parser_info *all_default_roots[] = {
 	&master_service_setting_parser_info,
 	&master_service_ssl_setting_parser_info,
-	&dict_setting_parser_info, 
-	&master_setting_parser_info, 
-	&pop3_login_setting_parser_info, 
-	&pop3_setting_parser_info, 
-	&imap_urlauth_login_setting_parser_info, 
-	&replicator_setting_parser_info, 
-	&lda_setting_parser_info, 
-	&imap_urlauth_setting_parser_info, 
-	&aggregator_setting_parser_info, 
-	&ssl_params_setting_parser_info, 
-	&mdbox_setting_parser_info, 
-	&doveadm_setting_parser_info, 
-	&mail_user_setting_parser_info, 
-	&imap_login_setting_parser_info, 
-	&mail_storage_setting_parser_info, 
-	&director_setting_parser_info, 
 	&stats_setting_parser_info, 
-	&imapc_setting_parser_info, 
-	&maildir_setting_parser_info, 
-	&lmtp_setting_parser_info, 
+	&mail_storage_setting_parser_info, 
+	&doveadm_setting_parser_info, 
+	&mbox_setting_parser_info, 
 	&imap_urlauth_worker_setting_parser_info, 
 	&login_setting_parser_info, 
 	&auth_setting_parser_info, 
-	&mbox_setting_parser_info, 
+	&imap_urlauth_login_setting_parser_info, 
+	&mdbox_setting_parser_info, 
+	&director_setting_parser_info, 
+	&imap_login_setting_parser_info, 
+	&fs_crypt_setting_parser_info, 
+	&ssl_params_setting_parser_info, 
+	&maildir_setting_parser_info, 
+	&imap_urlauth_setting_parser_info, 
+	&aggregator_setting_parser_info, 
+	&pop3_login_setting_parser_info, 
 	&pop3c_setting_parser_info, 
+	&dict_setting_parser_info, 
+	&replicator_setting_parser_info, 
+	&imapc_setting_parser_info, 
+	&mail_user_setting_parser_info, 
+	&quota_status_setting_parser_info, 
+	&lmtp_setting_parser_info, 
+	&lda_setting_parser_info, 
+	&master_setting_parser_info, 
 	&imap_setting_parser_info, 
+	&pop3_setting_parser_info, 
 	NULL
 };
 const struct setting_parser_info *const *all_roots = all_default_roots;

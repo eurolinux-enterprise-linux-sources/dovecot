@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "seq-range-array.h"
@@ -7,7 +7,6 @@
 #include "imap-search-args.h"
 #include "imap-util.h"
 
-#include <stdlib.h>
 
 struct imap_store_context {
 	struct client_command_context *cmd;
@@ -136,6 +135,8 @@ bool cmd_store(struct client_command_context *cmd)
 	const char *set, *reply, *tagged_reply;
 	string_t *str;
 	int ret;
+	bool update_deletes;
+	unsigned int deleted_count;
 
 	if (!client_read_args(cmd, 0, 0, &args))
 		return FALSE;
@@ -151,7 +152,7 @@ bool cmd_store(struct client_command_context *cmd)
 	if (ret <= 0)
 		return ret < 0;
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.cmd = cmd;
 	if (!store_parse_args(&ctx, ++args)) {
 		mail_search_args_unref(&search_args);
@@ -177,17 +178,21 @@ bool cmd_store(struct client_command_context *cmd)
 	}
 
 	t = mailbox_transaction_begin(client->mailbox, flags);
+	imap_transaction_set_cmd_reason(t, cmd);
 	search_ctx = mailbox_search_init(t, search_args, NULL,
 					 MAIL_FETCH_FLAGS, NULL);
 	mail_search_args_unref(&search_args);
 
 	i_array_init(&modified_set, 64);
-	if (ctx.max_modseq < (uint32_t)-1) {
+	if (ctx.max_modseq < (uint64_t)-1) {
 		/* STORE UNCHANGEDSINCE is being used */
 		mailbox_transaction_set_max_modseq(t, ctx.max_modseq,
 						   &modified_set);
 	}
 
+	update_deletes = (ctx.flags & MAIL_DELETED) != 0 &&
+		ctx.modify_type != MODIFY_REMOVE;
+	deleted_count = 0;
 	while (mailbox_search_next(search_ctx, &mail)) {
 		if (ctx.max_modseq < (uint64_t)-1) {
 			/* check early so there's less work for transaction
@@ -196,6 +201,10 @@ bool cmd_store(struct client_command_context *cmd)
 				seq_range_array_add(&modified_set, mail->seq);
 				continue;
 			}
+		}
+		if (update_deletes) {
+			if ((mail_get_flags(mail) & MAIL_DELETED) == 0)
+				deleted_count++;
 		}
 		if (ctx.modify_type == MODIFY_REPLACE || ctx.flags != 0)
 			mail_update_flags(mail, ctx.modify_type, ctx.flags);
@@ -218,6 +227,7 @@ bool cmd_store(struct client_command_context *cmd)
 		client_send_box_error(cmd, client->mailbox);
 		return TRUE;
 	}
+	client->deleted_count += deleted_count;
 
 	if (array_count(&modified_set) == 0)
 		tagged_reply = "OK Store completed.";

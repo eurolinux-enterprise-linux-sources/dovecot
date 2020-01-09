@@ -8,6 +8,7 @@
 struct mail_cache;
 struct mail_cache_view;
 struct mail_cache_transaction_ctx;
+struct mail_cache_compress_lock;
 
 enum mail_cache_decision_type {
 	/* Not needed currently */
@@ -43,7 +44,6 @@ struct mail_cache_field {
 };
 
 struct mail_cache *mail_cache_open_or_create(struct mail_index *index);
-struct mail_cache *mail_cache_create(struct mail_index *index);
 void mail_cache_free(struct mail_cache **cache);
 
 /* Register fields. fields[].idx is updated to contain field index.
@@ -59,15 +59,21 @@ mail_cache_register_lookup(struct mail_cache *cache, const char *name);
 const struct mail_cache_field *
 mail_cache_register_get_field(struct mail_cache *cache, unsigned int field_idx);
 /* Returns a list of all registered fields */
-const struct mail_cache_field *
+struct mail_cache_field *
 mail_cache_register_get_list(struct mail_cache *cache, pool_t pool,
 			     unsigned int *count_r);
 
 /* Returns TRUE if cache should be compressed. */
 bool mail_cache_need_compress(struct mail_cache *cache);
-/* Compress cache file. Offsets are updated to given transaction. */
+/* Compress cache file. Offsets are updated to given transaction. The cache
+   compression lock should be kept until the transaction is committed.
+   mail_cache_compress_unlock() needs to be called afterwards. The lock doesn't
+   prevent updates to the cache while it's held, it only prevents another cache
+   compression. */
 int mail_cache_compress(struct mail_cache *cache,
-			struct mail_index_transaction *trans);
+			struct mail_index_transaction *trans,
+			struct mail_cache_compress_lock **lock_r);
+void mail_cache_compress_unlock(struct mail_cache_compress_lock **lock);
 /* Returns TRUE if there is at least something in the cache. */
 bool mail_cache_exists(struct mail_cache *cache);
 /* Open and read cache header. Returns 0 if ok, -1 if error/corrupted. */
@@ -82,10 +88,10 @@ void mail_cache_view_close(struct mail_cache_view **view);
 void mail_cache_view_update_cache_decisions(struct mail_cache_view *view,
 					    bool update);
 
-/* Normally cache decisions are updated on lookup/add. Use this function to
-   enable/disable this (useful for precaching data). */
-void mail_cache_view_update_cache_decisions(struct mail_cache_view *view,
-					    bool update);
+/* Copy caching decisions */
+void mail_cache_decisions_copy(struct mail_index_transaction *itrans,
+			       struct mail_cache *src,
+			       struct mail_cache *dst);
 
 /* Get index transaction specific cache transaction. */
 struct mail_cache_transaction_ctx *
@@ -109,6 +115,11 @@ bool mail_cache_field_want_add(struct mail_cache_transaction_ctx *ctx,
    returned only if the decision is a forced no. */
 bool mail_cache_field_can_add(struct mail_cache_transaction_ctx *ctx,
 			      uint32_t seq, unsigned int field_idx);
+/* Notify cache that the mail is now closed. Any records added with
+   mail_cache_add() are unlikely to be required again. This mainly tells
+   INDEX=MEMORY that it can free up the memory used by the mail. */
+void mail_cache_close_mail(struct mail_cache_transaction_ctx *ctx,
+			   uint32_t seq);
 
 /* Returns 1 if field exists, 0 if not, -1 if error. */
 int mail_cache_field_exists(struct mail_cache_view *view, uint32_t seq,
@@ -133,7 +144,15 @@ int mail_cache_lookup_headers(struct mail_cache_view *view, string_t *dest,
 /* "Error in index cache file %s: ...". */
 void mail_cache_set_corrupted(struct mail_cache *cache, const char *fmt, ...)
 	ATTR_FORMAT(2, 3);
+void mail_cache_set_seq_corrupted_reason(struct mail_cache_view *cache_view,
+					 uint32_t seq, const char *reason);
 /* Delete the cache file. */
 void mail_cache_reset(struct mail_cache *cache);
+
+/* Returns human-readable reason for why a cached field is missing for
+   the specified mail. This is mainly for debugging purposes, so the exact
+   field doesn't matter here. */
+const char *
+mail_cache_get_missing_reason(struct mail_cache_view *view, uint32_t seq);
 
 #endif

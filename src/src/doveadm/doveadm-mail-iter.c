@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "mail-storage.h"
@@ -14,6 +14,7 @@ struct doveadm_mail_iter {
 	struct mailbox *box;
 	struct mailbox_transaction_context *t;
 	struct mail_search_context *search_ctx;
+	bool killed;
 };
 
 int doveadm_mail_iter_init(struct doveadm_mail_cmd_context *ctx,
@@ -21,6 +22,7 @@ int doveadm_mail_iter_init(struct doveadm_mail_cmd_context *ctx,
 			   struct mail_search_args *search_args,
 			   enum mail_fetch_field wanted_fields,
 			   const char *const *wanted_headers,
+			   bool readonly,
 			   struct doveadm_mail_iter **iter_r)
 {
 	struct doveadm_mail_iter *iter;
@@ -28,14 +30,18 @@ int doveadm_mail_iter_init(struct doveadm_mail_cmd_context *ctx,
 	const char *errstr;
 	enum mail_error error;
 
+	enum mailbox_flags readonly_flag =
+		readonly ? MAILBOX_FLAG_READONLY : 0;
+
 	iter = i_new(struct doveadm_mail_iter, 1);
 	iter->ctx = ctx;
 	iter->box = mailbox_alloc(info->ns->list, info->vname,
-				  MAILBOX_FLAG_IGNORE_ACLS);
+				  MAILBOX_FLAG_IGNORE_ACLS | readonly_flag);
+	mailbox_set_reason(iter->box, ctx->cmd->name);
 	iter->search_args = search_args;
 
 	if (mailbox_sync(iter->box, MAILBOX_SYNC_FLAG_FULL_READ) < 0) {
-		errstr = mailbox_get_last_error(iter->box, &error);
+		errstr = mailbox_get_last_internal_error(iter->box, &error);
 		if (error == MAIL_ERROR_NOTFOUND) {
 			/* just ignore this mailbox */
 			*iter_r = iter;
@@ -69,7 +75,7 @@ doveadm_mail_iter_deinit_transaction(struct doveadm_mail_iter *iter,
 		if (mailbox_search_deinit(&iter->search_ctx) < 0) {
 			i_error("Searching mailbox %s failed: %s",
 				mailbox_get_vname(iter->box),
-				mailbox_get_last_error(iter->box, NULL));
+				mailbox_get_last_internal_error(iter->box, NULL));
 			ret = -1;
 		}
 	}
@@ -79,7 +85,7 @@ doveadm_mail_iter_deinit_transaction(struct doveadm_mail_iter *iter,
 		if (mailbox_transaction_commit(&iter->t) < 0) {
 			i_error("Committing mailbox %s failed: %s",
 				mailbox_get_vname(iter->box),
-				mailbox_get_last_error(iter->box, NULL));
+				mailbox_get_last_internal_error(iter->box, NULL));
 			ret = -1;
 		}
 	} else {
@@ -99,10 +105,20 @@ doveadm_mail_iter_deinit_full(struct doveadm_mail_iter **_iter,
 	*_iter = NULL;
 
 	ret = doveadm_mail_iter_deinit_transaction(iter, commit);
-	if (ret == 0 && sync)
+	if (ret == 0 && sync) {
 		ret = mailbox_sync(iter->box, 0);
+		if (ret < 0) {
+			i_error("Mailbox %s: Mailbox sync failed: %s",
+				mailbox_get_vname(iter->box),
+				mailbox_get_last_internal_error(iter->box, NULL));
+		}
+	}
 	if (ret < 0)
 		doveadm_mail_failed_mailbox(iter->ctx, iter->box);
+	else if (iter->killed) {
+		iter->ctx->exit_code = EX_TEMPFAIL;
+		ret = -1;
+	}
 	if (!keep_box)
 		mailbox_free(&iter->box);
 	i_free(iter);
@@ -136,6 +152,10 @@ bool doveadm_mail_iter_next(struct doveadm_mail_iter *iter,
 {
 	if (iter->search_ctx == NULL)
 		return FALSE;
+	if (doveadm_is_killed()) {
+		iter->killed = TRUE;
+		return FALSE;
+	}
 	return mailbox_search_next(iter->search_ctx, mail_r);
 }
 

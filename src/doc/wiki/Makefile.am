@@ -8,12 +8,14 @@ EXTRA_DIST = \
 
 wikifiles = ACL.txt \
 	AixPluginsSupport.txt \
+	AttachmentIndicator.txt \
 	AuthDatabase.CheckPassword.txt \
 	AuthDatabase.Dict.txt \
 	AuthDatabase.LDAP.AuthBinds.txt \
 	AuthDatabase.LDAP.PasswordLookups.txt \
 	AuthDatabase.LDAP.Userdb.txt \
 	AuthDatabase.LDAP.txt \
+	AuthDatabase.Lua.txt \
 	AuthDatabase.Passwd.txt \
 	AuthDatabase.PasswdFile.txt \
 	AuthDatabase.SQL.txt \
@@ -29,6 +31,7 @@ wikifiles = ACL.txt \
 	Authentication.MultipleDatabases.txt \
 	Authentication.PasswordSchemes.txt \
 	Authentication.Penalty.txt \
+	Authentication.Policy.txt \
 	Authentication.RestrictAccess.txt \
 	Authentication.txt \
 	BasicConfiguration.txt \
@@ -36,6 +39,7 @@ wikifiles = ACL.txt \
 	Clients.NegativeUIDs.txt \
 	Clients.txt \
 	CompilingSource.txt \
+	ConfigFile.txt \
 	Debugging.Authentication.txt \
 	Debugging.ProcessTracing.txt \
 	Debugging.Rawlog.txt \
@@ -45,14 +49,18 @@ wikifiles = ACL.txt \
 	Design.AuthProtocol.txt \
 	Design.Buffers.txt \
 	Design.Code.txt \
+	Design.Dcrypt.txt \
+	Design.DoveadmProtocol.HTTP.txt \
 	Design.DoveadmProtocol.txt \
 	Design.Dsync.txt \
+	Design.Events.txt \
 	Design.Indexes.Cache.txt \
 	Design.Indexes.MailIndexApi.txt \
 	Design.Indexes.MainIndex.txt \
 	Design.Indexes.TransactionLog.txt \
 	Design.Indexes.txt \
 	Design.InputStreams.txt \
+	Design.Lua.txt \
 	Design.MailProcess.txt \
 	Design.Memory.txt \
 	Design.OutputStreams.txt \
@@ -73,11 +81,14 @@ wikifiles = ACL.txt \
 	Design.Strings.txt \
 	Design.txt \
 	Dict.txt \
+	Dictionary.txt \
 	Director.txt \
 	DomainLost.txt \
 	Errors.ChgrpNoPerm.txt \
 	FindMailLocation.txt \
 	FinishBasicConfiguration.txt \
+	HAProxy.txt \
+	HowTo.AntispamWithSieve.txt \
 	HowTo.EximAndDovecotSASL.txt \
 	HowTo.ImapcProxy.txt \
 	HowTo.PopBSMTPAndDovecot.txt \
@@ -85,7 +96,11 @@ wikifiles = ACL.txt \
 	HowTo.PostfixAndDovecotSASL.txt \
 	HowTo.Rootless.txt \
 	HowTo.SimpleVirtualInstall.txt \
+	HowTo.WriteConfiguration.txt \
 	HowTo.txt \
+	IMAPServer.Hibernation.txt \
+	IMAPServer.txt \
+	ImapMetadata.txt \
 	IndexFiles.txt \
 	LDA.Exim.txt \
 	LDA.Indexing.txt \
@@ -109,6 +124,7 @@ wikifiles = ACL.txt \
 	MailboxFormat.MH.txt \
 	MailboxFormat.Maildir.txt \
 	MailboxFormat.dbox.txt \
+	MailboxFormat.imapc.txt \
 	MailboxFormat.mailstore.txt \
 	MailboxFormat.mbox.txt \
 	MailboxFormat.mbx.txt \
@@ -147,6 +163,7 @@ wikifiles = ACL.txt \
 	PasswordDatabase.PAM.txt \
 	PasswordDatabase.Shadow.txt \
 	PasswordDatabase.Static.txt \
+	PasswordDatabase.oauth2.txt \
 	PasswordDatabase.txt \
 	PerformanceTuning.txt \
 	Pigeonhole.Installation.txt \
@@ -155,42 +172,59 @@ wikifiles = ACL.txt \
 	Pigeonhole.ManageSieve.Install.txt \
 	Pigeonhole.ManageSieve.Troubleshooting.txt \
 	Pigeonhole.ManageSieve.txt \
+	Pigeonhole.Sieve.Configuration.Dict.txt \
+	Pigeonhole.Sieve.Configuration.File.txt \
+	Pigeonhole.Sieve.Configuration.LDAP.txt \
 	Pigeonhole.Sieve.Configuration.txt \
 	Pigeonhole.Sieve.Examples.txt \
+	Pigeonhole.Sieve.Extensions.Duplicate.txt \
+	Pigeonhole.Sieve.Extensions.Editheader.txt \
+	Pigeonhole.Sieve.Extensions.Include.txt \
 	Pigeonhole.Sieve.Extensions.SpamtestVirustest.txt \
 	Pigeonhole.Sieve.Extensions.Vacation.txt \
 	Pigeonhole.Sieve.Extensions.txt \
 	Pigeonhole.Sieve.Plugins.Extdata.txt \
 	Pigeonhole.Sieve.Plugins.Extprograms.txt \
+	Pigeonhole.Sieve.Plugins.IMAPSieve.txt \
 	Pigeonhole.Sieve.Plugins.Pipe.txt \
 	Pigeonhole.Sieve.Plugins.txt \
 	Pigeonhole.Sieve.Troubleshooting.txt \
 	Pigeonhole.Sieve.Usage.txt \
 	Pigeonhole.Sieve.txt \
 	Pigeonhole.txt \
+	Plugins.Apparmor.txt \
 	Plugins.Autocreate.txt \
+	Plugins.CharsetAlias.txt \
 	Plugins.Compress.txt \
 	Plugins.Expire.txt \
 	Plugins.FTS.Lucene.txt \
 	Plugins.FTS.Solr.txt \
 	Plugins.FTS.Squat.txt \
 	Plugins.FTS.txt \
+	Plugins.LastLogin.txt \
 	Plugins.Lazyexpunge.txt \
 	Plugins.Listescape.txt \
+	Plugins.MailCrypt.txt \
 	Plugins.MailFilter.txt \
 	Plugins.MailLog.txt \
 	Plugins.MailboxAlias.txt \
 	Plugins.Notify.txt \
+	Plugins.NotifyStatus.txt \
+	Plugins.PushNotification.txt \
+	Plugins.QuotaClone.txt \
 	Plugins.Snarf.txt \
 	Plugins.Stats.txt \
 	Plugins.Trash.txt \
+	Plugins.VarExpandCrypt.txt \
 	Plugins.Virtual.txt \
+	Plugins.Welcome.txt \
 	Plugins.Zlib.txt \
 	Plugins.txt \
 	PostLoginScripting.txt \
 	PreAuth.txt \
 	QuickConfiguration.txt \
 	Quota.Configuration.txt \
+	Quota.Count.txt \
 	Quota.Dict.txt \
 	Quota.Dirsize.txt \
 	Quota.FS.txt \
@@ -206,23 +240,28 @@ wikifiles = ACL.txt \
 	Sasl.txt \
 	SecurityTuning.txt \
 	Services.txt \
+	SharedMailboxes.ClusterSetup.txt \
 	SharedMailboxes.Permissions.txt \
 	SharedMailboxes.Public.txt \
 	SharedMailboxes.Shared.txt \
 	SharedMailboxes.Symlinks.txt \
 	SharedMailboxes.txt \
 	SocketUnavailable.txt \
+	Statistics.Old.txt \
 	Statistics.txt \
+	Submission.txt \
 	SystemUsers.txt \
 	TestInstallation.txt \
 	TestPop3Installation.txt \
 	TimeMovedBackwards.txt \
+	Timeouts.txt \
 	Upgrading.1.0.txt \
 	Upgrading.1.1.txt \
 	Upgrading.1.2.txt \
 	Upgrading.2.0.txt \
 	Upgrading.2.1.txt \
 	Upgrading.2.2.txt \
+	Upgrading.2.3.txt \
 	Upgrading.txt \
 	UserDatabase.ExtraFields.txt \
 	UserDatabase.NSS.txt \

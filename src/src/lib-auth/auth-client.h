@@ -13,7 +13,9 @@ enum auth_request_flags {
 	/* Skip penalty checks for this request */
 	AUTH_REQUEST_FLAG_NO_PENALTY		= 0x04,
 	/* Support final SASL response */
-	AUTH_REQUEST_FLAG_SUPPORT_FINAL_RESP	= 0x08
+	AUTH_REQUEST_FLAG_SUPPORT_FINAL_RESP	= 0x08,
+	/* Enable auth_debug=yes logging for this request */
+	AUTH_REQUEST_FLAG_DEBUG			= 0x10
 };
 
 enum auth_request_status {
@@ -39,10 +41,13 @@ struct auth_request_info {
 	const char *service;
 	const char *session_id;
 	const char *cert_username;
+	const char *local_name;
+	const char *client_id;
+	const char *forward_fields;
 	enum auth_request_flags flags;
 
 	struct ip_addr local_ip, remote_ip, real_local_ip, real_remote_ip;
-	unsigned int local_port, remote_port, real_local_port, real_remote_port;
+	in_port_t local_port, remote_port, real_local_port, real_remote_port;
 
 	const char *initial_resp_base64;
 };

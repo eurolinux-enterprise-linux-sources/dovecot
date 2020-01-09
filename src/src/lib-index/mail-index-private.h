@@ -23,11 +23,6 @@ struct mail_index_sync_map_ctx;
    try to catch them by limiting the header size. */
 #define MAIL_INDEX_EXT_HEADER_MAX_SIZE (1024*1024*16-1)
 
-/* Write to main index file when bytes-to-be-read-from-log is between these
-   values. */
-#define MAIL_INDEX_MIN_WRITE_BYTES (1024*8)
-#define MAIL_INDEX_MAX_WRITE_BYTES (1024*128)
-
 #define MAIL_INDEX_IS_IN_MEMORY(index) \
 	((index)->dir == NULL)
 
@@ -37,6 +32,9 @@ struct mail_index_sync_map_ctx;
 #define MAIL_INDEX_MAP_IDX(map, idx) \
 	((struct mail_index_record *) \
 	 PTR_OFFSET((map)->rec_map->records, (idx) * (map)->hdr.record_size))
+#define MAIL_INDEX_REC_AT_SEQ(map, seq)					\
+	((struct mail_index_record *)					\
+	 PTR_OFFSET((map)->rec_map->records, ((seq)-1) * (map)->hdr.record_size))
 
 #define MAIL_TRANSACTION_FLAG_UPDATE_IS_INTERNAL(u) \
 	((((u)->add_flags | (u)->remove_flags) & MAIL_INDEX_FLAGS_MASK) == 0 && \
@@ -47,9 +45,6 @@ struct mail_index_sync_map_ctx;
 typedef int mail_index_expunge_handler_t(struct mail_index_sync_map_ctx *ctx,
 					 uint32_t seq, const void *data,
 					 void **sync_context, void *context);
-typedef int mail_index_sync_handler_t(struct mail_index_sync_map_ctx *ctx,
-				      uint32_t seq, void *old_data,
-				      const void *new_data, void **context);
 typedef void mail_index_sync_lost_handler_t(struct mail_index *index);
 
 #define MAIL_INDEX_HEADER_SIZE_ALIGN(size) \
@@ -95,11 +90,6 @@ enum mail_index_sync_handler_type {
 	MAIL_INDEX_SYNC_HANDLER_VIEW	= 0x04
 };
 
-struct mail_index_sync_handler {
-	mail_index_sync_handler_t *callback;
-        enum mail_index_sync_handler_type type;
-};
-
 struct mail_index_registered_ext {
 	const char *name;
 	uint32_t index_idx; /* index ext_id */
@@ -107,7 +97,6 @@ struct mail_index_registered_ext {
 	uint16_t record_size;
 	uint16_t record_align;
 
-	struct mail_index_sync_handler sync_handler;
 	mail_index_expunge_handler_t *expunge_handler;
 
 	void *expunge_context;
@@ -168,6 +157,9 @@ struct mail_index {
 	gid_t gid;
 	char *gid_origin;
 
+	struct mail_index_optimization_settings optimization_set;
+	uint32_t pending_log2_rotate_time;
+
 	pool_t extension_pool;
 	ARRAY(struct mail_index_registered_ext) extensions;
 
@@ -180,17 +172,17 @@ struct mail_index {
 	int fd;
 
 	struct mail_index_map *map;
+
+	time_t last_mmap_error_time;
+
 	uint32_t indexid;
 	unsigned int inconsistency_id;
 
 	/* last_read_log_file_* contains the seq/offsets we last read from
 	   the main index file's headers. these are used to figure out when
-	   the main index file should be updated, and if we can update it
-	   by writing on top of it or if we need to recreate it. */
+	   the main index file should be updated. */
 	uint32_t last_read_log_file_seq;
-	uint32_t last_read_log_file_head_offset;
 	uint32_t last_read_log_file_tail_offset;
-	struct stat last_read_stat;
 
 	/* transaction log head seq/offset when we last fscked */
 	uint32_t fsck_log_head_file_seq;
@@ -199,13 +191,8 @@ struct mail_index {
 	/* syncing will update this if non-NULL */
 	struct mail_index_transaction_commit_result *sync_commit_result;
 
-	int lock_type;
-	unsigned int lock_id_counter;
 	enum file_lock_method lock_method;
 	unsigned int max_lock_timeout_secs;
-
-	struct file_lock *file_lock;
-	struct dotlock *dotlock;
 
 	pool_t keywords_pool;
 	ARRAY_TYPE(keywords) keywords;
@@ -214,7 +201,7 @@ struct mail_index {
 	uint32_t keywords_ext_id;
 	uint32_t modseq_ext_id;
 
-	unsigned int view_count;
+	struct mail_index_view *views;
 
 	/* Module-specific contexts. */
 	ARRAY(union mail_index_module_context *) module_contexts;
@@ -246,21 +233,18 @@ void mail_index_register_expunge_handler(struct mail_index *index,
 					 void *context);
 void mail_index_unregister_expunge_handler(struct mail_index *index,
 					   uint32_t ext_id);
-void mail_index_register_sync_handler(struct mail_index *index, uint32_t ext_id,
-				      mail_index_sync_handler_t *cb,
-				      enum mail_index_sync_handler_type type);
-void mail_index_unregister_sync_handler(struct mail_index *index,
-					uint32_t ext_id);
 void mail_index_register_sync_lost_handler(struct mail_index *index,
 					   mail_index_sync_lost_handler_t *cb);
 void mail_index_unregister_sync_lost_handler(struct mail_index *index,
 					mail_index_sync_lost_handler_t *cb);
 
-int mail_index_create_tmp_file(struct mail_index *index, const char **path_r);
+int mail_index_create_tmp_file(struct mail_index *index,
+			       const char *path_prefix, const char **path_r);
 
 int mail_index_try_open_only(struct mail_index *index);
 void mail_index_close_file(struct mail_index *index);
-int mail_index_reopen_if_changed(struct mail_index *index);
+int mail_index_reopen_if_changed(struct mail_index *index,
+				 const char **reason_r);
 /* Update/rewrite the main index file from index->map */
 void mail_index_write(struct mail_index *index, bool want_rotate);
 
@@ -308,10 +292,16 @@ void mail_index_map_lookup_seq_range(struct mail_index_map *map,
 				     uint32_t *first_seq_r,
 				     uint32_t *last_seq_r);
 
-int mail_index_map_check_header(struct mail_index_map *map);
+/* Returns 1 on success, 0 on non-critical errors we want to silently fix,
+   -1 if map isn't usable. The caller is responsible for logging the errors
+   if -1 is returned. */
+int mail_index_map_check_header(struct mail_index_map *map,
+				const char **error_r);
+/* Returns 1 if header is usable, 0 or -1 if not. The caller should log an
+   error if -1 is returned, but not if 0 is returned. */
 bool mail_index_check_header_compat(struct mail_index *index,
 				    const struct mail_index_header *hdr,
-				    uoff_t file_size);
+				    uoff_t file_size, const char **error_r);
 int mail_index_map_parse_extensions(struct mail_index_map *map);
 int mail_index_map_parse_keywords(struct mail_index_map *map);
 
@@ -331,8 +321,12 @@ void mail_index_view_transaction_unref(struct mail_index_view *view);
 
 void mail_index_fsck_locked(struct mail_index *index);
 
+/* Log an error and set it as the index's current error that is available
+   with mail_index_get_error_message(). */
 void mail_index_set_error(struct mail_index *index, const char *fmt, ...)
 	ATTR_FORMAT(2, 3);
+/* Same as mail_index_set_error(), but don't log the error. */
+void mail_index_set_error_nolog(struct mail_index *index, const char *str);
 /* "%s failed with index file %s: %m" */
 void mail_index_set_syscall_error(struct mail_index *index,
 				  const char *function);

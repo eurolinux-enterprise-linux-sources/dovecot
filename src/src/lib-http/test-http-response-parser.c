@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "test-lib.h"
 #include "buffer.h"
@@ -11,8 +11,7 @@
 
 #include <time.h>
 
-struct http_response_parse_test {
-	const char *response;
+struct valid_parse_test_response {
 	unsigned char version_major;
 	unsigned char version_minor;
 	unsigned int status;
@@ -20,11 +19,57 @@ struct http_response_parse_test {
 	const char *payload;
 };
 
-/* Valid header tests */
+struct valid_parse_test {
+	const char *input;
+	enum http_response_parse_flags flags;
 
-static const struct http_response_parse_test
+	const struct valid_parse_test_response *responses;
+	unsigned int responses_count;
+};
+
+/* Valid response tests */
+
+static const struct valid_parse_test_response valid_responses1[] = {
+	{ 
+		.status = 200,
+		.payload = "This is a piece of stupid text.\r\n"
+	}
+};
+
+static const struct valid_parse_test_response valid_responses2[] = {
+	{ 
+		.status = 200,
+		.payload = "This is a piece of stupid text.\r\n"
+	},{ 
+		.status = 200,
+		.payload = "This is a piece of even more stupid text.\r\n"
+	}
+};
+
+static const struct valid_parse_test_response valid_responses3[] = {
+	{ 
+		.status = 401,
+		.payload = "Frop!"
+	}
+};
+
+static const struct valid_parse_test_response valid_responses4[] = {
+	{
+		.status = 200,
+		.payload = "Invalid date header"
+	}
+};
+
+static const struct valid_parse_test_response valid_responses5[] = {
+	{
+		.status = 200,
+		.payload = "Duplicate headers"
+	}
+};
+
+static const struct valid_parse_test
 valid_response_parse_tests[] = {
-	{ .response =
+	{ .input =
 			"HTTP/1.1 200 OK\r\n"
 			"Date: Sun, 07 Oct 2012 13:02:27 GMT\r\n"
 			"Server: Apache/2.2.16 (Debian)\r\n"
@@ -37,10 +82,10 @@ valid_response_parse_tests[] = {
 			"Content-Type: text/plain\r\n"
 			"\r\n"
 			"This is a piece of stupid text.\r\n",
-		.status = 200,
-		.payload = "This is a piece of stupid text.\r\n"
-	},{ 
-		.response =
+		.responses = valid_responses1,
+		.responses_count = N_ELEMENTS(valid_responses1)
+	},{
+		.input =
 			"HTTP/1.1 200 OK\r\n"
 			"Date: Sun, 07 Oct 2012 13:02:27 GMT\r\n"
 			"Server: Apache/2.2.16 (Debian)\r\n"
@@ -65,10 +110,10 @@ valid_response_parse_tests[] = {
 			"Content-Type: text/plain\r\n"
 			"\r\n"
 			"This is a piece of even more stupid text.\r\n",
-		.status = 200,
-		.payload = "This is a piece of even more stupid text.\r\n"
+		.responses = valid_responses2,
+		.responses_count = N_ELEMENTS(valid_responses2)
 	},{
-		.response =
+		.input =
 			"HTTP/1.1 401 Authorization Required\r\n"
 			"Date: Sun, 07 Oct 2012 19:52:03 GMT\r\n"
 			"Server: Apache/2.2.16 (Debian) PHP/5.3.3-7+squeeze14\r\n"
@@ -81,12 +126,38 @@ valid_response_parse_tests[] = {
 			"Content-Type: text/html; charset=iso-8859-1\r\n"
 			"\r\n"
 			"Frop!",
-		.status = 401,
-		.payload = "Frop!"
+		.responses = valid_responses3,
+		.responses_count = N_ELEMENTS(valid_responses3)
+	},{
+		.input =
+			"HTTP/1.1 200 OK\r\n"
+			"Date: Sun, 07 Ocu 2012 19:52:03 GMT\r\n"
+			"Content-Length: 19\r\n"
+			"Keep-Alive: timeout=15, max=99\r\n"
+			"Connection: Keep-Alive\r\n"
+			"Date: Sun, 13 Oct 2013 13:13:13 GMT\r\n"
+			"\r\n"
+			"Invalid date header",
+		.responses = valid_responses4,
+		.responses_count = N_ELEMENTS(valid_responses4)
+	},{
+		.input =
+			"HTTP/1.1 200 OK\r\n"
+			"Date: Sun, 07 Oct 2012 19:52:03 GMT\r\n"
+			"Server: Apache/2.2.16 (Debian) PHP/5.3.3-7+squeeze14\r\n"
+			"Content-Length: 17\r\n"
+			"Keep-Alive: timeout=15, max=99\r\n"
+			"Connection: Keep-Alive\r\n"
+			"Content-Type: text/html; charset=iso-8859-1\r\n"
+			"Date: Sun, 13 Oct 2013 13:13:13 GMT\r\n"
+			"\r\n"
+			"Duplicate headers",
+		.responses = valid_responses5,
+		.responses_count = N_ELEMENTS(valid_responses5)
 	}
 };
 
-unsigned int valid_response_parse_test_count =
+static const unsigned int valid_response_parse_test_count =
 	N_ELEMENTS(valid_response_parse_tests);
 
 static void test_http_response_parse_valid(void)
@@ -97,58 +168,75 @@ static void test_http_response_parse_valid(void)
 	for (i = 0; i < valid_response_parse_test_count; i++) T_BEGIN {
 		struct istream *input;
 		struct ostream *output;
-		const struct http_response_parse_test *test;
+		const struct valid_parse_test *test;
+		const struct valid_parse_test_response *tresponse;
 		struct http_response_parser *parser;
-		struct http_response response;
-		const char *response_text, *payload, *error;
-		unsigned int pos, response_text_len;
+		struct http_response presponse;
+		const char *input_text, *payload, *error;
+		unsigned int j, pos, input_text_len;
 		int ret = 0;
 
-		memset(&response, 0, sizeof(response));
+		i_zero(&presponse);
 		test = &valid_response_parse_tests[i];
-		response_text = test->response;
-		response_text_len = strlen(response_text);
-		input = test_istream_create_data(response_text, response_text_len);
-		parser = http_response_parser_init(input, NULL);
+		input_text = test->input;
+		input_text_len = strlen(input_text);
+		input = test_istream_create_data(input_text, input_text_len);
+		parser = http_response_parser_init(input, NULL,
+			valid_response_parse_tests[i].flags);
 
 		test_begin(t_strdup_printf("http response valid [%d]", i));
 
 		payload = NULL;
-		for (pos = 0; pos < response_text_len && ret == 0; pos++) {
+		for (pos = 0; pos < input_text_len && ret == 0; pos++) {
 			test_istream_set_size(input, pos);
-			ret = http_response_parse_next(parser, FALSE, &response, &error);
+			ret = http_response_parse_next(parser,
+				HTTP_RESPONSE_PAYLOAD_TYPE_ALLOWED, &presponse, &error);
 		}
-		test_istream_set_size(input, response_text_len);
+		test_istream_set_size(input, input_text_len);
+		i_stream_unref(&input);
+
+		j = 0;
+		test_out("parse success", ret > 0);
 		while (ret > 0) {
-			if (response.payload != NULL) {
+			if (presponse.payload != NULL) {
 				buffer_set_used_size(payload_buffer, 0);
 				output = o_stream_create_buffer(payload_buffer);
 				test_out("payload receive", 
-					o_stream_send_istream(output, response.payload));
+					o_stream_send_istream(output, presponse.payload));
 				o_stream_destroy(&output);
 				payload = str_c(payload_buffer);
 			} else {
 				payload = NULL;
 			}
-			ret = http_response_parse_next(parser, FALSE, &response, &error);
-		}
 
-		test_out("parse success", ret == 0);
-		
-		if (ret == 0) {
+			test_assert(j < test->responses_count);
+			if (j >= test->responses_count)
+				break;
+			tresponse = &test->responses[j];
+
 			/* verify last response only */
-			test_out(t_strdup_printf("response->status = %d",test->status),
-					response.status == test->status);
-			if (payload == NULL || test->payload == NULL) {
+			test_out(t_strdup_printf("response->status = %d",
+					tresponse->status),
+				presponse.status == tresponse->status);
+			if (payload == NULL || tresponse->payload == NULL) {
 				test_out(t_strdup_printf("response->payload = %s",
 					str_sanitize(payload, 80)),
-					payload == test->payload);
+					payload == tresponse->payload);
 			} else {
 				test_out(t_strdup_printf("response->payload = %s",
 					str_sanitize(payload, 80)),
-					strcmp(payload, test->payload) == 0);
+					strcmp(payload, tresponse->payload) == 0);
 			}
+		
+			ret = http_response_parse_next(parser,
+				HTTP_RESPONSE_PAYLOAD_TYPE_ALLOWED, &presponse, &error);
+			if (++j == test->responses_count)
+				test_out("parse end", ret == 0);
+			else
+				test_out("parse success", ret > 0);
 		}
+
+		test_assert(ret == 0);
 		test_end();
 		http_response_parser_deinit(&parser);
 	} T_END;
@@ -156,30 +244,68 @@ static void test_http_response_parse_valid(void)
 	buffer_free(&payload_buffer);
 }
 
-static const char *invalid_response_parse_tests[] = {
-	"XMPP/1.0 302 Found\r\n"
-	"Location: http://www.example.nl/\r\n"
-	"Cache-Control: private\r\n",
-	"HTTP/1.1  302 Found\r\n"
-	"Location: http://www.example.nl/\r\n"
-	"Cache-Control: private\r\n",
-	"HTTP/1.1 ABC Found\r\n"
-	"Location: http://www.example.nl/\r\n"
-	"Cache-Control: private\r\n",
-	"HTTP/1.1 302 \177\r\n"
-	"Location: http://www.example.nl/\r\n"
-	"Cache-Control: private\r\n",
-	"HTTP/1.1 302 Found\n\r"
-	"Location: http://www.example.nl/\n\r"
-	"Cache-Control: private\n\r"
+/*
+ * Invalid response tests
+ */
+
+struct invalid_parse_test {
+	const char *input;
+	enum http_response_parse_flags flags;
 };
 
-static unsigned char invalid_response_with_nuls[] =
-	"HTTP/1.1 200 OK\r\n"
-	"Server: text\0server\r\n"
-	"\r\n";
+static struct invalid_parse_test invalid_response_parse_tests[] = {
+	{
+		.input =
+			"XMPP/1.0 302 Found\r\n"
+			"Location: http://www.example.nl/\r\n"
+			"Cache-Control: private\r\n"
+	},{
+		.input =
+			"HTTP/1.1  302 Found\r\n"
+			"Location: http://www.example.nl/\r\n"
+			"Cache-Control: private\r\n"
+	},{
+		.input =
+			"HTTP/1.1 ABC Found\r\n"
+			"Location: http://www.example.nl/\r\n"
+			"Cache-Control: private\r\n"
+	},{
+		.input =
+			"HTTP/1.1 302 \177\r\n"
+			"Location: http://www.example.nl/\r\n"
+			"Cache-Control: private\r\n"
+	},{
+		.input =
+			"HTTP/1.1 302 Found\n\r"
+			"Location: http://www.example.nl/\n\r"
+			"Cache-Control: private\n\r"
+	},{
+		.input =
+			"HTTP/1.1 200 OK\r\n"
+			"Date: Sun, 07 Ocu 2012 19:52:03 GMT\r\n"
+			"Content-Length: 19\r\n"
+			"Keep-Alive: timeout=15, max=99\r\n"
+			"Connection: Keep-Alive\r\n"
+			"\r\n"
+			"Invalid date header",
+		.flags = HTTP_RESPONSE_PARSE_FLAG_STRICT
+	},{
+		.input =
+			"HTTP/1.1 200 OK\r\n"
+			"Date: Sun, 07 Oct 2012 19:52:03 GMT\r\n"
+			"Server: Apache/2.2.16 (Debian) PHP/5.3.3-7+squeeze14\r\n"
+			"Content-Length: 17\r\n"
+			"Keep-Alive: timeout=15, max=99\r\n"
+			"Connection: Keep-Alive\r\n"
+			"Content-Type: text/html; charset=iso-8859-1\r\n"
+			"Date: Sun, 13 Oct 2013 13:13:13 GMT\r\n"
+			"\r\n"
+			"Duplicate headers",
+		.flags = HTTP_RESPONSE_PARSE_FLAG_STRICT
+	}
+};
 
-unsigned int invalid_response_parse_test_count =
+static const unsigned int invalid_response_parse_test_count =
 	N_ELEMENTS(invalid_response_parse_tests);
 
 static void test_http_response_parse_invalid(void)
@@ -194,28 +320,76 @@ static void test_http_response_parse_invalid(void)
 	for (i = 0; i < invalid_response_parse_test_count; i++) T_BEGIN {
 		const char *test;
 
-		test = invalid_response_parse_tests[i];
+		test = invalid_response_parse_tests[i].input;
 		response_text = test;
 		input = i_stream_create_from_data(response_text, strlen(response_text));
-		parser = http_response_parser_init(input, NULL);
+		parser = http_response_parser_init(input, NULL,
+			invalid_response_parse_tests[i].flags);
+		i_stream_unref(&input);
 
 		test_begin(t_strdup_printf("http response invalid [%d]", i));
 
 		while ((ret=http_response_parse_next(parser, FALSE, &response, &error)) > 0);
 
-		test_assert(ret < 0);
+		test_out_reason("parse failure", ret < 0, error);
 		test_end();
 		http_response_parser_deinit(&parser);
 	} T_END;
+}
+
+/*
+ * Bad response tests
+ */
+
+static const unsigned char bad_response_with_nuls[] =
+	"HTTP/1.1 200 OK\r\n"
+	"Server: text\0server\r\n"
+	"\r\n";
+
+static void test_http_response_parse_bad(void)
+{
+	struct http_response_parser *parser;
+	struct http_response response;
+	const char *header, *error;
+	struct istream *input;
+	int ret;
 
 	/* parse failure guarantees http_response_header.size equals
 	   strlen(http_response_header.value) */
-	test_begin("http response with NULs");
-	input = i_stream_create_from_data(invalid_response_with_nuls,
-					  sizeof(invalid_response_with_nuls)-1);
-	parser = http_response_parser_init(input, 0);
-	while ((ret=http_response_parse_next(parser, FALSE, &response, &error)) > 0);
+
+	test_begin("http response with NULs (strict)");
+	input = i_stream_create_from_data(bad_response_with_nuls,
+					  sizeof(bad_response_with_nuls)-1);
+	parser = http_response_parser_init(input, NULL,
+		HTTP_RESPONSE_PARSE_FLAG_STRICT);
+	i_stream_unref(&input);
+
+	while ((ret=http_response_parse_next(parser,
+		HTTP_RESPONSE_PAYLOAD_TYPE_ALLOWED, &response, &error)) > 0);
 	test_assert(ret < 0);
+	http_response_parser_deinit(&parser);
+	test_end();
+
+	/* even when lenient, bad characters like NUL must not be returned */
+	test_begin("http response with NULs (lenient)");
+	input = i_stream_create_from_data(bad_response_with_nuls,
+					  sizeof(bad_response_with_nuls)-1);
+	parser = http_response_parser_init(input, NULL, 0);
+	i_stream_unref(&input);
+
+	ret = http_response_parse_next(parser,
+		HTTP_RESPONSE_PAYLOAD_TYPE_ALLOWED, &response, &error);
+	test_out("parse success", ret > 0);
+	header = http_response_header_get(&response, "server");
+	test_out("header present", header != NULL);
+	if (header != NULL) {
+		test_out(t_strdup_printf("header Server: %s", header),
+			strcmp(header, "textserver") == 0);
+	}
+	ret = http_response_parse_next(parser,
+		HTTP_RESPONSE_PAYLOAD_TYPE_ALLOWED, &response, &error);
+	test_out("parse end", ret == 0);
+	http_response_parser_deinit(&parser);
 	test_end();
 }
 
@@ -224,6 +398,7 @@ int main(void)
 	static void (*test_functions[])(void) = {
 		test_http_response_parse_valid,
 		test_http_response_parse_invalid,
+		test_http_response_parse_bad,
 		NULL
 	};
 	return test_run(test_functions);

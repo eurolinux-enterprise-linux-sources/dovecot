@@ -10,7 +10,8 @@ struct director_host {
 	int refcount;
 
 	struct ip_addr ip;
-	unsigned int port;
+	char *ip_str;
+	in_port_t port;
 
 	/* name contains "ip:port" */
 	char *name;
@@ -23,9 +24,21 @@ struct director_host {
 	/* use these to avoid infinitely sending SYNCs for directors that
 	   aren't connected in the ring. */
 	unsigned int last_sync_seq, last_sync_seq_counter, last_sync_timestamp;
+	/* whenever we receive a SYNC with stale hosts_hash, set this. if it's
+	   already set and equals the current hosts_hash, re-send our hosts to
+	   everybody in case they somehow got out of sync. */
+	unsigned int desynced_hosts_hash;
 	/* Last time host was detected to be down */
 	time_t last_network_failure;
 	time_t last_protocol_failure;
+
+	/* When we finish getting a right connection, send a SYNC with these
+	   parameters (if delayed_sync_seq != 0) */
+	uint32_t delayed_sync_seq;
+	unsigned int delayed_sync_minor_version;
+	unsigned int delayed_sync_timestamp;
+	unsigned int delayed_sync_hosts_hash;
+
 	/* we are this director */
 	unsigned int self:1;
 	unsigned int removed:1;
@@ -33,7 +46,7 @@ struct director_host {
 
 struct director_host *
 director_host_add(struct director *dir, const struct ip_addr *ip,
-		  unsigned int port);
+		  in_port_t port);
 void director_host_free(struct director_host **host);
 
 void director_host_ref(struct director_host *host);
@@ -43,10 +56,10 @@ void director_host_restarted(struct director_host *host);
 
 struct director_host *
 director_host_get(struct director *dir, const struct ip_addr *ip,
-		  unsigned int port);
+		  in_port_t port);
 struct director_host *
 director_host_lookup(struct director *dir, const struct ip_addr *ip,
-		     unsigned int port);
+		     in_port_t port);
 struct director_host *
 director_host_lookup_ip(struct director *dir, const struct ip_addr *ip);
 
@@ -57,6 +70,9 @@ director_host_lookup_ip(struct director *dir, const struct ip_addr *ip);
 int director_host_cmp_to_self(const struct director_host *b1,
 			      const struct director_host *b2,
 			      const struct director_host *self);
+/* Compare directors by IP/port. */
+int director_host_cmp_p(struct director_host *const *host1,
+			struct director_host *const *host2);
 
 /* Parse hosts list (e.g. "host1:port host2 host3:port") and them as
    directors */

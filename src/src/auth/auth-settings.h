@@ -5,10 +5,13 @@ struct master_service;
 struct master_service_settings_output;
 
 struct auth_passdb_settings {
+	const char *name;
 	const char *driver;
 	const char *args;
 	const char *default_fields;
 	const char *override_fields;
+	const char *mechanisms;
+	const char *username_filter;
 
 	const char *skip;
 	const char *result_success;
@@ -17,9 +20,11 @@ struct auth_passdb_settings {
 	bool deny;
 	bool pass; /* deprecated, use result_success=continue instead */
 	bool master;
+	const char *auth_verbose;
 };
 
 struct auth_userdb_settings {
+	const char *name;
 	const char *driver;
 	const char *args;
 	const char *default_fields;
@@ -29,6 +34,7 @@ struct auth_userdb_settings {
 	const char *result_success;
 	const char *result_failure;
 	const char *result_internalfail;
+	const char *auth_verbose;
 };
 
 struct auth_settings {
@@ -38,6 +44,7 @@ struct auth_settings {
 	uoff_t cache_size;
 	unsigned int cache_ttl;
 	unsigned int cache_negative_ttl;
+	bool cache_verify_password_with_worker;
 	const char *username_chars;
 	const char *username_translation;
 	const char *username_format;
@@ -49,6 +56,19 @@ struct auth_settings {
 	const char *proxy_self;
 	unsigned int failure_delay;
 
+	const char *policy_server_url;
+	const char *policy_server_api_header;
+	unsigned int policy_server_timeout_msecs;
+	const char *policy_hash_mech;
+	const char *policy_hash_nonce;
+	const char *policy_request_attributes;
+	bool policy_reject_on_fail;
+	bool policy_check_before_auth;
+	bool policy_check_after_auth;
+	bool policy_report_after_auth;
+	unsigned int policy_hash_truncate;
+
+	bool stats;
 	bool verbose, debug, debug_passwords;
 	const char *verbose_passwords;
 	bool ssl_require_client_cert;
@@ -62,6 +82,9 @@ struct auth_settings {
 	ARRAY(struct auth_userdb_settings *) userdbs;
 
 	const char *base_dir;
+	const char *ssl_client_ca_dir;
+	const char *ssl_client_ca_file;
+
 	bool verbose_proctitle;
 	unsigned int first_valid_uid;
 	unsigned int last_valid_uid;

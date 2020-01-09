@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "test-lib.h"
 #include "str.h"
@@ -25,7 +25,7 @@ void test_strescape(void)
 		{ "\001\001\t\t\r\r\n\n", "\0011\0011\001t\001t\001r\001r\001n\001n" }
 	};
 	unsigned char buf[1 << CHAR_BIT];
-	const char *escaped, *tabstr;
+	const char *escaped, *tabstr, *unesc_str;
 	string_t *str;
 	unsigned int i;
 
@@ -57,8 +57,21 @@ void test_strescape(void)
 	}
 	test_end();
 
+	test_begin("str_unescape_next");
+	escaped = "foo\"bar\\\"b\\\\az\"plop";
+	test_assert(str_unescape_next(&escaped, &unesc_str) == 0);
+	test_assert(strcmp(unesc_str, "foo") == 0);
+	test_assert(str_unescape_next(&escaped, &unesc_str) == 0);
+	test_assert(strcmp(unesc_str, "bar\"b\\az") == 0);
+	test_assert(str_unescape_next(&escaped, &unesc_str) == -1);
+	escaped = "foo\\";
+	test_assert(str_unescape_next(&escaped, &unesc_str) == -1);
+	test_end();
+
 	test_begin("str_tabescape");
 	for (i = 0; i < N_ELEMENTS(tabesc); i++) {
+		test_assert(strcmp(t_str_tabunescape(tabesc[i].output),
+				   tabesc[i].input) == 0);
 		test_assert(strcmp(str_tabunescape(t_strdup_noconst(tabesc[i].output)),
 				   tabesc[i].input) == 0);
 		test_assert(strcmp(str_tabescape(tabesc[i].input),

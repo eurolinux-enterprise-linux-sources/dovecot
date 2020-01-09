@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -28,7 +28,6 @@ struct cydir_save_context {
 	/* updated for each appended mail: */
 	uint32_t seq;
 	struct istream *input;
-	struct mail *mail;
 	int fd;
 
 	unsigned int failed:1;
@@ -115,11 +114,6 @@ int cydir_save_begin(struct mail_save_context *_ctx, struct istream *input)
 					 _ctx->data.min_modseq);
 	}
 
-	if (_ctx->dest_mail == NULL) {
-		if (ctx->mail == NULL)
-			ctx->mail = mail_alloc(trans, 0, NULL);
-		_ctx->dest_mail = ctx->mail;
-	}
 	mail_set_seq_saving(_ctx->dest_mail, ctx->seq);
 
 	crlf_input = i_stream_create_crlf(input);
@@ -162,7 +156,8 @@ static int cydir_save_flush(struct cydir_save_context *ctx, const char *path)
 	int ret = 0;
 
 	if (o_stream_nfinish(ctx->ctx.data.output) < 0) {
-		mail_storage_set_critical(storage, "write(%s) failed: %m", path);
+		mail_storage_set_critical(storage, "write(%s) failed: %s", path,
+			o_stream_get_error(ctx->ctx.data.output));
 		ret = -1;
 	}
 
@@ -218,12 +213,8 @@ int cydir_save_finish(struct mail_save_context *_ctx)
 
 	if (!ctx->failed)
 		ctx->mail_count++;
-	else {
-		if (unlink(path) < 0) {
-			mail_storage_set_critical(&ctx->mbox->storage->storage,
-				"unlink(%s) failed: %m", path);
-		}
-	}
+	else
+		i_unlink(path);
 
 	index_mail_cache_parse_deinit(_ctx->dest_mail,
 				      _ctx->data.received_date, !ctx->failed);
@@ -251,7 +242,8 @@ int cydir_transaction_save_commit_pre(struct mail_save_context *_ctx)
 	uint32_t uid;
 	const char *dir;
 	string_t *src_path, *dest_path;
-	unsigned int n, src_prefixlen, dest_prefixlen;
+	unsigned int n;
+	size_t src_prefixlen, dest_prefixlen;
 
 	i_assert(ctx->finished);
 
@@ -293,9 +285,6 @@ int cydir_transaction_save_commit_pre(struct mail_save_context *_ctx)
 			return -1;
 		}
 	}
-
-	if (ctx->mail != NULL)
-		mail_free(&ctx->mail);
 	return 0;
 }
 
@@ -323,8 +312,6 @@ void cydir_transaction_save_rollback(struct mail_save_context *_ctx)
 	if (ctx->sync_ctx != NULL)
 		(void)cydir_sync_finish(&ctx->sync_ctx, FALSE);
 
-	if (ctx->mail != NULL)
-		mail_free(&ctx->mail);
 	i_free(ctx->tmp_basename);
 	i_free(ctx);
 }

@@ -1,10 +1,11 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "llist.h"
 #include "istream.h"
 #include "ostream.h"
+#include "strescape.h"
 #include "settings-parser.h"
 #include "master-service.h"
 #include "master-service-settings.h"
@@ -12,7 +13,6 @@
 #include "config-parser.h"
 #include "config-connection.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 #define MAX_INBUF_SIZE 1024
@@ -32,7 +32,7 @@ struct config_connection {
 	unsigned int handshaked:1;
 };
 
-struct config_connection *config_connections = NULL;
+static struct config_connection *config_connections = NULL;
 
 static const char *const *
 config_connection_next_line(struct config_connection *conn)
@@ -43,7 +43,7 @@ config_connection_next_line(struct config_connection *conn)
 	if (line == NULL)
 		return NULL;
 
-	return t_strsplit_tab(line);
+	return t_strsplit_tabescaped(line);
 }
 
 static void
@@ -76,7 +76,7 @@ static int config_connection_request(struct config_connection *conn,
 
 	/* [<args>] */
 	t_array_init(&modules, 4);
-	memset(&filter, 0, sizeof(filter));
+	i_zero(&filter);
 	for (; *args != NULL; args++) {
 		if (strncmp(*args, "service=", 8) == 0)
 			filter.service = *args + 8;
@@ -150,6 +150,36 @@ static int config_connection_request(struct config_connection *conn,
 	return 0;
 }
 
+static int config_filters_request(struct config_connection *conn)
+{
+	struct config_filter_parser *const *filters = config_filter_get_all(config_filter);
+	o_stream_cork(conn->output);
+	while(*filters != NULL) {
+		const struct config_filter *filter = &(*filters)->filter;
+		o_stream_nsend_str(conn->output, "FILTER");
+		if (filter->service != NULL)
+			o_stream_nsend_str(conn->output, t_strdup_printf("\tservice=%s",
+					   str_tabescape(filter->service)));
+		if (filter->local_name != NULL)
+			o_stream_nsend_str(conn->output, t_strdup_printf("\tlocal-name=%s",
+					   str_tabescape(filter->local_name)));
+		if (filter->local_bits > 0)
+			o_stream_nsend_str(conn->output, t_strdup_printf("\tlocal-net=%s/%u",
+					   net_ip2addr(&filter->local_net),
+					   filter->local_bits));
+		if (filter->remote_bits > 0)
+			o_stream_nsend_str(conn->output, t_strdup_printf("\tremote-net=%s/%u",
+					   net_ip2addr(&filter->remote_net),
+					   filter->remote_bits));
+		o_stream_nsend_str(conn->output, "\n");
+		filters++;
+	}
+	o_stream_nsend_str(conn->output, "\n");
+	o_stream_uncork(conn->output);
+	return 0;
+}
+
+
 static void config_connection_input(struct config_connection *conn)
 {
 	const char *const *args, *line;
@@ -184,6 +214,10 @@ static void config_connection_input(struct config_connection *conn)
 			continue;
 		if (strcmp(args[0], "REQ") == 0) {
 			if (config_connection_request(conn, args + 1) < 0)
+				break;
+		}
+		if (strcmp(args[0], "FILTERS") == 0) {
+			if (config_filters_request(conn) < 0)
 				break;
 		}
 	}

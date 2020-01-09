@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 /*
    Here's a description of how we handle Maildir synchronization and
@@ -185,7 +185,6 @@
 
 #include <stdio.h>
 #include <stddef.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -325,13 +324,8 @@ static int maildir_fix_duplicate(struct maildir_sync_context *ctx,
 			   and hope that another process didn't just decide to
 			   unlink() the other (uidlist lock prevents this from
 			   happening) */
-			if (unlink(path2) == 0)
+			if (i_unlink(path2) == 0)
 				i_warning("Unlinked a duplicate: %s", path2);
-			else {
-				mail_storage_set_critical(
-					&ctx->mbox->storage->storage,
-					"unlink(%s) failed: %m", path2);
-			}
 		}
 		return 0;
 	}
@@ -469,9 +463,9 @@ maildir_scan_dir(struct maildir_sync_context *ctx, bool new_dir, bool final,
 	src = t_str_new(1024);
 	dest = t_str_new(1024);
 
-	move_new = new_dir && !mailbox_is_readonly(&ctx->mbox->box) &&
-		(ctx->mbox->box.flags & MAILBOX_FLAG_DROP_RECENT) != 0 &&
-		ctx->locked;
+	move_new = new_dir && ctx->locked &&
+		((ctx->mbox->box.flags & MAILBOX_FLAG_DROP_RECENT) != 0 ||
+		 ctx->mbox->storage->set->maildir_empty_new);
 
 	errno = 0;
 	for (; (dp = readdir(dirp)) != NULL; errno = 0) {
@@ -978,8 +972,9 @@ maildir_sync_context(struct maildir_sync_context *ctx, bool forced,
 			/* UID is expunged */
 			*find_uid = 0;
 		} else if ((flags & MAILDIR_UIDLIST_REC_FLAG_NONSYNCED) == 0) {
-			/* we didn't find it, possibly expunged? */
 			*find_uid = 0;
+		} else {
+			/* we didn't find it, possibly expunged? */
 		}
 	}
 
@@ -1091,11 +1086,6 @@ maildir_storage_sync_init(struct mailbox *box, enum mailbox_sync_flags flags)
 	struct maildir_mailbox *mbox = (struct maildir_mailbox *)box;
 	bool lost_files, force_resync;
 	int ret = 0;
-
-	if (!box->opened) {
-		if (mailbox_open(box) < 0)
-			return index_mailbox_sync_init(box, flags, TRUE);
-	}
 
 	force_resync = (flags & MAILBOX_SYNC_FLAG_FORCE_RESYNC) != 0;
 	if (index_mailbox_want_full_sync(&mbox->box, flags)) {

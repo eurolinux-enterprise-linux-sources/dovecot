@@ -1,7 +1,8 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
+#include "ioloop.h"
 #include "env-util.h"
 #include "fd-set-nonblock.h"
 #include "istream.h"
@@ -10,7 +11,6 @@
 #include "safe-mkstemp.h"
 #include "eacces-error.h"
 #include "ipwd.h"
-#include "mkdir-parents.h"
 #include "str.h"
 #include "str-sanitize.h"
 #include "strescape.h"
@@ -29,7 +29,6 @@
 #include "lda-settings.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <sysexits.h>
 
 #define DEFAULT_ENVELOPE_SENDER "MAILER-DAEMON"
@@ -98,9 +97,8 @@ static int seekable_fd_callback(const char **path_r, void *context)
 	}
 
 	/* we just want the fd, unlink it */
-	if (unlink(str_c(path)) < 0) {
+	if (i_unlink(str_c(path)) < 0) {
 		/* shouldn't happen.. */
-		i_error("unlink(%s) failed: %m", str_c(path));
 		i_close_fd(&fd);
 		return -1;
 	}
@@ -198,7 +196,7 @@ lda_raw_mail_open(struct mail_deliver_context *ctx, const char *path)
 	}
 	if (ret < 0) {
 		i_fatal("Can't open delivery mail as raw: %s",
-			mailbox_get_last_error(box, NULL));
+			mailbox_get_last_internal_error(box, NULL));
 	}
 	mail_user_unref(&raw_mail_user);
 
@@ -310,12 +308,13 @@ int main(int argc, char *argv[])
 	master_service = master_service_init("lda",
 		MASTER_SERVICE_FLAG_STANDALONE |
 		MASTER_SERVICE_FLAG_DONT_LOG_TO_STDERR,
-		&argc, &argv, "a:d:ef:km:p:r:");
+		&argc, &argv, "a:d:ef:m:p:r:");
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.session = mail_deliver_session_init();
 	ctx.pool = ctx.session->pool;
 	ctx.dest_mailbox_name = "INBOX";
+	ctx.timeout_secs = LDA_SUBMISSION_TIMEOUT_SECS;
 	path = NULL;
 
 	user = getenv("USER");
@@ -400,7 +399,7 @@ int main(int argc, char *argv[])
 	}
 	master_service_init_finish(master_service);
 
-	memset(&service_input, 0, sizeof(service_input));
+	i_zero(&service_input);
 	service_input.module = "lda";
 	service_input.service = "lda";
 	service_input.username = user;
@@ -409,6 +408,10 @@ int main(int argc, char *argv[])
 		MAIL_STORAGE_SERVICE_FLAG_USE_SYSEXITS;
 	storage_service = mail_storage_service_init(master_service, set_roots,
 						    service_flags);
+	mail_deliver_hooks_init();
+	/* set before looking up the user (or ideally we'd do this between
+	   _lookup() and _next(), but don't bother) */
+	ctx.delivery_time_started = ioloop_timeval;
 	ret = mail_storage_service_lookup_next(storage_service, &service_input,
 					       &service_user, &ctx.dest_user,
 					       &errstr);
@@ -436,11 +439,11 @@ int main(int argc, char *argv[])
 	lda_set_dest_addr(&ctx, user, destaddr_source);
 
 	if (mail_deliver(&ctx, &storage) < 0) {
-		if (storage != NULL) {
-			errstr = mail_storage_get_last_error(storage, &error);
-		} else if (ctx.tempfail_error != NULL) {
+		if (ctx.tempfail_error != NULL) {
 			errstr = ctx.tempfail_error;
 			error = MAIL_ERROR_TEMP;
+		} else if (storage != NULL) {
+			errstr = mail_storage_get_last_error(storage, &error);
 		} else {
 			/* This shouldn't happen */
 			i_error("BUG: Saving failed to unknown storage");
@@ -453,7 +456,7 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "%s\n", errstr);
 		}
 
-		if (error != MAIL_ERROR_NOSPACE ||
+		if (error != MAIL_ERROR_NOQUOTA ||
 		    ctx.set->quota_full_tempfail) {
 			/* Saving to INBOX should always work unless
 			   we're over quota. If it didn't, it's probably a
@@ -488,7 +491,7 @@ int main(int argc, char *argv[])
 	mail_user_unref(&ctx.dest_user);
 	mail_deliver_session_deinit(&ctx.session);
 
-	mail_storage_service_user_free(&service_user);
+	mail_storage_service_user_unref(&service_user);
 	mail_storage_service_deinit(&storage_service);
 	master_service_deinit(&master_service);
         return EX_OK;

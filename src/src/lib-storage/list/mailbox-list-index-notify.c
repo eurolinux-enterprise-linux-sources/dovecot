@@ -1,11 +1,11 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
 #include "str.h"
 #include "mail-index-private.h"
 #include "mail-transaction-log-private.h"
-#include "mail-storage.h"
+#include "mail-storage-private.h"
 #include "mailbox-list-notify.h"
 #include "mailbox-list-notify-tree.h"
 #include "mailbox-list-index.h"
@@ -44,7 +44,7 @@ struct mailbox_list_notify_index {
 
 	void (*wait_callback)(void *context);
 	void *wait_context;
-	struct io *io_wait;
+	struct io *io_wait, *io_wait_inbox;
 	struct timeout *to_wait, *to_notify;
 
 	ARRAY_TYPE(seq_range) new_uids, expunged_uids, changed_uids;
@@ -58,11 +58,64 @@ struct mailbox_list_notify_index {
 	struct mailbox_list_notify_rec notify_rec;
 	string_t *rec_name;
 
-	struct stat last_st;
+	char *list_log_path, *inbox_log_path;
+	struct stat list_last_st, inbox_last_st;
+	struct mailbox *inbox;
 
 	unsigned int initialized:1;
 	unsigned int read_failed:1;
+	unsigned int inbox_event_pending:1;
 };
+
+static const enum mailbox_status_items notify_status_items =
+	STATUS_UIDVALIDITY | STATUS_UIDNEXT | STATUS_MESSAGES |
+	STATUS_UNSEEN | STATUS_HIGHESTMODSEQ;
+
+static enum mailbox_list_notify_event
+mailbox_list_index_get_changed_events(const struct mailbox_notify_node *nnode,
+				      const struct mailbox_status *status)
+{
+	enum mailbox_list_notify_event events = 0;
+
+	if (nnode->uidvalidity != status->uidvalidity)
+		events |= MAILBOX_LIST_NOTIFY_UIDVALIDITY;
+	if (nnode->uidnext != status->uidnext)
+		events |= MAILBOX_LIST_NOTIFY_APPENDS;
+	if (nnode->messages > status->messages) {
+		/* NOTE: not entirely reliable, since there could be both
+		   expunges and appends.. but it shouldn't make any difference
+		   in practise, since anybody interested in expunges is most
+		   likely also interested in appends. */
+		events |= MAILBOX_LIST_NOTIFY_EXPUNGES;
+	}
+	if (nnode->unseen != status->unseen)
+		events |= MAILBOX_LIST_NOTIFY_SEEN_CHANGES;
+	if (nnode->highest_modseq < status->highest_modseq)
+		events |= MAILBOX_LIST_NOTIFY_MODSEQ_CHANGES;
+	return events;
+}
+
+static void
+mailbox_notify_node_update_status(struct mailbox_notify_node *nnode,
+				  struct mailbox_status *status)
+{
+	nnode->uidvalidity = status->uidvalidity;
+	nnode->uidnext = status->uidnext;
+	nnode->messages = status->messages;
+	nnode->unseen = status->unseen;
+	nnode->highest_modseq = status->highest_modseq;
+}
+
+static void
+mailbox_list_index_notify_init_inbox(struct mailbox_list_notify_index *inotify)
+{
+	inotify->inbox = mailbox_alloc(inotify->notify.list, "INBOX",
+				       MAILBOX_FLAG_READONLY);
+	if (mailbox_open(inotify->inbox) < 0)
+		mailbox_free(&inotify->inbox);
+	inotify->inbox_log_path =
+		i_strconcat(inotify->inbox->index->filepath, ".log", NULL);
+}
 
 int mailbox_list_index_notify_init(struct mailbox_list *list,
 				   enum mailbox_list_notify_event mask,
@@ -70,6 +123,7 @@ int mailbox_list_index_notify_init(struct mailbox_list *list,
 {
 	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT(list);
 	struct mailbox_list_notify_index *inotify;
+	const char *index_dir;
 
 	if (ilist == NULL) {
 		/* can't do this without mailbox list indexes */
@@ -97,6 +151,19 @@ int mailbox_list_index_notify_init(struct mailbox_list *list,
 		mailbox_tree_sort(list->subscriptions);
 		inotify->subscriptions = mailbox_tree_dup(list->subscriptions);
 	}
+	inotify->list_log_path = i_strdup(ilist->index->log->filepath);
+	if (list->mail_set->mailbox_list_index_include_inbox) {
+		/* INBOX can be handled also using mailbox list index */
+	} else if ((list->ns->flags & NAMESPACE_FLAG_INBOX_ANY) == 0) {
+		/* no INBOX in this namespace */
+	} else if ((mask & MAILBOX_LIST_NOTIFY_STATUS) == 0) {
+		/* not interested in mailbox changes */
+	} else if (mailbox_list_get_path(list, "INBOX", MAILBOX_LIST_PATH_TYPE_INDEX,
+					 &index_dir) <= 0) {
+		/* no indexes for INBOX? can't handle it */
+	} else {
+		mailbox_list_index_notify_init_inbox(inotify);
+	}
 
 	*notify_r = &inotify->notify;
 	return 1;
@@ -108,10 +175,14 @@ void mailbox_list_index_notify_deinit(struct mailbox_list_notify *notify)
 		(struct mailbox_list_notify_index *)notify;
 	bool b;
 
+	if (inotify->inbox != NULL)
+		mailbox_free(&inotify->inbox);
 	if (inotify->subscriptions != NULL)
 		mailbox_tree_deinit(&inotify->subscriptions);
 	if (inotify->io_wait != NULL)
 		io_remove(&inotify->io_wait);
+	if (inotify->io_wait_inbox != NULL)
+		io_remove(&inotify->io_wait_inbox);
 	if (inotify->to_wait != NULL)
 		timeout_remove(&inotify->to_wait);
 	if (inotify->to_notify != NULL)
@@ -128,6 +199,8 @@ void mailbox_list_index_notify_deinit(struct mailbox_list_notify *notify)
 	array_free(&inotify->changed_uids);
 	array_free(&inotify->renames);
 	str_free(&inotify->rec_name);
+	i_free(inotify->list_log_path);
+	i_free(inotify->inbox_log_path);
 	i_free(inotify);
 }
 
@@ -157,23 +230,31 @@ notify_lookup_guid(struct mailbox_list_notify_index *inotify,
 	}
 
 	/* get GUID */
-	memset(status_r, 0, sizeof(*status_r));
+	i_zero(status_r);
 	memset(guid_r, 0, GUID_128_SIZE);
 	(void)mailbox_list_index_status(inotify->notify.list, view, seq,
-					items, status_r, guid_r);
+					items, status_r, guid_r, NULL);
 	return index_node;
 }
 
 static void notify_update_stat(struct mailbox_list_notify_index *inotify)
 {
-	struct mailbox_list_index *ilist =
-		INDEX_LIST_CONTEXT(inotify->notify.list);
-	const char *path = ilist->index->log->filepath;
+	bool call = FALSE;
 
-	if (stat(path, &inotify->last_st) < 0 && errno != ENOENT) {
-		i_error("stat(%s) failed: %m", path);
-		mailbox_list_index_notify_wait(&inotify->notify, NULL, NULL);
+	if (stat(inotify->list_log_path, &inotify->list_last_st) < 0 &&
+	    errno != ENOENT) {
+		i_error("stat(%s) failed: %m", inotify->list_log_path);
+		call = TRUE;
 	}
+	if (inotify->inbox_log_path != NULL) {
+		if (stat(inotify->inbox_log_path, &inotify->inbox_last_st) < 0 &&
+		    errno != ENOENT) {
+			i_error("stat(%s) failed: %m", inotify->inbox_log_path);
+			call = TRUE;
+		}
+	}
+	if (call)
+		mailbox_list_index_notify_wait(&inotify->notify, NULL, NULL);
 }
 
 static void
@@ -550,7 +631,7 @@ mailbox_list_index_notify_lookup(struct mailbox_list_notify_index *inotify,
 	const char *storage_name;
 	char ns_sep = mailbox_list_get_hierarchy_sep(inotify->notify.list);
 
-	memset(rec, 0, sizeof(*rec));
+	i_zero(rec);
 	index_node = notify_lookup_guid(inotify, view, uid,
 					items, status_r, rec->guid);
 	if (index_node == NULL)
@@ -591,7 +672,7 @@ mailbox_list_index_notify_rename(struct mailbox_list_notify_index *inotify,
 		return FALSE;
 
 	rec->old_vname = old_vname;
-	rec->event = MAILBOX_LIST_NOTIFY_RENAME;
+	rec->events = MAILBOX_LIST_NOTIFY_RENAME;
 	return TRUE;
 }
 
@@ -602,12 +683,12 @@ mailbox_list_index_notify_subscribe(struct mailbox_list_notify_index *inotify,
 	struct mailbox_list_notify_rec *rec = &inotify->notify_rec;
 	const char *const *vnamep;
 
-	memset(rec, 0, sizeof(*rec));
+	i_zero(rec);
 	vnamep = array_idx(&inotify->new_subscriptions, idx);
 	rec->vname = *vnamep;
 	rec->storage_name = mailbox_list_get_storage_name(inotify->notify.list,
 							  rec->vname);
-	rec->event = MAILBOX_LIST_NOTIFY_SUBSCRIBE;
+	rec->events = MAILBOX_LIST_NOTIFY_SUBSCRIBE;
 	return TRUE;
 }
 
@@ -618,12 +699,12 @@ mailbox_list_index_notify_unsubscribe(struct mailbox_list_notify_index *inotify,
 	struct mailbox_list_notify_rec *rec = &inotify->notify_rec;
 	const char *const *vnamep;
 
-	memset(rec, 0, sizeof(*rec));
+	i_zero(rec);
 	vnamep = array_idx(&inotify->new_unsubscriptions, idx);
 	rec->vname = *vnamep;
 	rec->storage_name = mailbox_list_get_storage_name(inotify->notify.list,
 							  rec->vname);
-	rec->event = MAILBOX_LIST_NOTIFY_UNSUBSCRIBE;
+	rec->events = MAILBOX_LIST_NOTIFY_UNSUBSCRIBE;
 	return TRUE;
 }
 
@@ -637,7 +718,7 @@ mailbox_list_index_notify_expunge(struct mailbox_list_notify_index *inotify,
 	if (!mailbox_list_index_notify_lookup(inotify, inotify->old_view,
 					      uid, 0, &status, &rec))
 		return FALSE;
-	rec->event = MAILBOX_LIST_NOTIFY_DELETE;
+	rec->events = MAILBOX_LIST_NOTIFY_DELETE;
 	return TRUE;
 }
 
@@ -651,7 +732,7 @@ mailbox_list_index_notify_new(struct mailbox_list_notify_index *inotify,
 	if (!mailbox_list_index_notify_lookup(inotify, inotify->view,
 					      uid, 0, &status, &rec))
 		i_unreached();
-	rec->event = MAILBOX_LIST_NOTIFY_CREATE;
+	rec->events = MAILBOX_LIST_NOTIFY_CREATE;
 	return TRUE;
 }
 
@@ -659,44 +740,31 @@ static bool
 mailbox_list_index_notify_change(struct mailbox_list_notify_index *inotify,
 				 uint32_t uid)
 {
-	const enum mailbox_status_items status_items =
-		STATUS_UIDVALIDITY | STATUS_UIDNEXT | STATUS_MESSAGES |
-		STATUS_UNSEEN | STATUS_HIGHESTMODSEQ;
 	struct mailbox_list_notify_rec *rec;
-	struct mailbox_notify_node *nnode;
+	struct mailbox_notify_node *nnode, empty_node;
 	struct mailbox_status status;
 
 	if (!mailbox_list_index_notify_lookup(inotify, inotify->view,
-					      uid, status_items, &status, &rec))
-		i_unreached();
+					      uid, notify_status_items,
+					      &status, &rec)) {
+		/* Mailbox is already deleted. We won't get here if we're
+		   tracking MAILBOX_LIST_NOTIFY_DELETE or _RENAME
+		   (which update expunged_uids). */
+		return FALSE;
+	}
 
 	/* get the old status */
 	nnode = mailbox_list_notify_tree_lookup(inotify->tree,
 						rec->storage_name);
-	if (nnode == NULL || nnode->uidvalidity != status.uidvalidity)
-		rec->event = MAILBOX_LIST_NOTIFY_UIDVALIDITY;
-	else if (nnode->uidnext != status.uidnext)
-		rec->event = MAILBOX_LIST_NOTIFY_APPENDS;
-	else if (nnode->messages > status.messages)
-		rec->event = MAILBOX_LIST_NOTIFY_EXPUNGES;
-	else if (nnode->unseen != status.unseen)
-		rec->event = MAILBOX_LIST_NOTIFY_SEEN_CHANGES;
-	else if (nnode->highest_modseq < status.highest_modseq)
-		rec->event = MAILBOX_LIST_NOTIFY_MODSEQ_CHANGES;
-	else {
-		/* nothing changed */
-		return FALSE;
+	if (nnode == NULL) {
+		/* mailbox didn't exist earlier - report all events as new */
+		i_zero(&empty_node);
+		nnode = &empty_node;
 	}
-
+	rec->events |= mailbox_list_index_get_changed_events(nnode, &status);
 	/* update internal state */
-	if (nnode != NULL) {
-		nnode->uidvalidity = status.uidvalidity;
-		nnode->uidnext = status.uidnext;
-		nnode->messages = status.messages;
-		nnode->unseen = status.unseen;
-		nnode->highest_modseq = status.highest_modseq;
-	}
-	return TRUE;
+	mailbox_notify_node_update_status(nnode, &status);
+	return rec->events != 0;
 }
 
 static bool
@@ -739,6 +807,24 @@ mailbox_list_index_notify_try_next(struct mailbox_list_notify_index *inotify)
 	return FALSE;
 }
 
+static enum mailbox_list_notify_event
+mailbox_list_notify_inbox_get_events(struct mailbox_list_notify_index *inotify)
+{
+	struct mailbox_status old_status, new_status;
+	struct mailbox_notify_node old_nnode;
+
+	mailbox_get_open_status(inotify->inbox, notify_status_items, &old_status);
+	if (mailbox_sync(inotify->inbox, MAILBOX_SYNC_FLAG_FAST) < 0) {
+		i_error("Mailbox list index notify: Failed to sync INBOX: %s",
+			mailbox_get_last_internal_error(inotify->inbox, NULL));
+		return 0;
+	}
+	mailbox_get_open_status(inotify->inbox, notify_status_items, &new_status);
+
+	mailbox_notify_node_update_status(&old_nnode, &old_status);
+	return mailbox_list_index_get_changed_events(&old_nnode, &new_status);
+}
+
 int mailbox_list_index_notify_next(struct mailbox_list_notify *notify,
 				   const struct mailbox_list_notify_rec **rec_r)
 {
@@ -747,13 +833,26 @@ int mailbox_list_index_notify_next(struct mailbox_list_notify *notify,
 
 	if (!inotify->initialized)
 		mailbox_list_index_notify_read_init(inotify);
+	if (mailbox_list_index_handle_corruption(notify->list) < 0)
+		return -1;
+
 	while (mailbox_list_index_notify_try_next(inotify)) {
-		if ((inotify->notify_rec.event & inotify->notify.mask) != 0) {
+		if ((inotify->notify_rec.events & inotify->notify.mask) != 0) {
 			*rec_r = &inotify->notify_rec;
 			return 1;
 		} else {
 			/* caller doesn't care about this change */
 		}
+	}
+	if (inotify->inbox_event_pending) {
+		inotify->inbox_event_pending = FALSE;
+		i_zero(&inotify->notify_rec);
+		inotify->notify_rec.vname = "INBOX";
+		inotify->notify_rec.storage_name = "INBOX";
+		inotify->notify_rec.events =
+			mailbox_list_notify_inbox_get_events(inotify);
+		*rec_r = &inotify->notify_rec;
+		return 1;
 	}
 
 	mailbox_list_index_notify_read_deinit(inotify);
@@ -768,13 +867,19 @@ static void notify_now_callback(struct mailbox_list_notify_index *inotify)
 
 static void notify_callback(struct mailbox_list_notify_index *inotify)
 {
-	struct stat prev_st = inotify->last_st;
-
+#define INOTIFY_ST_CHANGED(last_st, prev_st) \
+	((last_st).st_mtime != (prev_st).st_mtime || \
+	 ST_MTIME_NSEC(last_st) != ST_MTIME_NSEC(prev_st) || \
+	 (last_st).st_size != (prev_st).st_size || \
+	 (last_st).st_ino != (prev_st).st_ino)
+	struct stat list_prev_st = inotify->list_last_st;
+	struct stat inbox_prev_st = inotify->inbox_last_st;
+			 
 	notify_update_stat(inotify);
-	if (inotify->last_st.st_mtime != prev_st.st_mtime ||
-	    ST_MTIME_NSEC(inotify->last_st) != ST_MTIME_NSEC(prev_st) ||
-	    inotify->last_st.st_size != prev_st.st_size ||
-	    inotify->last_st.st_ino != prev_st.st_ino) {
+	if (INOTIFY_ST_CHANGED(inotify->inbox_last_st, inbox_prev_st))
+		inotify->inbox_event_pending = TRUE;
+	if (inotify->inbox_event_pending ||
+	    INOTIFY_ST_CHANGED(inotify->list_last_st, list_prev_st)) {
 		/* log has changed. call the callback with a small delay
 		   to allow bundling multiple changes together */
 		if (inotify->to_notify != NULL) {
@@ -793,7 +898,6 @@ void mailbox_list_index_notify_wait(struct mailbox_list_notify *notify,
 {
 	struct mailbox_list_notify_index *inotify =
 		(struct mailbox_list_notify_index *)notify;
-	const char *path;
 	unsigned int check_interval;
 
 	inotify->wait_callback = callback;
@@ -802,14 +906,22 @@ void mailbox_list_index_notify_wait(struct mailbox_list_notify *notify,
 	if (callback == NULL) {
 		if (inotify->io_wait != NULL)
 			io_remove(&inotify->io_wait);
+		if (inotify->io_wait_inbox != NULL)
+			io_remove(&inotify->io_wait_inbox);
 		if (inotify->to_wait != NULL)
 			timeout_remove(&inotify->to_wait);
 		if (inotify->to_notify != NULL)
 			timeout_remove(&inotify->to_notify);
 	} else if (inotify->to_wait == NULL) {
-		path = inotify->view->index->log->filepath;
-		(void)io_add_notify(path, notify_callback, inotify,
-				    &inotify->io_wait);
+		(void)io_add_notify(inotify->list_log_path, notify_callback,
+				    inotify, &inotify->io_wait);
+		/* we need to check for INBOX explicitly, because INBOX changes
+		   don't get added to mailbox.list.index.log */
+		if (inotify->inbox_log_path != NULL) {
+			(void)io_add_notify(inotify->inbox_log_path,
+					    notify_callback, inotify,
+					    &inotify->io_wait_inbox);
+		}
 		/* check with timeout as well, in case io_add_notify()
 		   doesn't work (e.g. NFS) */
 		check_interval = notify->list->mail_set->mailbox_idle_check_interval;
@@ -818,4 +930,18 @@ void mailbox_list_index_notify_wait(struct mailbox_list_notify *notify,
 					       notify_callback, inotify);
 		notify_update_stat(inotify);
 	}
+}
+
+void mailbox_list_index_notify_flush(struct mailbox_list_notify *notify)
+{
+	struct mailbox_list_notify_index *inotify =
+		(struct mailbox_list_notify_index *)notify;
+
+	if (inotify->to_notify == NULL &&
+	    notify->list->mail_set->mailbox_idle_check_interval > 0) {
+		/* no pending notification - check if anything had changed */
+		notify_callback(inotify);
+	}
+	if (inotify->to_notify != NULL)
+		notify_now_callback(inotify);
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -155,7 +155,7 @@ keywords_header_add(struct mail_index_sync_map_ctx *ctx,
 	}
 
 	/* add the keyword */
-	memset(&kw_rec, 0, sizeof(kw_rec));
+	i_zero(&kw_rec);
 	kw_rec.name_offset = name_offset;
 
 	keyword_len = strlen(keyword_name) + 1;
@@ -190,6 +190,7 @@ keywords_header_add(struct mail_index_sync_map_ctx *ctx,
 
 	buffer_copy(map->hdr_copy_buf, ext->hdr_offset, buf, 0, buf->used);
 	map->hdr_base = map->hdr_copy_buf->data;
+	i_assert(map->hdr_copy_buf->used == map->hdr.header_size);
 
 	if (mail_index_map_parse_keywords(map) < 0)
 		i_panic("Keyword update corrupted keywords header");
@@ -224,20 +225,20 @@ keywords_update_records(struct mail_index_sync_map_ctx *ctx,
 	i_assert(data_offset < ext->record_size);
 	data_offset += ext->record_offset;
 
-	i_assert(data_offset >= sizeof(struct mail_index_record));
+	i_assert(data_offset >= MAIL_INDEX_RECORD_MIN_SIZE);
 
 	switch (type) {
 	case MODIFY_ADD:
-		for (seq1--; seq1 < seq2; seq1++) {
-			rec = MAIL_INDEX_MAP_IDX(view->map, seq1);
+		for (; seq1 <= seq2; seq1++) {
+			rec = MAIL_INDEX_REC_AT_SEQ(view->map, seq1);
 			data = PTR_OFFSET(rec, data_offset);
 			*data |= data_mask;
 		}
 		break;
 	case MODIFY_REMOVE:
 		data_mask = ~data_mask;
-		for (seq1--; seq1 < seq2; seq1++) {
-			rec = MAIL_INDEX_MAP_IDX(view->map, seq1);
+		for (; seq1 <= seq2; seq1++) {
+			rec = MAIL_INDEX_REC_AT_SEQ(view->map, seq1);
 			data = PTR_OFFSET(rec, data_offset);
 			*data &= data_mask;
 		}
@@ -337,8 +338,8 @@ mail_index_sync_keywords_reset(struct mail_index_sync_map_ctx *ctx,
 			continue;
 
 		mail_index_modseq_reset_keywords(ctx->modseq_ctx, seq1, seq2);
-		for (seq1--; seq1 < seq2; seq1++) {
-			rec = MAIL_INDEX_MAP_IDX(map, seq1);
+		for (; seq1 <= seq2; seq1++) {
+			rec = MAIL_INDEX_REC_AT_SEQ(map, seq1);
 			memset(PTR_OFFSET(rec, ext->record_offset),
 			       0, ext->record_size);
 		}

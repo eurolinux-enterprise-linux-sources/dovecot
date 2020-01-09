@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "login-common.h"
 #include "hostpid.h"
@@ -21,10 +21,15 @@ static bool login_settings_check(void *_set, pool_t pool, const char **error_r);
 
 static const struct setting_define login_setting_defines[] = {
 	DEF(SET_STR, login_trusted_networks),
+	DEF(SET_STR, login_source_ips),
 	DEF(SET_STR_VARS, login_greeting),
 	DEF(SET_STR, login_log_format_elements),
 	DEF(SET_STR, login_log_format),
 	DEF(SET_STR, login_access_sockets),
+	DEF(SET_STR_VARS, login_proxy_notify_path),
+	DEF(SET_STR, login_plugin_dir),
+	DEF(SET_STR, login_plugins),
+	DEF(SET_TIME, login_proxy_max_disconnect_delay),
 	DEF(SET_STR, director_username_hash),
 
 	DEF(SET_STR, ssl_client_cert),
@@ -45,10 +50,15 @@ static const struct setting_define login_setting_defines[] = {
 
 static const struct login_settings login_default_settings = {
 	.login_trusted_networks = "",
+	.login_source_ips = "",
 	.login_greeting = PACKAGE_NAME" ready.",
 	.login_log_format_elements = "user=<%u> method=%m rip=%r lip=%l mpid=%e %c session=<%{session}>",
 	.login_log_format = "%$: %s",
 	.login_access_sockets = "",
+	.login_proxy_notify_path = "proxy-notify",
+	.login_plugin_dir = MODULEDIR"/login",
+	.login_plugins = "",
+	.login_proxy_max_disconnect_delay = 0,
 	.director_username_hash = "%u",
 
 	.ssl_client_cert = "",
@@ -112,6 +122,7 @@ login_set_var_expand_table(const struct master_service_settings_input *input)
 		{ 'r', NULL, "rip" },
 		{ 'p', NULL, "pid" },
 		{ 's', NULL, "service" },
+		{ '\0', NULL, "local_name" },
 		{ '\0', NULL, NULL }
 	};
 	struct var_expand_table *tab;
@@ -123,6 +134,7 @@ login_set_var_expand_table(const struct master_service_settings_input *input)
 	tab[1].value = net_ip2addr(&input->remote_ip);
 	tab[2].value = my_pid;
 	tab[3].value = input->service;
+	tab[4].value = input->local_name;
 	return tab;
 }
 
@@ -158,7 +170,7 @@ login_settings_read(pool_t pool,
 	void **sets;
 	unsigned int i, count;
 
-	memset(&input, 0, sizeof(input));
+	i_zero(&input);
 	input.roots = login_set_roots;
 	input.module = login_binary->process_name;
 	input.service = login_binary->protocol;
@@ -173,6 +185,14 @@ login_settings_read(pool_t pool,
 		set_cache = master_service_settings_cache_init(master_service,
 							       input.module,
 							       input.service);
+		/* lookup filters
+
+		   this is only enabled if service_count > 1 because otherwise
+		   login process will process only one request and this is only
+		   useful when more than one request is processed.
+		*/
+		if (master_service_get_service_count(master_service) > 1)
+			master_service_settings_cache_init_filter(set_cache);
 	}
 
 	if (master_service_settings_cache_read(set_cache, &input, NULL,

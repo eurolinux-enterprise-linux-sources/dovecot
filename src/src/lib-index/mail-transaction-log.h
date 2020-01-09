@@ -6,8 +6,20 @@
 #define MAIL_TRANSACTION_LOG_SUFFIX ".log"
 
 #define MAIL_TRANSACTION_LOG_MAJOR_VERSION 1
-#define MAIL_TRANSACTION_LOG_MINOR_VERSION 2
+#define MAIL_TRANSACTION_LOG_MINOR_VERSION 3
 #define MAIL_TRANSACTION_LOG_HEADER_MIN_SIZE 24
+
+#define MAIL_TRANSACTION_LOG_VERSION_FULL(major, minor) \
+	((major) << 8 | (minor))
+#define MAIL_TRANSACTION_LOG_VERSION_HAVE(version, wanted_feature) \
+	((version) >= MAIL_TRANSACTION_LOG_VERSION_##wanted_feature)
+#define MAIL_TRANSACTION_LOG_HDR_VERSION(hdr) \
+	MAIL_TRANSACTION_LOG_VERSION_FULL((hdr)->major_version, (hdr)->minor_version)
+
+#define MAIL_TRANSACTION_LOG_VERSION_COMPAT_FLAGS \
+	MAIL_TRANSACTION_LOG_VERSION_FULL(1, 2)
+#define MAIL_TRANSACTION_LOG_VERSION_HIDE_INTERNAL_MODSEQS \
+	MAIL_TRANSACTION_LOG_VERSION_FULL(1, 3)
 
 struct mail_transaction_log_header {
 	uint8_t major_version;
@@ -176,7 +188,10 @@ struct mail_transaction_log_append_ctx {
 	uint64_t new_highest_modseq;
 	unsigned int transaction_count;
 
-	unsigned int append_sync_offset:1;
+	/* same as mail_index_transaction->sync_transaction */
+	unsigned int index_sync_transaction:1;
+	/* same as mail_index_transaction->tail_offset_changed */
+	unsigned int tail_offset_changed:1;
 	unsigned int sync_includes_this:1;
 	unsigned int want_fsync:1;
 };
@@ -224,7 +239,7 @@ void mail_transaction_log_view_close(struct mail_transaction_log_view **view);
 int mail_transaction_log_view_set(struct mail_transaction_log_view *view,
 				  uint32_t min_file_seq, uoff_t min_file_offset,
 				  uint32_t max_file_seq, uoff_t max_file_offset,
-				  bool *reset_r);
+				  bool *reset_r, const char **reason_r);
 /* Scan through all of the log files that we can find.
    Returns -1 if error, 0 if ok. */
 int mail_transaction_log_view_set_all(struct mail_transaction_log_view *view);
@@ -275,8 +290,10 @@ int mail_transaction_log_append_commit(struct mail_transaction_log_append_ctx **
 /* Lock transaction log for index synchronization. Log cannot be read or
    written to while it's locked. Returns end offset. */
 int mail_transaction_log_sync_lock(struct mail_transaction_log *log,
+				   const char *lock_reason,
 				   uint32_t *file_seq_r, uoff_t *file_offset_r);
-void mail_transaction_log_sync_unlock(struct mail_transaction_log *log);
+void mail_transaction_log_sync_unlock(struct mail_transaction_log *log,
+				      const char *lock_reason);
 /* Returns the current head. Works only when log is locked. */
 void mail_transaction_log_get_head(struct mail_transaction_log *log,
 				   uint32_t *file_seq_r, uoff_t *file_offset_r);
@@ -290,10 +307,6 @@ bool mail_transaction_log_is_head_prev(struct mail_transaction_log *log,
 /* Move currently opened log head file to memory (called by
    mail_index_move_to_memory()) */
 void mail_transaction_log_move_to_memory(struct mail_transaction_log *log);
-/* Returns mtime of the transaction log head file.
-   If it doesn't exist, mtime_r is set to 0. */
-int mail_transaction_log_get_mtime(struct mail_transaction_log *log,
-				   time_t *mtime_r);
 /* Unlink transaction log files */
 int mail_transaction_log_unlink(struct mail_transaction_log *log);
 

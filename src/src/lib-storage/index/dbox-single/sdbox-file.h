@@ -13,6 +13,7 @@ struct sdbox_file {
 	/* list of attachment paths while saving/copying message */
 	pool_t attachment_pool;
 	ARRAY_TYPE(const_string) attachment_paths;
+	bool written_to_disk;
 };
 
 struct dbox_file *sdbox_file_init(struct sdbox_mailbox *mbox, uint32_t uid);
@@ -28,7 +29,8 @@ const char *
 sdbox_file_attachment_relpath(struct sdbox_file *file, const char *srcpath);
 
 /* Assign UID for a newly created file (by renaming it) */
-int sdbox_file_assign_uid(struct sdbox_file *file, uint32_t uid);
+int sdbox_file_assign_uid(struct sdbox_file *file, uint32_t uid,
+			  bool ignore_if_exists);
 
 int sdbox_file_create_fd(struct dbox_file *file, const char *path,
 			 bool parents);

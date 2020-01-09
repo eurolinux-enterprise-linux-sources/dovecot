@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -59,7 +59,7 @@ maildir_filename_guess(struct maildir_mailbox *mbox, uint32_t uid,
 		*uidlist_flags &= MAILDIR_UIDLIST_REC_FLAG_NEW_DIR;
 	} else if ((*uidlist_flags & MAILDIR_UIDLIST_REC_FLAG_MOVED) == 0 &&
 		   ((*uidlist_flags & MAILDIR_UIDLIST_REC_FLAG_NEW_DIR) != 0 ||
-		    index_mailbox_is_recent(&mbox->box, uid))) {
+		    mailbox_recent_flags_have_uid(&mbox->box, uid))) {
 		/* probably in new/ dir, drop ":2," from fname */
 		*uidlist_flags |= MAILDIR_UIDLIST_REC_FLAG_NEW_DIR;
 		p = strrchr(fname, MAILDIR_INFO_SEP);
@@ -117,18 +117,26 @@ static int maildir_file_do_try(struct maildir_mailbox *mbox, uint32_t uid,
 }
 
 static int do_racecheck(struct maildir_mailbox *mbox, const char *path,
-			void *context ATTR_UNUSED)
+			void *context)
 {
+	const uint32_t *uidp = context;
 	struct stat st;
+	int ret;
 
-	if (lstat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFLNK) {
+	ret = lstat(path, &st);
+	if (ret == 0 && (st.st_mode & S_IFMT) == S_IFLNK) {
 		/* most likely a symlink pointing to a nonexistent file */
 		mail_storage_set_critical(&mbox->storage->storage,
-			"Maildir: Symlink destination doesn't exist: %s", path);
+			"Maildir: Symlink destination doesn't exist for UID=%u: %s", *uidp, path);
 		return -2;
-	} else {
+	} else if (ret < 0 && errno != ENOENT) {
 		mail_storage_set_critical(&mbox->storage->storage,
-			"maildir_file_do(%s): Filename keeps changing", path);
+			"lstat(%s) failed: %m", path);
+		return -1;
+	} else {
+		/* success or ENOENT, either way we're done */
+		mail_storage_set_critical(&mbox->storage->storage,
+			"maildir_file_do(%s): Filename keeps changing for UID=%u", path, *uidp);
 		return -1;
 	}
 }
@@ -160,7 +168,7 @@ int maildir_file_do(struct maildir_mailbox *mbox, uint32_t uid,
 	}
 
 	if (i == MAILDIR_RESYNC_RETRY_COUNT) T_BEGIN {
-		ret = maildir_file_do_try(mbox, uid, do_racecheck, context);
+		ret = maildir_file_do_try(mbox, uid, do_racecheck, &uid);
 	} T_END;
 
 	return ret == -2 ? 0 : ret;

@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -16,9 +16,10 @@
 #include "mdbox-sync.h"
 #include "mdbox-storage-rebuild.h"
 
-#include <stdlib.h>
 #include <dirent.h>
 #include <unistd.h>
+
+#define REBUILD_MAX_REFCOUNT 32768
 
 struct mdbox_rebuild_msg {
 	struct mdbox_rebuild_msg *guid_hash_next;
@@ -247,8 +248,7 @@ rebuild_rename_file(struct mdbox_storage_rebuild_context *ctx,
 		/* use link()+unlink() instead of rename() to make sure we
 		   don't overwrite any files. */
 		if (link(old_path, new_path) == 0) {
-			if (unlink(old_path) < 0)
-				i_error("unlink(%s) failed: %m", old_path);
+			i_unlink(old_path);
 			*fname_p = strrchr(new_path, '/') + 1;
 			*file_id_r = ctx->highest_file_id;
 			return 0;
@@ -312,7 +312,7 @@ rebuild_add_missing_map_uids(struct mdbox_storage_rebuild_context *ctx,
 	unsigned int i, count;
 	uint32_t seq;
 
-	memset(&rec, 0, sizeof(rec));
+	i_zero(&rec);
 	msgs = array_get_modifiable(&ctx->msgs, &count);
 	for (i = 0; i < count; i++) {
 		if (msgs[i]->map_uid != 0)
@@ -331,7 +331,7 @@ rebuild_add_missing_map_uids(struct mdbox_storage_rebuild_context *ctx,
 	}
 }
 
-static int rebuild_apply_map(struct mdbox_storage_rebuild_context *ctx)
+static void rebuild_apply_map(struct mdbox_storage_rebuild_context *ctx)
 {
 	struct mdbox_map *map = ctx->storage->map;
 	const struct mail_index_header *hdr;
@@ -347,8 +347,14 @@ static int rebuild_apply_map(struct mdbox_storage_rebuild_context *ctx)
 	hdr = mail_index_get_header(ctx->atomic->sync_view);
 	for (seq = 1; seq <= hdr->messages_count; seq++) {
 		if (mdbox_map_view_lookup_rec(map, ctx->atomic->sync_view,
-					      seq, &rec) < 0)
-			return -1;
+					      seq, &rec) < 0) {
+			/* map or ref extension is missing from the index.
+			   Just ignore the file entirely. (Don't try to
+			   continue with other records, since they'll fail
+			   as well, and each failure logs the same error.) */
+			i_assert(seq == 1);
+			break;
+		}
 
 		/* look up the rebuild msg record for this message based on
 		   the (file_id, offset, size) triplet */
@@ -373,7 +379,6 @@ static int rebuild_apply_map(struct mdbox_storage_rebuild_context *ctx)
 	/* afterwards we're interested in looking up map_uids.
 	   re-sort the messages to make it easier. */
 	array_sort(&ctx->msgs, mdbox_rebuild_msg_uid_cmp);
-	return 0;
 }
 
 static struct mdbox_rebuild_msg *
@@ -425,7 +430,7 @@ rebuild_mailbox_multi(struct mdbox_storage_rebuild_context *ctx,
 		mail_index_lookup_ext(view, old_seq, mbox->ext_id,
 				      &data, NULL);
 		if (data == NULL) {
-			memset(&new_dbox_rec, 0, sizeof(new_dbox_rec));
+			i_zero(&new_dbox_rec);
 			map_uid = 0;
 		} else {
 			memcpy(&new_dbox_rec, data, sizeof(new_dbox_rec));
@@ -458,7 +463,8 @@ rebuild_mailbox_multi(struct mdbox_storage_rebuild_context *ctx,
 			   GUID exists multiple times */
 		}
 
-		if (rec != NULL) T_BEGIN {
+		if (rec != NULL &&
+		    rec->refcount < REBUILD_MAX_REFCOUNT) T_BEGIN {
 			/* keep this message. add it to mailbox index. */
 			i_assert(map_uid != 0);
 			rec->refcount++;
@@ -485,7 +491,7 @@ mdbox_rebuild_get_header(struct mail_index_view *view, uint32_t hdr_ext_id,
 	size_t data_size;
 
 	mail_index_get_header_ext(view, hdr_ext_id, &data, &data_size);
-	memset(hdr_r, 0, sizeof(*hdr_r));
+	i_zero(hdr_r);
 	memcpy(hdr_r, data, I_MIN(data_size, sizeof(*hdr_r)));
 	*need_resize_r = data_size < sizeof(*hdr_r);
 }
@@ -500,7 +506,7 @@ static void mdbox_header_update(struct mdbox_storage_rebuild_context *ctx,
 	mdbox_rebuild_get_header(rebuild_ctx->view, mbox->hdr_ext_id,
 				 &hdr, &need_resize);
 	if (rebuild_ctx->backup_view == NULL) {
-		memset(&backup_hdr, 0, sizeof(backup_hdr));
+		i_zero(&backup_hdr);
 		need_resize = TRUE;
 	} else {
 		mdbox_rebuild_get_header(rebuild_ctx->backup_view,
@@ -550,6 +556,7 @@ rebuild_mailbox(struct mdbox_storage_rebuild_context *ctx,
 
 	box = mailbox_alloc(ns->list, vname, MAILBOX_FLAG_READONLY |
 			    MAILBOX_FLAG_IGNORE_ACLS);
+	mailbox_set_reason(box, "mdbox rebuild");
 	if (box->storage != &ctx->storage->storage.storage) {
 		/* the namespace has multiple storages. */
 		mailbox_free(&box);
@@ -558,7 +565,7 @@ rebuild_mailbox(struct mdbox_storage_rebuild_context *ctx,
 	if (mailbox_open(box) < 0) {
 		error = mailbox_get_last_mail_error(box);
 		i_error("Couldn't open mailbox '%s': %s",
-			vname, mailbox_get_last_error(box, NULL));
+			vname, mailbox_get_last_internal_error(box, NULL));
 		mailbox_free(&box);
 		if (error == MAIL_ERROR_TEMP)
 			return -1;
@@ -580,7 +587,9 @@ rebuild_mailbox(struct mdbox_storage_rebuild_context *ctx,
 	mdbox_header_update(ctx, rebuild_ctx, mbox);
 	rebuild_mailbox_multi(ctx, rebuild_ctx, mbox, view, trans);
 	index_index_rebuild_deinit(&rebuild_ctx, dbox_get_uidvalidity_next);
+	mail_index_unset_fscked(trans);
 
+	mail_index_sync_set_reason(sync_ctx, "mdbox storage rebuild");
 	if (mail_index_sync_commit(&sync_ctx) < 0) {
 		mailbox_set_index_error(box);
 		ret = -1;
@@ -640,10 +649,11 @@ static int rebuild_mailboxes(struct mdbox_storage_rebuild_context *ctx)
 
 static int rebuild_msg_mailbox_commit(struct rebuild_msg_mailbox *msg)
 {
+	mail_index_sync_set_reason(msg->sync_ctx, "mdbox storage rebuild");
 	if (mail_index_sync_commit(&msg->sync_ctx) < 0)
 		return -1;
 	mailbox_free(&msg->box);
-	memset(msg, 0, sizeof(*msg));
+	i_zero(msg);
 	return 0;
 }
 
@@ -699,6 +709,7 @@ static int rebuild_restore_msg(struct mdbox_storage_rebuild_context *ctx,
 		box = mailbox_alloc(ctx->default_list, mailbox,
 				    MAILBOX_FLAG_READONLY |
 				    MAILBOX_FLAG_IGNORE_ACLS);
+		mailbox_set_reason(box, "mdbox rebuild restore");
 		i_assert(box->storage == storage);
 		if (mailbox_open(box) == 0)
 			break;
@@ -749,7 +760,7 @@ static int rebuild_restore_msg(struct mdbox_storage_rebuild_context *ctx,
 	}
 
 	/* add the new message */
-	memset(&dbox_rec, 0, sizeof(dbox_rec));
+	i_zero(&dbox_rec);
 	dbox_rec.map_uid = msg->map_uid;
 	dbox_rec.save_date = ioloop_time;
 	mail_index_append(ctx->prev_msg.trans, ctx->prev_msg.next_uid++, &seq);
@@ -758,6 +769,7 @@ static int rebuild_restore_msg(struct mdbox_storage_rebuild_context *ctx,
 	mail_index_update_ext(ctx->prev_msg.trans, seq, mbox->guid_ext_id,
 			      msg->guid_128, NULL);
 
+	i_assert(msg->refcount == 0);
 	msg->refcount++;
 	return 0;
 }
@@ -899,12 +911,13 @@ static int mdbox_storage_rebuild_scan(struct mdbox_storage_rebuild_context *ctx)
 
 	/* begin by locking the map, so that other processes can't try to
 	   rebuild at the same time. */
-	if (mdbox_map_atomic_lock(ctx->atomic) < 0)
+	if (mdbox_map_atomic_lock(ctx->atomic, "mdbox storage rebuild") < 0)
 		return -1;
 
 	/* fsck the map just in case its UIDs are broken */
 	if (mail_index_fsck(ctx->storage->map->index) < 0) {
-		mail_storage_set_internal_error(&ctx->storage->storage.storage);
+		mail_storage_set_index_error(&ctx->storage->storage.storage,
+					     ctx->storage->map->index);
 		return -1;
 	}
 
@@ -912,7 +925,7 @@ static int mdbox_storage_rebuild_scan(struct mdbox_storage_rebuild_context *ctx)
 	mail_index_get_header_ext(ctx->atomic->sync_view,
 				  ctx->storage->map->map_ext_id,
 				  &data, &data_size);
-	memset(&ctx->orig_map_hdr, 0, sizeof(ctx->orig_map_hdr));
+	i_zero(&ctx->orig_map_hdr);
 	memcpy(&ctx->orig_map_hdr, data,
 	       I_MIN(data_size, sizeof(ctx->orig_map_hdr)));
 	ctx->highest_file_id = ctx->orig_map_hdr.highest_file_id;
@@ -936,8 +949,8 @@ static int mdbox_storage_rebuild_scan(struct mdbox_storage_rebuild_context *ctx)
 			return -1;
 	}
 
-	if (rebuild_apply_map(ctx) < 0 ||
-	    rebuild_mailboxes(ctx) < 0 ||
+	rebuild_apply_map(ctx);
+	if (rebuild_mailboxes(ctx) < 0 ||
 	    rebuild_finish(ctx) < 0) {
 		mdbox_map_atomic_set_failed(ctx->atomic);
 		return -1;
@@ -978,6 +991,7 @@ int mdbox_storage_rebuild(struct mdbox_storage *storage)
 	atomic = mdbox_map_atomic_begin(storage->map);
 	ret = mdbox_storage_rebuild_in_context(storage, atomic);
 	mdbox_map_atomic_set_success(atomic);
+	mdbox_map_atomic_unset_fscked(atomic);
 	if (mdbox_map_atomic_finish(&atomic) < 0)
 		ret = -1;
 	return ret;

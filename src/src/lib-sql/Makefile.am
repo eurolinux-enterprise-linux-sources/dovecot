@@ -18,11 +18,16 @@ if BUILD_SQLITE
 SQLITE_LIB = libdriver_sqlite.la
 SQL_DRIVER_PLUGINS += sqlite
 endif
+if BUILD_CASSANDRA
+CASSANDRA_LIB = libdriver_cassandra.la
+SQL_DRIVER_PLUGINS += cassandra
+endif
 
 sql_module_LTLIBRARIES = \
 	$(MYSQL_LIB) \
 	$(PGSQL_LIB) \
-	$(SQLITE_LIB)
+	$(SQLITE_LIB) \
+	$(CASSANDRA_LIB)
 
 sql_moduledir = $(moduledir)
 endif
@@ -31,6 +36,7 @@ sql_drivers = @sql_drivers@
 
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
+	-I$(top_srcdir)/src/lib-settings \
 	$(SQL_CFLAGS)
 
 dist_sources = \
@@ -41,7 +47,8 @@ if ! SQL_PLUGINS
 driver_sources = \
 	driver-mysql.c \
 	driver-pgsql.c \
-	driver-sqlite.c
+	driver-sqlite.c \
+	driver-cassandra.c
 endif
 
 libsql_la_SOURCES = \
@@ -56,25 +63,31 @@ deplibs = \
 if SQL_PLUGINS
 libdriver_mysql_la_LDFLAGS = -module -avoid-version
 libdriver_mysql_la_LIBADD = $(MYSQL_LIBS)
-libdriver_mysql_la_CPPFLAGS = -I$(top_srcdir)/src/lib $(MYSQL_CFLAGS)
+libdriver_mysql_la_CPPFLAGS = $(AM_CPPFLAGS) $(MYSQL_CFLAGS)
 libdriver_mysql_la_SOURCES = driver-mysql.c
 
 libdriver_pgsql_la_LDFLAGS = -module -avoid-version
 libdriver_pgsql_la_LIBADD = $(PGSQL_LIBS)
-libdriver_pgsql_la_CPPFLAGS = -I$(top_srcdir)/src/lib $(PGSQL_CFLAGS)
+libdriver_pgsql_la_CPPFLAGS = $(AM_CPPFLAGS) $(PGSQL_CFLAGS)
 libdriver_pgsql_la_SOURCES = driver-pgsql.c
 
 libdriver_sqlite_la_LDFLAGS = -module -avoid-version
 libdriver_sqlite_la_LIBADD = $(SQLITE_LIBS)
-libdriver_sqlite_la_CPPFLAGS = -I$(top_srcdir)/src/lib $(SQLITE_CFLAGS)
+libdriver_sqlite_la_CPPFLAGS = $(AM_CPPFLAGS) $(SQLITE_CFLAGS)
 libdriver_sqlite_la_SOURCES = driver-sqlite.c
+
+libdriver_cassandra_la_LDFLAGS = -module -avoid-version
+libdriver_cassandra_la_LIBADD = $(CASSANDRA_LIBS)
+libdriver_cassandra_la_CPPFLAGS = $(AM_CPPFLAGS) $(CASSANDRA_CFLAGS)
+libdriver_cassandra_la_SOURCES = driver-cassandra.c
 
 sql_libs =
 else
 sql_libs = \
 	$(MYSQL_LIBS) \
 	$(PGSQL_LIBS) \
-	$(SQLITE_LIBS)
+	$(SQLITE_LIBS) \
+	$(CASSANDRA_LIBS)
 endif
 
 pkglib_LTLIBRARIES = libdovecot-sql.la

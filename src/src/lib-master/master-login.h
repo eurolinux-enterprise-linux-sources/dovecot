@@ -4,15 +4,20 @@
 #include "master-auth.h"
 
 #define MASTER_POSTLOGIN_TIMEOUT_DEFAULT 60
-/* base64(<IPv6><port><48bit timestamp>) + NUL */
-#define LOGIN_MAX_SESSION_ID_LEN 33
 
 struct master_login_client {
+	/* parent connection */
 	struct master_login_connection *conn;
+	/* linked list of all clients within the connection */
+	struct master_login_client *prev, *next;
+	/* non-NULL while running postlogin script */
+	struct master_login_postlogin *postlogin_client;
+
 	int fd;
+	struct timeval create_time;
 
 	struct master_auth_request auth_req;
-	char session_id[LOGIN_MAX_SESSION_ID_LEN];
+	char *session_id;
 	unsigned char data[FLEXIBLE_ARRAY_MEMBER];
 };
 

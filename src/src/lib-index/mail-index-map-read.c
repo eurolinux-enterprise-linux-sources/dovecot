@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,6 +8,7 @@
 #include "mail-index-private.h"
 #include "mail-index-sync-private.h"
 #include "mail-transaction-log-private.h"
+#include "ioloop.h"
 
 static void mail_index_map_copy_hdr(struct mail_index_map *map,
 				    const struct mail_index_header *hdr)
@@ -15,7 +16,7 @@ static void mail_index_map_copy_hdr(struct mail_index_map *map,
 	if (hdr->base_header_size < sizeof(map->hdr)) {
 		/* header smaller than ours, make a copy so our newer headers
 		   won't have garbage in them */
-		memset(&map->hdr, 0, sizeof(map->hdr));
+		i_zero(&map->hdr);
 		memcpy(&map->hdr, hdr, hdr->base_header_size);
 	} else {
 		map->hdr = *hdr;
@@ -31,6 +32,7 @@ static int mail_index_mmap(struct mail_index_map *map, uoff_t file_size)
 	struct mail_index *index = map->index;
 	struct mail_index_record_map *rec_map = map->rec_map;
 	const struct mail_index_header *hdr;
+	const char *error;
 
 	i_assert(rec_map->mmap_base == NULL);
 
@@ -46,7 +48,11 @@ static int mail_index_mmap(struct mail_index_map *map, uoff_t file_size)
 				  MAP_PRIVATE, index->fd, 0);
 	if (rec_map->mmap_base == MAP_FAILED) {
 		rec_map->mmap_base = NULL;
-		mail_index_set_syscall_error(index, "mmap()");
+		if (ioloop_time != index->last_mmap_error_time) {
+			index->last_mmap_error_time = ioloop_time;
+			mail_index_set_syscall_error(index, t_strdup_printf(
+				"mmap(size=%"PRIuUOFF_T")", file_size));
+		}
 		return -1;
 	}
 	rec_map->mmap_size = file_size;
@@ -66,8 +72,10 @@ static int mail_index_mmap(struct mail_index_map *map, uoff_t file_size)
 		return 0;
 	}
 
-	if (!mail_index_check_header_compat(index, hdr, rec_map->mmap_size)) {
+	if (!mail_index_check_header_compat(index, hdr, rec_map->mmap_size, &error)) {
 		/* Can't use this file */
+		mail_index_set_error(index, "Corrupted index file %s: %s",
+				     index->filepath, error);
 		return 0;
 	}
 
@@ -126,6 +134,7 @@ mail_index_try_read_map(struct mail_index_map *map,
 	struct mail_index *index = map->index;
 	const struct mail_index_header *hdr;
 	unsigned char read_buf[IO_BLOCK_SIZE];
+	const char *error;
 	const void *buf;
 	void *data = NULL;
 	ssize_t ret;
@@ -146,8 +155,10 @@ mail_index_try_read_map(struct mail_index_map *map,
 
 	if (ret >= 0 && pos >= MAIL_INDEX_HEADER_MIN_SIZE &&
 	    (ret > 0 || pos >= hdr->base_header_size)) {
-		if (!mail_index_check_header_compat(index, hdr, file_size)) {
+		if (!mail_index_check_header_compat(index, hdr, file_size, &error)) {
 			/* Can't use this file */
+			mail_index_set_error(index, "Corrupted index file %s: %s",
+					     index->filepath, error);
 			return 0;
 		}
 
@@ -232,6 +243,7 @@ mail_index_try_read_map(struct mail_index_map *map,
 
 	mail_index_map_copy_hdr(map, hdr);
 	map->hdr_base = map->hdr_copy_buf->data;
+	i_assert(map->hdr_copy_buf->used == map->hdr.header_size);
 	return 1;
 }
 
@@ -289,15 +301,19 @@ static int mail_index_read_map(struct mail_index_map *map, uoff_t file_size)
 
 /* returns -1 = error, 0 = index files are unusable,
    1 = index files are usable or at least repairable */
-static int mail_index_map_latest_file(struct mail_index *index)
+static int
+mail_index_map_latest_file(struct mail_index *index, const char **reason_r)
 {
 	struct mail_index_map *old_map, *new_map;
 	struct stat st;
 	uoff_t file_size;
 	bool use_mmap, unusable = FALSE;
+	const char *error;
 	int ret, try;
 
-	ret = mail_index_reopen_if_changed(index);
+	*reason_r = NULL;
+
+	ret = mail_index_reopen_if_changed(index, reason_r);
 	if (ret <= 0) {
 		if (ret < 0)
 			return -1;
@@ -306,6 +322,7 @@ static int mail_index_map_latest_file(struct mail_index *index)
 		   build it from the transaction log. */
 		return 1;
 	}
+	i_assert(index->fd != -1);
 
 	if ((index->flags & MAIL_INDEX_OPEN_FLAG_NFS_FLUSH) != 0)
 		nfs_flush_attr_cache_fd_locked(index->filepath, index->fd);
@@ -338,7 +355,12 @@ static int mail_index_map_latest_file(struct mail_index *index)
 
 	for (try = 0; ret > 0; try++) {
 		/* make sure the header is ok before using this mapping */
-		ret = mail_index_map_check_header(new_map);
+		ret = mail_index_map_check_header(new_map, &error);
+		if (ret < 0) {
+			mail_index_set_error(index,
+				"Corrupted index file %s: %s",
+				index->filepath, error);
+		}
 		if (ret > 0) T_BEGIN {
 			if (mail_index_map_parse_extensions(new_map) < 0)
 				ret = 0;
@@ -347,6 +369,7 @@ static int mail_index_map_latest_file(struct mail_index *index)
 		} T_END;
 		if (ret != 0 || try == 2) {
 			if (ret < 0) {
+				*reason_r = "Corrupted index file";
 				unusable = TRUE;
 				ret = 0;
 			}
@@ -372,20 +395,19 @@ static int mail_index_map_latest_file(struct mail_index *index)
 	i_assert(new_map->rec_map->records != NULL);
 
 	index->last_read_log_file_seq = new_map->hdr.log_file_seq;
-	index->last_read_log_file_head_offset =
-		new_map->hdr.log_file_head_offset;
 	index->last_read_log_file_tail_offset =
 		new_map->hdr.log_file_tail_offset;
-	index->last_read_stat = st;
 
 	mail_index_unmap(&index->map);
 	index->map = new_map;
+	*reason_r = "Index mapped";
 	return 1;
 }
 
 int mail_index_map(struct mail_index *index,
 		   enum mail_index_sync_handler_type type)
 {
+	const char *reason;
 	int ret;
 
 	i_assert(!index->mapping);
@@ -399,7 +421,7 @@ int mail_index_map(struct mail_index *index,
 	if (index->initial_mapped) {
 		/* we're not creating/opening the index.
 		   sync this as a view from transaction log. */
-		ret = mail_index_sync_map(&index->map, type, FALSE);
+		ret = mail_index_sync_map(&index->map, type, FALSE, "initial mapping");
 	} else {
 		ret = 0;
 	}
@@ -410,7 +432,7 @@ int mail_index_map(struct mail_index *index,
 		   logs (which we'll also do even if the reopening succeeds).
 		   if index files are unusable (e.g. major version change)
 		   don't even try to use the transaction log. */
-		ret = mail_index_map_latest_file(index);
+		ret = mail_index_map_latest_file(index, &reason);
 		if (ret > 0) {
 			/* if we're creating the index file, we don't have any
 			   logs yet */
@@ -418,7 +440,15 @@ int mail_index_map(struct mail_index *index,
 				/* and update the map with the latest changes
 				   from transaction log */
 				ret = mail_index_sync_map(&index->map, type,
-							  TRUE);
+							  TRUE, reason);
+			}
+			if (ret == 0) {
+				/* we fsck'd the index. try opening again. */
+				ret = mail_index_map_latest_file(index, &reason);
+				if (ret > 0 && index->indexid != 0) {
+					ret = mail_index_sync_map(&index->map,
+						type, TRUE, reason);
+				}
 			}
 		} else if (ret == 0 && !index->readonly) {
 			/* make sure we don't try to open the file again */

@@ -1,3 +1,5 @@
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
+
 #ifdef HAVE_CONFIG_H
 #  include "config.h"
 #endif

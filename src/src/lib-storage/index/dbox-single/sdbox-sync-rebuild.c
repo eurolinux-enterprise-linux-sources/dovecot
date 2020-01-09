@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,7 +8,6 @@
 #include "sdbox-file.h"
 #include "sdbox-sync.h"
 
-#include <stdlib.h>
 #include <dirent.h>
 
 static void sdbox_sync_set_uidvalidity(struct index_rebuild_context *ctx)
@@ -108,8 +107,7 @@ static int sdbox_sync_index_rebuild_dir(struct index_rebuild_context *ctx,
 				/* alt directory doesn't exist, ignore */
 				return 0;
 			}
-			mailbox_set_deleted(ctx->box);
-			return -1;
+			return index_mailbox_fix_inconsistent_existence(ctx->box, path);
 		}
 		mail_storage_set_critical(storage,
 			"opendir(%s) failed: %m", path);
@@ -143,7 +141,7 @@ static void sdbox_sync_update_header(struct index_rebuild_context *ctx)
 	bool need_resize;
 
 	if (sdbox_read_header(mbox, &hdr, FALSE, &need_resize) < 0)
-		memset(&hdr, 0, sizeof(hdr));
+		i_zero(&hdr);
 	if (guid_128_is_empty(hdr.mailbox_guid))
 		guid_128_generate(hdr.mailbox_guid);
 	if (++hdr.rebuild_count == 0)
@@ -217,8 +215,10 @@ int sdbox_sync_index_rebuild(struct sdbox_mailbox *mbox, bool force)
 
 	if (ret < 0)
 		mail_index_transaction_rollback(&trans);
-	else
+	else {
+		mail_index_unset_fscked(trans);
 		ret = mail_index_transaction_commit(&trans);
+	}
 	mail_index_view_close(&view);
 	mbox->corrupted_rebuild_count = 0;
 	return ret;

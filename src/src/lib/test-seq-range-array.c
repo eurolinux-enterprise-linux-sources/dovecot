@@ -1,10 +1,9 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "test-lib.h"
 #include "array.h"
 #include "seq-range-array.h"
 
-#include <stdlib.h>
 
 static void
 boundaries_permute(uint32_t *input, unsigned int i, unsigned int count)
@@ -51,13 +50,44 @@ static void test_seq_range_array_add_merge(void)
 	seq_range_array_add(&range, 1);
 	seq_range_array_add(&range, 2);
 	test_assert(array_count(&range) == 2);
+
+	seq_range_array_add_range(&range, 1, (uint32_t)-1);
+	test_assert(array_count(&range) == 1);
+	seq_range_array_add_range(&range, 1, (uint32_t)-1);
+	test_assert(array_count(&range) == 1);
+	test_end();
+}
+
+static void test_seq_range_array_remove_nth(void)
+{
+	ARRAY_TYPE(seq_range) range;
+	const struct seq_range *r;
+
+	test_begin("seq_range_array_remove_nth()");
+	t_array_init(&range, 8);
+	seq_range_array_add_range(&range, 1, 5);
+	seq_range_array_add(&range, 7);
+	seq_range_array_add_range(&range, 10,20);
+	test_assert(array_count(&range) == 3);
+
+	seq_range_array_remove_nth(&range, 0, 2);
+	r = array_idx(&range, 0); test_assert(r->seq1 == 3 && r->seq2 == 5);
+
+	seq_range_array_remove_nth(&range, 1, 4);
+	r = array_idx(&range, 0); test_assert(r->seq1 == 3 && r->seq2 == 3);
+	r = array_idx(&range, 1); test_assert(r->seq1 == 11 && r->seq2 == 20);
+
+	seq_range_array_remove_nth(&range, 5, (uint32_t)-1);
+	r = array_idx(&range, 1); test_assert(r->seq1 == 11 && r->seq2 == 14);
+
+	test_assert(array_count(&range) == 2);
 	test_end();
 }
 
 static void test_seq_range_array_random(void)
 {
-#define SEQ_RANGE_TEST_BUFSIZE 20
-#define SEQ_RANGE_TEST_COUNT 10000
+#define SEQ_RANGE_TEST_BUFSIZE 100
+#define SEQ_RANGE_TEST_COUNT 20000
 	unsigned char shadowbuf[SEQ_RANGE_TEST_BUFSIZE];
 	ARRAY_TYPE(seq_range) range;
 	const struct seq_range *seqs;
@@ -74,12 +104,18 @@ static void test_seq_range_array_random(void)
 		test = rand() % 4;
 		switch (test) {
 		case 0:
-			seq_range_array_add(&range, seq1);
+			ret = seq_range_array_add(&range, seq1) ? 0 : 1; /* FALSE == added */
+			ret2 = shadowbuf[seq1] == 0 ? 1 : 0;
 			shadowbuf[seq1] = 1;
 			break;
 		case 1:
-			seq_range_array_add_range(&range, seq1, seq2);
-			memset(shadowbuf + seq1, 1, seq2 - seq1 + 1);
+			ret = seq_range_array_add_range_count(&range, seq1, seq2);
+			for (ret2 = 0; seq1 <= seq2; seq1++) {
+				if (shadowbuf[seq1] == 0) {
+					ret2++;
+					shadowbuf[seq1] = 1;
+				}
+			}
 			break;
 		case 2:
 			ret = seq_range_array_remove(&range, seq1) ? 1 : 0;
@@ -125,49 +161,105 @@ fail:
 		test_out_reason("seq_range_array random", FALSE,
 			t_strdup_printf("round %u test %d failed", i, test));
 	}
+	array_free(&range);
+}
+
+static void test_seq_range_array_invert_minmax(uint32_t min, uint32_t max)
+{
+	ARRAY_TYPE(seq_range) range = ARRAY_INIT;
+	struct seq_range_iter iter;
+	unsigned int n, inverse_mask, mask_inside, mask_size = max-min+1;
+	uint32_t seq;
+
+	i_assert(mask_size <= sizeof(unsigned int)*8);
+	t_array_init(&range, 16);
+	for (unsigned int mask = 0; mask < mask_size; mask++) {
+		array_clear(&range);
+		for (unsigned int i = 0; i < mask_size; i++) {
+			if ((mask & (1 << i)) != 0)
+				seq_range_array_add(&range, min+i);
+		}
+		seq_range_array_invert(&range, min, max);
+
+		inverse_mask = 0;
+		seq_range_array_iter_init(&iter, &range); n = 0;
+		while (seq_range_array_iter_nth(&iter, n++, &seq)) {
+			test_assert(seq >= min && seq <= max);
+			inverse_mask |= 1 << (seq-min);
+		}
+		mask_inside = ((1 << mask_size)-1);
+		test_assert_idx((inverse_mask & ~mask_inside) == 0, mask);
+		test_assert_idx(inverse_mask == (mask ^ mask_inside), mask);
+	}
 }
 
 static void test_seq_range_array_invert(void)
 {
-	static const unsigned int input_min = 1, input_max = 5;
-	static const unsigned int input[] = {
-		1, 2, 3, 4, 5, UINT_MAX,
-		2, 3, 4, UINT_MAX,
-		1, 2, 4, 5, UINT_MAX,
-		1, 3, 5, UINT_MAX,
-		1, UINT_MAX,
-		5, UINT_MAX,
-		UINT_MAX
+	test_begin("seq_range_array_invert()");
+	/* first numbers */
+	for (unsigned int min = 0; min <= 7; min++) {
+		for (unsigned int max = min; max <= 7; max++) T_BEGIN {
+			test_seq_range_array_invert_minmax(min, max);
+		} T_END;
+	}
+	/* last numbers */
+	for (uint64_t min = 0xffffffff-7; min <= 0xffffffff; min++) {
+		for (uint64_t max = min; max <= 0xffffffff; max++) T_BEGIN {
+			test_seq_range_array_invert_minmax(min, max);
+		} T_END;
+	}
+	test_end();
+}
+
+static void test_seq_range_array_invert_edges(void)
+{
+	const struct {
+		int64_t a_seq1, a_seq2, b_seq1, b_seq2;
+		int64_t resa_seq1, resa_seq2, resb_seq1, resb_seq2;
+	} tests[] = {
+		{ -1, -1, -1, -1,
+		  0, 0xffffffff, -1, -1 },
+		{ 0, 0xffffffff, -1, -1,
+		  -1, -1, -1, -1 },
+		{ 0, 0xfffffffe, -1, -1,
+		  0xffffffff, 0xffffffff, -1, -1 },
+		{ 1, 0xfffffffe, -1, -1,
+		  0, 0, 0xffffffff, 0xffffffff },
+		{ 1, 0xffffffff, -1, -1,
+		  0, 0, -1, -1 },
+		{ 0, 0, 0xffffffff, 0xffffffff,
+		  1, 0xfffffffe, -1, -1 },
+		{ 0xffffffff, 0xffffffff, -1, -1,
+		  0, 0xfffffffe, -1, -1 },
 	};
 	ARRAY_TYPE(seq_range) range = ARRAY_INIT;
-	unsigned int i, j, seq, start, num;
-	bool old_exists, success;
+	const struct seq_range *result;
+	unsigned int count;
 
-	for (i = num = 0; input[i] != UINT_MAX; num++, i++) {
-		success = TRUE;
-		start = i;
-		for (; input[i] != UINT_MAX; i++) {
-			seq_range_array_add_with_init(&range, 32, input[i]);
-			for (j = start; j < i; j++) {
-				if (!seq_range_exists(&range, input[j]))
-					success = FALSE;
+	test_begin("seq_range_array_invert() edges");
+	for (unsigned int i = 0; i < N_ELEMENTS(tests); i++) T_BEGIN {
+		t_array_init(&range, 10);
+		if (tests[i].a_seq1 != -1)
+			seq_range_array_add_range(&range, tests[i].a_seq1, tests[i].a_seq2);
+		if (tests[i].b_seq1 != -1)
+			seq_range_array_add_range(&range, tests[i].b_seq1, tests[i].b_seq2);
+		seq_range_array_invert(&range, 0, 0xffffffff);
+
+		result = array_get(&range, &count);
+		if (tests[i].resa_seq1 == -1)
+			test_assert_idx(count == 0, i);
+		else {
+			test_assert(result[0].seq1 == tests[i].resa_seq1);
+			test_assert(result[0].seq2 == tests[i].resa_seq2);
+			if (tests[i].resb_seq1 == -1)
+				test_assert_idx(count == 1, i);
+			else {
+				test_assert(result[1].seq1 == tests[i].resb_seq1);
+				test_assert(result[1].seq2 == tests[i].resb_seq2);
 			}
 		}
-
-		seq_range_array_invert(&range, input_min, input_max);
-		for (seq = input_min; seq <= input_max; seq++) {
-			for (j = start; input[j] != UINT_MAX; j++) {
-				if (input[j] == seq)
-					break;
-			}
-			old_exists = input[j] != UINT_MAX;
-			if (seq_range_exists(&range, seq) == old_exists)
-				success = FALSE;
-		}
-		test_out(t_strdup_printf("seq_range_array_invert(%u)", num),
-			 success);
-		array_free(&range);
-	}
+	} T_END;
+	test_end();
 }
 
 static void test_seq_range_create(ARRAY_TYPE(seq_range) *array, uint8_t byte)
@@ -206,7 +298,9 @@ void test_seq_range_array(void)
 {
 	test_seq_range_array_add_boundaries();
 	test_seq_range_array_add_merge();
+	test_seq_range_array_remove_nth();
 	test_seq_range_array_invert();
+	test_seq_range_array_invert_edges();
 	test_seq_range_array_have_common();
 	test_seq_range_array_random();
 }

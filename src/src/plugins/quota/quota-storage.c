@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,6 +7,7 @@
 #include "mail-storage-private.h"
 #include "mailbox-list-private.h"
 #include "maildir-storage.h"
+#include "index-mailbox-size.h"
 #include "quota-private.h"
 #include "quota-plugin.h"
 
@@ -30,6 +31,7 @@ struct quota_mailbox {
 	struct quota_transaction_context *expunge_qt;
 	ARRAY(uint32_t) expunge_uids;
 	ARRAY(uoff_t) expunge_sizes;
+	unsigned int prev_idx;
 
 	unsigned int recalculate:1;
 	unsigned int sync_transaction_expunge:1;
@@ -44,18 +46,51 @@ static MODULE_CONTEXT_DEFINE_INIT(quota_mail_module, &mail_module_register);
 static MODULE_CONTEXT_DEFINE_INIT(quota_mailbox_list_module,
 				  &mailbox_list_module_register);
 
+static void quota_set_storage_error(struct quota_transaction_context *qt,
+				    struct mail_storage *storage,
+				    enum quota_alloc_result res)
+{
+	const char *errstr = quota_alloc_result_errstr(res, qt);
+	switch (res) {
+	case QUOTA_ALLOC_RESULT_OVER_MAXSIZE:
+		mail_storage_set_error(storage, MAIL_ERROR_LIMIT, errstr);
+		break;
+	case QUOTA_ALLOC_RESULT_OVER_QUOTA_LIMIT:
+	case QUOTA_ALLOC_RESULT_OVER_QUOTA:
+		mail_storage_set_error(storage, MAIL_ERROR_NOQUOTA, errstr);
+		break;
+	case QUOTA_ALLOC_RESULT_TEMPFAIL:
+		mail_storage_set_internal_error(storage);
+		break;
+	case QUOTA_ALLOC_RESULT_OK:
+		i_unreached();
+	}
+}
+
 static void quota_mail_expunge(struct mail *_mail)
 {
 	struct mail_private *mail = (struct mail_private *)_mail;
 	struct quota_mailbox *qbox = QUOTA_CONTEXT(_mail->box);
+	struct quota_user *quser = QUOTA_USER_CONTEXT(_mail->box->storage->user);
 	union mail_module_context *qmail = QUOTA_MAIL_CONTEXT(mail);
+	struct quota_transaction_context *qt = QUOTA_CONTEXT(_mail->transaction);
 	uoff_t size;
+	int ret;
+
+	if (qt->auto_updating) {
+		qmail->super.expunge(_mail);
+		return;
+	}
 
 	/* We need to handle the situation where multiple transactions expunged
 	   the mail at the same time. In here we'll just save the message's
 	   physical size and do the quota freeing later when the message was
 	   known to be expunged. */
-	if (mail_get_physical_size(_mail, &size) == 0) {
+	if (quser->quota->set->vsizes)
+		ret = mail_get_virtual_size(_mail, &size);
+	else
+		ret = mail_get_physical_size(_mail, &size);
+	if (ret == 0) {
 		if (!array_is_created(&qbox->expunge_uids)) {
 			i_array_init(&qbox->expunge_uids, 64);
 			i_array_init(&qbox->expunge_sizes, 64);
@@ -81,14 +116,13 @@ quota_get_status(struct mailbox *box, enum mailbox_status_items items,
 {
 	struct quota_mailbox *qbox = QUOTA_CONTEXT(box);
 	struct quota_transaction_context *qt;
-	bool too_large;
 	int ret = 0;
 
 	if ((items & STATUS_CHECK_OVER_QUOTA) != 0) {
 		qt = quota_transaction_begin(box);
-		if ((ret = quota_test_alloc(qt, 0, &too_large)) == 0) {
-			mail_storage_set_error(box->storage, MAIL_ERROR_NOSPACE,
-					       qt->quota->set->quota_exceeded_msg);
+		enum quota_alloc_result qret = quota_test_alloc(qt, 0);
+		if (qret != QUOTA_ALLOC_RESULT_OK) {
+			quota_set_storage_error(qt, box->storage, qret);
 			ret = -1;
 		}
 		quota_transaction_rollback(&qt);
@@ -128,8 +162,7 @@ quota_mailbox_transaction_commit(struct mailbox_transaction_context *ctx,
 	struct quota_mailbox *qbox = QUOTA_CONTEXT(ctx->box);
 	struct quota_transaction_context *qt = QUOTA_CONTEXT(ctx);
 
-	if (qt->tmp_mail != NULL)
-		mail_free(&qt->tmp_mail);
+	i_assert(qt->tmp_mail == NULL);
 
 	if (qbox->module_ctx.super.transaction_commit(ctx, changes_r) < 0) {
 		quota_transaction_rollback(&qt);
@@ -146,8 +179,7 @@ quota_mailbox_transaction_rollback(struct mailbox_transaction_context *ctx)
 	struct quota_mailbox *qbox = QUOTA_CONTEXT(ctx->box);
 	struct quota_transaction_context *qt = QUOTA_CONTEXT(ctx);
 
-	if (qt->tmp_mail != NULL)
-		mail_free(&qt->tmp_mail);
+	i_assert(qt->tmp_mail == NULL);
 
 	qbox->module_ctx.super.transaction_rollback(ctx);
 	quota_transaction_rollback(&qt);
@@ -171,14 +203,45 @@ void quota_mail_allocated(struct mail *_mail)
 	MODULE_CONTEXT_SET_SELF(mail, quota_mail_module, qmail);
 }
 
-static int quota_check(struct mail_save_context *ctx)
+static bool
+quota_move_requires_check(struct mailbox *dest_box, struct mailbox *src_box)
+{
+	struct mail_namespace *src_ns = src_box->list->ns;
+	struct mail_namespace *dest_ns = dest_box->list->ns;
+	struct quota_user *quser = QUOTA_USER_CONTEXT(src_ns->user);
+	struct quota_root *const *rootp;
+
+	array_foreach(&quser->quota->roots, rootp) {
+		bool have_src_quota, have_dest_quota;
+
+		have_src_quota = quota_root_is_namespace_visible(*rootp, src_ns);
+		have_dest_quota = quota_root_is_namespace_visible(*rootp, dest_ns);
+		if (have_src_quota == have_dest_quota) {
+			/* Both/neither have this quota */
+		} else if (have_dest_quota) {
+			/* Destination mailbox has a quota that doesn't exist
+			   in source. We'll need to check if it's being
+			   exceeded. */
+			return TRUE;
+		} else {
+			/* Source mailbox has a quota root that doesn't exist
+			   in destination. We're not increasing the source
+			   quota, so ignore it. */
+		}
+	}
+	return FALSE;
+}
+
+static int quota_check(struct mail_save_context *ctx, struct mailbox *src_box)
 {
 	struct mailbox_transaction_context *t = ctx->transaction;
 	struct quota_transaction_context *qt = QUOTA_CONTEXT(t);
-	int ret;
-	bool too_large;
+	enum quota_alloc_result ret;
 
-	if (ctx->moving) {
+	i_assert(!ctx->moving || src_box != NULL);
+
+	if (ctx->moving &&
+	     !quota_move_requires_check(ctx->transaction->box, src_box)) {
 		/* the mail is being moved. the quota won't increase (after
 		   the following expunge), so allow this even if user is
 		   currently over quota */
@@ -186,18 +249,20 @@ static int quota_check(struct mail_save_context *ctx)
 		return 0;
 	}
 
-	ret = quota_try_alloc(qt, ctx->dest_mail, &too_large);
-	if (ret > 0)
+	ret = quota_try_alloc(qt, ctx->dest_mail);
+	switch (ret) {
+	case QUOTA_ALLOC_RESULT_OK:
 		return 0;
-	else if (ret == 0) {
-		mail_storage_set_error(t->box->storage, MAIL_ERROR_NOSPACE,
-				       qt->quota->set->quota_exceeded_msg);
+	case QUOTA_ALLOC_RESULT_TEMPFAIL:
+		/* allow saving anyway. don't log an error, because at this
+		   point we can't give very informative error without API
+		   changes. the real error should have been logged already
+		   (except if this was due to quota calculation on background,
+		   then we intentionally don't want to log anything) */
+		return 0;
+	default:
+		quota_set_storage_error(qt, t->box->storage, ret);
 		return -1;
-	} else {
-		mail_storage_set_critical(t->box->storage,
-					  "Internal quota calculation error");
-		/* allow saving anyway */
-		return 0;
 	}
 }
 
@@ -208,14 +273,12 @@ quota_copy(struct mail_save_context *ctx, struct mail *mail)
 	struct quota_transaction_context *qt = QUOTA_CONTEXT(t);
 	struct quota_mailbox *qbox = QUOTA_CONTEXT(t->box);
 
-	if (ctx->dest_mail == NULL) {
-		/* we always want to know the mail size */
-		if (qt->tmp_mail == NULL) {
-			qt->tmp_mail = mail_alloc(t, MAIL_FETCH_PHYSICAL_SIZE,
-						  NULL);
-		}
-		ctx->dest_mail = qt->tmp_mail;
-	}
+	/* we always want to know the mail size */
+	mail_add_temp_wanted_fields(ctx->dest_mail, MAIL_FETCH_PHYSICAL_SIZE, NULL);
+
+	/* get quota before copying any mails. this avoids .vsize.lock
+	   deadlocks with backends that lock mails for expunging/copying. */
+	(void)quota_transaction_set_limits(qt);
 
 	if (qbox->module_ctx.super.copy(ctx, mail) < 0)
 		return -1;
@@ -225,7 +288,7 @@ quota_copy(struct mail_save_context *ctx, struct mail *mail)
 		   quota */
 		return 0;
 	}
-	return quota_check(ctx);
+	return quota_check(ctx, mail->box);
 }
 
 static int
@@ -235,7 +298,6 @@ quota_save_begin(struct mail_save_context *ctx, struct istream *input)
 	struct quota_transaction_context *qt = QUOTA_CONTEXT(t);
 	struct quota_mailbox *qbox = QUOTA_CONTEXT(t->box);
 	uoff_t size;
-	int ret;
 
 	if (!ctx->moving && i_stream_get_size(input, TRUE, &size) > 0) {
 		/* Input size is known, check for quota immediately. This
@@ -247,29 +309,28 @@ quota_save_begin(struct mail_save_context *ctx, struct istream *input)
 		   I think these don't really matter though compared to the
 		   benefit of giving "out of quota" error before sending the
 		   full mail. */
-		bool too_large;
 
-		ret = quota_test_alloc(qt, size, &too_large);
-		if (ret == 0) {
-			mail_storage_set_error(t->box->storage,
-				MAIL_ERROR_NOSPACE,
-				qt->quota->set->quota_exceeded_msg);
+		enum quota_alloc_result qret = quota_test_alloc(qt, size);
+		switch (qret) {
+		case QUOTA_ALLOC_RESULT_OK:
+			/* Great, there is space. */
+			break;
+		case QUOTA_ALLOC_RESULT_TEMPFAIL:
+			/* allow saving anyway. don't log an error - see
+			   quota_check() for reasons. */
+			break;
+		default:
+			quota_set_storage_error(qt, t->box->storage, qret);
 			return -1;
-		} else if (ret < 0) {
-			mail_storage_set_critical(t->box->storage,
-				"Internal quota calculation error");
-			/* allow saving anyway */
 		}
 	}
 
-	if (ctx->dest_mail == NULL) {
-		/* we always want to know the mail size */
-		if (qt->tmp_mail == NULL) {
-			qt->tmp_mail = mail_alloc(t, MAIL_FETCH_PHYSICAL_SIZE,
-						  NULL);
-		}
-		ctx->dest_mail = qt->tmp_mail;
-	}
+	/* we always want to know the mail size */
+	mail_add_temp_wanted_fields(ctx->dest_mail, MAIL_FETCH_PHYSICAL_SIZE, NULL);
+
+	/* get quota before copying any mails. this avoids .vsize.lock
+	   deadlocks with backends that lock mails for expunging/copying. */
+	(void)quota_transaction_set_limits(qt);
 
 	return qbox->module_ctx.super.save_begin(ctx, input);
 }
@@ -277,11 +338,13 @@ quota_save_begin(struct mail_save_context *ctx, struct istream *input)
 static int quota_save_finish(struct mail_save_context *ctx)
 {
 	struct quota_mailbox *qbox = QUOTA_CONTEXT(ctx->transaction->box);
+	struct mailbox *src_box;
 
 	if (qbox->module_ctx.super.save_finish(ctx) < 0)
 		return -1;
 
-	return quota_check(ctx);
+	src_box = ctx->copy_src_mail == NULL ? NULL : ctx->copy_src_mail->box;
+	return quota_check(ctx, src_box);
 }
 
 static void quota_mailbox_sync_cleanup(struct quota_mailbox *qbox)
@@ -293,7 +356,7 @@ static void quota_mailbox_sync_cleanup(struct quota_mailbox *qbox)
 
 	if (qbox->expunge_qt != NULL && qbox->expunge_qt->tmp_mail != NULL) {
 		mail_free(&qbox->expunge_qt->tmp_mail);
-		mailbox_transaction_rollback(&qbox->expunge_trans);
+		(void)mailbox_transaction_commit(&qbox->expunge_trans);
 	}
 	qbox->sync_transaction_expunge = FALSE;
 }
@@ -310,6 +373,8 @@ static void quota_mailbox_sync_notify(struct mailbox *box, uint32_t uid,
 				      enum mailbox_sync_type sync_type)
 {
 	struct quota_mailbox *qbox = QUOTA_CONTEXT(box);
+	struct index_mailbox_context *ibox = INDEX_STORAGE_CONTEXT(box);
+	struct quota_user *quser = QUOTA_USER_CONTEXT(box->storage->user);
 	const uint32_t *uids;
 	const uoff_t *sizep;
 	unsigned int i, count;
@@ -318,7 +383,8 @@ static void quota_mailbox_sync_notify(struct mailbox *box, uint32_t uid,
 	if (qbox->module_ctx.super.sync_notify != NULL)
 		qbox->module_ctx.super.sync_notify(box, uid, sync_type);
 
-	if (sync_type != MAILBOX_SYNC_TYPE_EXPUNGE || qbox->recalculate) {
+	if (sync_type != MAILBOX_SYNC_TYPE_EXPUNGE || qbox->recalculate ||
+	    (box->flags & MAILBOX_FLAG_DELETE_UNSAFE) != 0) {
 		if (uid == 0) {
 			/* free the transaction before view syncing begins,
 			   otherwise it'll crash. */
@@ -327,30 +393,52 @@ static void quota_mailbox_sync_notify(struct mailbox *box, uint32_t uid,
 		return;
 	}
 
-	/* we're in the middle of syncing the mailbox, so it's a bad idea to
-	   try and get the message sizes at this point. Rely on sizes that
-	   we saved earlier, or recalculate the whole quota if we don't know
-	   the size. */
-	if (!array_is_created(&qbox->expunge_uids)) {
-		i = count = 0;
-	} else {
-		uids = array_get(&qbox->expunge_uids, &count);
-		for (i = 0; i < count; i++) {
-			if (uids[i] == uid)
-				break;
-		}
-	}
-
 	if (qbox->expunge_qt == NULL) {
 		qbox->expunge_qt = quota_transaction_begin(box);
 		qbox->expunge_qt->sync_transaction =
 			qbox->sync_transaction_expunge;
+	}
+	if (qbox->expunge_qt->auto_updating) {
+		/* even though backend doesn't care about size/count changes,
+		   make sure count_used changes so quota_warnings are
+		   executed */
+		quota_free_bytes(qbox->expunge_qt, 0);
+		return;
+	}
+
+	/* we're in the middle of syncing the mailbox, so it's a bad idea to
+	   try and get the message sizes at this point. Rely on sizes that
+	   we saved earlier, or recalculate the whole quota if we don't know
+	   the size. */
+	if (!array_is_created(&qbox->expunge_uids) ||
+	    array_is_empty(&qbox->expunge_uids)) {
+		i = count = 0;
+	} else {
+		uids = array_get(&qbox->expunge_uids, &count);
+		for (i = qbox->prev_idx; i < count; i++) {
+			if (uids[i] == uid)
+				break;
+		}
+		if (i >= count) {
+			for (i = 0; i < qbox->prev_idx; i++) {
+				if (uids[i] == uid)
+					break;
+			}
+			if (i == qbox->prev_idx)
+				i = count;
+		}
+		qbox->prev_idx = i;
 	}
 
 	if (i != count) {
 		/* we already know the size */
 		sizep = array_idx(&qbox->expunge_sizes, i);
 		quota_free_bytes(qbox->expunge_qt, *sizep);
+		/* FIXME: it's not ideal that we do the vsize update here, but
+		   this is the easiest place for it for now.. maybe the mail
+		   size checking code could be moved to lib-storage */
+		if (ibox->vsize_update != NULL && quser->quota->set->vsizes)
+			index_mailbox_vsize_hdr_expunge(ibox->vsize_update, uid, *sizep);
 		return;
 	}
 
@@ -364,17 +452,26 @@ static void quota_mailbox_sync_notify(struct mailbox *box, uint32_t uid,
 		if (box->tmp_sync_view != NULL)
 			box->view = box->tmp_sync_view;
 		qbox->expunge_trans = mailbox_transaction_begin(box, 0);
+		mailbox_transaction_set_reason(qbox->expunge_trans, "quota");
 		box->view = box_view;
 		qbox->expunge_qt->tmp_mail =
 			mail_alloc(qbox->expunge_trans,
 				   MAIL_FETCH_PHYSICAL_SIZE, NULL);
 	}
-	if (mail_set_uid(qbox->expunge_qt->tmp_mail, uid) &&
-	    mail_get_physical_size(qbox->expunge_qt->tmp_mail, &size) == 0)
+	if (!mail_set_uid(qbox->expunge_qt->tmp_mail, uid))
+		;
+	else if (!quser->quota->set->vsizes) {
+		if (mail_get_physical_size(qbox->expunge_qt->tmp_mail, &size) == 0) {
+			quota_free_bytes(qbox->expunge_qt, size);
+			return;
+		}
+	} else if (mail_get_virtual_size(qbox->expunge_qt->tmp_mail, &size) == 0) {
 		quota_free_bytes(qbox->expunge_qt, size);
-	else {
+		if (ibox->vsize_update != NULL)
+			index_mailbox_vsize_hdr_expunge(ibox->vsize_update, uid, size);
+	} else {
 		/* there's no way to get the size. recalculate the quota. */
-		quota_recalculate(qbox->expunge_qt);
+		quota_recalculate(qbox->expunge_qt, QUOTA_RECALCULATE_MISSING_FREES);
 		qbox->recalculate = TRUE;
 	}
 }
@@ -479,7 +576,7 @@ struct quota *quota_get_mail_user_quota(struct mail_user *user)
 {
 	struct quota_user *quser = QUOTA_USER_CONTEXT(user);
 
-	return quser->quota;
+	return quser == NULL ? NULL : quser->quota;
 }
 
 static void quota_user_deinit(struct mail_user *user)
@@ -550,11 +647,10 @@ void quota_mailbox_list_created(struct mailbox_list *list)
 	struct mail_user *quota_user;
 	bool add;
 
-	if (QUOTA_USER_CONTEXT(list->ns->user) == NULL)
-		return;
-
 	/* see if we have a quota explicitly defined for this namespace */
 	quota = quota_get_mail_user_quota(list->ns->user);
+	if (quota == NULL)
+		return;
 	root = quota_find_root_for_ns(quota, list->ns);
 	if (root != NULL) {
 		/* explicit quota root */
@@ -587,6 +683,7 @@ void quota_mailbox_list_created(struct mailbox_list *list)
 		MODULE_CONTEXT_SET(list, quota_mailbox_list_module, qlist);
 
 		quota = quota_get_mail_user_quota(quota_user);
+		i_assert(quota != NULL);
 		quota_add_user_namespace(quota, list->ns);
 	}
 }
@@ -624,11 +721,12 @@ void quota_mail_namespaces_created(struct mail_namespace *namespaces)
 	struct quota_root *const *roots;
 	unsigned int i, count;
 
-	if (QUOTA_USER_CONTEXT(namespaces->user) == NULL)
-		return;
-
 	quota = quota_get_mail_user_quota(namespaces->user);
+	if (quota == NULL)
+		return;
 	roots = array_get(&quota->roots, &count);
 	for (i = 0; i < count; i++)
 		quota_root_set_namespace(roots[i], namespaces);
+
+	quota_over_flag_check_startup(quota);
 }

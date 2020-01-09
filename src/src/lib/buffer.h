@@ -18,6 +18,14 @@ void buffer_create_from_data(buffer_t *buffer, void *data, size_t size);
 /* Create a non-modifiable buffer from given data. */
 void buffer_create_from_const_data(buffer_t *buffer,
 				   const void *data, size_t size);
+#if defined(__GNUC__) && (__GNUC__ * 100 + __GNUC_MINOR__) > 401
+#define buffer_create_from_data(b,d,s) ({					\
+	(void)COMPILE_ERROR_IF_TRUE(__builtin_object_size((d),1) < ((s)>0?(s):1)); \
+	buffer_create_from_data((b), (d), (s)); })
+#define buffer_create_from_const_data(b,d,s) ({					\
+	(void)COMPILE_ERROR_IF_TRUE(__builtin_object_size((d),1) < ((s)>0?(s):1)); \
+	buffer_create_from_const_data((b), (d), (s)); })
+#endif
 /* Creates a dynamically growing buffer. Whenever write would exceed the
    current size it's grown. */
 buffer_t *buffer_create_dynamic(pool_t pool, size_t init_size);
@@ -34,7 +42,8 @@ pool_t buffer_get_pool(const buffer_t *buf) ATTR_PURE;
 /* Reset the buffer. used size and it's contents are zeroed. */
 void buffer_reset(buffer_t *buf);
 
-/* Write data to buffer at specified position. */
+/* Write data to buffer at specified position. If pos is beyond the buffer's
+   current size, it is zero-filled up to that point (even if data_size==0). */
 void buffer_write(buffer_t *buf, size_t pos,
 		  const void *data, size_t data_size);
 /* Append data to buffer. */
@@ -78,11 +87,17 @@ void *buffer_get_modifiable_data(const buffer_t *buf, size_t *used_size_r)
 	ATTR_NULL(2);
 
 /* Set the "used size" of buffer, ie. 0 would set the buffer empty.
-   Must not be used to grow buffer. */
+   Must not be used to grow buffer. The data after the buffer's new size will
+   be effectively lost, because e.g. buffer_get_space_unsafe() will zero out
+   the contents. */
 void buffer_set_used_size(buffer_t *buf, size_t used_size);
 
 /* Returns the current buffer size. */
 size_t buffer_get_size(const buffer_t *buf) ATTR_PURE;
+/* Returns how many bytes we can write to buffer without increasing its size.
+   With dynamic buffers this is buffer_get_size()-1, because the extra 1 byte
+   is reserved for str_c()'s NUL. */
+size_t buffer_get_writable_size(const buffer_t *buf) ATTR_PURE;
 
 /* Returns TRUE if buffer contents are identical. */
 bool buffer_cmp(const buffer_t *buf1, const buffer_t *buf2);
@@ -109,5 +124,30 @@ buffer_get_used_size(const buffer_t *buf)
    increase the buffer size here, instead of crashing only randomly when the
    buffer needs to be increased. */
 void buffer_verify_pool(buffer_t *buf);
+
+/* This will truncate your byte buffer to contain at most
+   given number of bits. 
+
+ 1 bits:    01 00000001
+ 2 bits:    03 00000011
+ 3 bits:    07 00000111
+ 4 bits:    0f 00001111
+ 5 bits:    1f 00011111
+ 6 bits:    3f 00111111
+ 7 bits:    7f 01111111
+ 8 bits:    ff 11111111
+ 9 bits:  01ff 0000000111111111
+10 bits:  03ff 0000001111111111
+11 bits:  07ff 0000011111111111
+12 bits:  0fff 0000111111111111
+13 bits:  1fff 0001111111111111
+14 bits:  3fff 0011111111111111
+15 bits:  7fff 0111111111111111
+16 bits:  ffff 1111111111111111
+
+ and so forth
+
+*/
+void buffer_truncate_rshift_bits(buffer_t *buf, size_t bits);
 
 #endif

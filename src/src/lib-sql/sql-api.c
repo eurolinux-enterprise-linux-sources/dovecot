@@ -1,12 +1,17 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "ioloop.h"
+#include "str.h"
 #include "sql-api-private.h"
 
-#include <stdlib.h>
 #include <time.h>
+
+struct default_sql_prepared_statement {
+	struct sql_prepared_statement prep_stmt;
+	char *query_template;
+};
 
 struct sql_db_module_register sql_db_module_register = { 0 };
 ARRAY_TYPE(sql_drivers) sql_drivers;
@@ -126,6 +131,12 @@ const char *sql_escape_string(struct sql_db *db, const char *string)
 	return db->v.escape_string(db, string);
 }
 
+const char *sql_escape_blob(struct sql_db *db,
+			    const unsigned char *data, size_t size)
+{
+	return db->v.escape_blob(db, data, size);
+}
+
 void sql_exec(struct sql_db *db, const char *query)
 {
 	db->v.exec(db, query);
@@ -141,6 +152,226 @@ void sql_query(struct sql_db *db, const char *query,
 struct sql_result *sql_query_s(struct sql_db *db, const char *query)
 {
 	return db->v.query_s(db, query);
+}
+
+static struct sql_prepared_statement *
+default_sql_prepared_statement_init(struct sql_db *db,
+				    const char *query_template)
+{
+	struct default_sql_prepared_statement *prep_stmt;
+
+	prep_stmt = i_new(struct default_sql_prepared_statement, 1);
+	prep_stmt->prep_stmt.db = db;
+	prep_stmt->query_template = i_strdup(query_template);
+	return &prep_stmt->prep_stmt;
+}
+
+static void
+default_sql_prepared_statement_deinit(struct sql_prepared_statement *_prep_stmt)
+{
+	struct default_sql_prepared_statement *prep_stmt =
+		(struct default_sql_prepared_statement *)_prep_stmt;
+
+	i_free(prep_stmt->query_template);
+	i_free(prep_stmt);
+}
+
+static struct sql_statement *
+default_sql_statement_init_prepared(struct sql_prepared_statement *_stmt)
+{
+	struct default_sql_prepared_statement *stmt =
+		(struct default_sql_prepared_statement *)_stmt;
+	return sql_statement_init(_stmt->db, stmt->query_template);
+}
+
+const char *sql_statement_get_query(struct sql_statement *stmt)
+{
+	string_t *query = t_str_new(128);
+	const char *const *args;
+	unsigned int i, args_count, arg_pos = 0;
+
+	args = array_get(&stmt->args, &args_count);
+
+	for (i = 0; stmt->query_template[i] != '\0'; i++) {
+		if (stmt->query_template[i] == '?') {
+			if (arg_pos >= args_count ||
+			    args[arg_pos] == NULL) {
+				i_panic("lib-sql: Missing bind for arg #%u in statement: %s",
+					arg_pos, stmt->query_template);
+			}
+			str_append(query, args[arg_pos++]);
+		} else {
+			str_append_c(query, stmt->query_template[i]);
+		}
+	}
+	if (arg_pos != args_count) {
+		i_panic("lib-sql: Too many bind args (%u) for statement: %s",
+			args_count, stmt->query_template);
+	}
+	return str_c(query);
+}
+
+static void
+default_sql_statement_query(struct sql_statement *stmt,
+			    sql_query_callback_t *callback, void *context)
+{
+	sql_query(stmt->db, sql_statement_get_query(stmt),
+		  callback, context);
+	pool_unref(&stmt->pool);
+}
+
+static struct sql_result *
+default_sql_statement_query_s(struct sql_statement *stmt)
+{
+	struct sql_result *result =
+		sql_query_s(stmt->db, sql_statement_get_query(stmt));
+	pool_unref(&stmt->pool);
+	return result;
+}
+
+static void default_sql_update_stmt(struct sql_transaction_context *ctx,
+				    struct sql_statement *stmt,
+				    unsigned int *affected_rows)
+{
+	ctx->db->v.update(ctx, sql_statement_get_query(stmt),
+			  affected_rows);
+	pool_unref(&stmt->pool);
+}
+
+struct sql_prepared_statement *
+sql_prepared_statement_init(struct sql_db *db, const char *query_template)
+{
+	if (db->v.prepared_statement_init != NULL)
+		return db->v.prepared_statement_init(db, query_template);
+	else
+		return default_sql_prepared_statement_init(db, query_template);
+}
+
+void sql_prepared_statement_deinit(struct sql_prepared_statement **_prep_stmt)
+{
+	struct sql_prepared_statement *prep_stmt = *_prep_stmt;
+
+	*_prep_stmt = NULL;
+	if (prep_stmt->db->v.prepared_statement_deinit != NULL)
+		prep_stmt->db->v.prepared_statement_deinit(prep_stmt);
+	else
+		default_sql_prepared_statement_deinit(prep_stmt);
+}
+
+static void
+sql_statement_init_fields(struct sql_statement *stmt, struct sql_db *db)
+{
+	stmt->db = db;
+	p_array_init(&stmt->args, stmt->pool, 8);
+}
+
+struct sql_statement *
+sql_statement_init(struct sql_db *db, const char *query_template)
+{
+	struct sql_statement *stmt;
+
+	if (db->v.statement_init != NULL)
+		stmt = db->v.statement_init(db, query_template);
+	else {
+		pool_t pool = pool_alloconly_create("sql statement", 1024);
+		stmt = p_new(pool, struct sql_statement, 1);
+		stmt->pool = pool;
+	}
+	stmt->query_template = p_strdup(stmt->pool, query_template);
+	sql_statement_init_fields(stmt, db);
+	return stmt;
+}
+
+struct sql_statement *
+sql_statement_init_prepared(struct sql_prepared_statement *prep_stmt)
+{
+	struct sql_statement *stmt;
+
+	if (prep_stmt->db->v.statement_init_prepared == NULL)
+		return default_sql_statement_init_prepared(prep_stmt);
+
+	stmt = prep_stmt->db->v.statement_init_prepared(prep_stmt);
+	sql_statement_init_fields(stmt, prep_stmt->db);
+	return stmt;
+}
+
+void sql_statement_abort(struct sql_statement **_stmt)
+{
+	struct sql_statement *stmt = *_stmt;
+
+	*_stmt = NULL;
+	if (stmt->db->v.statement_abort != NULL)
+		stmt->db->v.statement_abort(stmt);
+	pool_unref(&stmt->pool);
+}
+
+void sql_statement_set_timestamp(struct sql_statement *stmt,
+				 const struct timespec *ts)
+{
+	if (stmt->db->v.statement_set_timestamp != NULL)
+		stmt->db->v.statement_set_timestamp(stmt, ts);
+}
+
+void sql_statement_bind_str(struct sql_statement *stmt,
+			    unsigned int column_idx, const char *value)
+{
+	const char *escaped_value =
+		p_strdup_printf(stmt->pool, "'%s'",
+				sql_escape_string(stmt->db, value));
+	array_idx_set(&stmt->args, column_idx, &escaped_value);
+
+	if (stmt->db->v.statement_bind_str != NULL)
+		stmt->db->v.statement_bind_str(stmt, column_idx, value);
+}
+
+void sql_statement_bind_binary(struct sql_statement *stmt,
+			       unsigned int column_idx, const void *value,
+			       size_t value_size)
+{
+	const char *value_str =
+		p_strdup_printf(stmt->pool, "%s",
+				sql_escape_blob(stmt->db, value, value_size));
+	array_idx_set(&stmt->args, column_idx, &value_str);
+
+	if (stmt->db->v.statement_bind_binary != NULL) {
+		stmt->db->v.statement_bind_binary(stmt, column_idx,
+						  value, value_size);
+	}
+}
+
+void sql_statement_bind_int64(struct sql_statement *stmt,
+			      unsigned int column_idx, int64_t value)
+{
+	const char *value_str = p_strdup_printf(stmt->pool, "%lld",
+						(long long)value);
+	array_idx_set(&stmt->args, column_idx, &value_str);
+
+	if (stmt->db->v.statement_bind_int64 != NULL)
+		stmt->db->v.statement_bind_int64(stmt, column_idx, value);
+}
+
+#undef sql_statement_query
+void sql_statement_query(struct sql_statement **_stmt,
+			 sql_query_callback_t *callback, void *context)
+{
+	struct sql_statement *stmt = *_stmt;
+
+	*_stmt = NULL;
+	if (stmt->db->v.statement_query != NULL)
+		stmt->db->v.statement_query(stmt, callback, context);
+	else
+		default_sql_statement_query(stmt, callback, context);
+}
+
+struct sql_result *sql_statement_query_s(struct sql_statement **_stmt)
+{
+	struct sql_statement *stmt = *_stmt;
+
+	*_stmt = NULL;
+	if (stmt->db->v.statement_query_s != NULL)
+		return stmt->db->v.statement_query_s(stmt);
+	else
+		return default_sql_statement_query_s(stmt);
 }
 
 void sql_result_ref(struct sql_result *result)
@@ -273,6 +504,32 @@ int sql_result_next_row(struct sql_result *result)
 	return 1;
 }
 
+#undef sql_result_more
+void sql_result_more(struct sql_result **result,
+		     sql_query_callback_t *callback, void *context)
+{
+	i_assert((*result)->v.more != NULL);
+
+	(*result)->v.more(result, TRUE, callback, context);
+}
+
+static void
+sql_result_more_sync_callback(struct sql_result *result, void *context)
+{
+	struct sql_result **dest_result = context;
+
+	*dest_result = result;
+}
+
+void sql_result_more_s(struct sql_result **result)
+{
+	i_assert((*result)->v.more != NULL);
+
+	(*result)->v.more(result, FALSE, sql_result_more_sync_callback, result);
+	/* the callback must have been called */
+	i_assert(*result != NULL);
+}
+
 unsigned int sql_result_get_fields_count(struct sql_result *result)
 {
 	return result->v.get_fields_count(result);
@@ -318,6 +575,11 @@ const char *sql_result_get_error(struct sql_result *result)
 	return result->v.get_error(result);
 }
 
+enum sql_result_error_type sql_result_get_error_type(struct sql_result *result)
+{
+	return result->error_type;
+}
+
 static void
 sql_result_not_connected_free(struct sql_result *result ATTR_UNUSED)
 {
@@ -340,6 +602,20 @@ struct sql_transaction_context *sql_transaction_begin(struct sql_db *db)
 	return db->v.transaction_begin(db);
 }
 
+struct sql_commit1_wrap_ctx {
+	sql_commit_callback_t *callback;
+	void *context;
+};
+
+static void sql_commit1_wrap(const struct sql_commit_result *result,
+			     void *context)
+{
+	struct sql_commit1_wrap_ctx *ctx = context;
+
+	ctx->callback(result->error, ctx->context);
+	i_free(ctx);
+}
+
 #undef sql_transaction_commit
 void sql_transaction_commit(struct sql_transaction_context **_ctx,
 			    sql_commit_callback_t *callback, void *context)
@@ -347,7 +623,49 @@ void sql_transaction_commit(struct sql_transaction_context **_ctx,
 	struct sql_transaction_context *ctx = *_ctx;
 
 	*_ctx = NULL;
-	ctx->db->v.transaction_commit(ctx, callback, context);
+	if (ctx->db->v.transaction_commit != NULL)
+		ctx->db->v.transaction_commit(ctx, callback, context);
+	else {
+		struct sql_commit1_wrap_ctx *wrap;
+
+		wrap = i_new(struct sql_commit1_wrap_ctx, 1);
+		wrap->callback = callback;
+		wrap->context = context;
+		ctx->db->v.transaction_commit2(ctx, sql_commit1_wrap, wrap);
+	}
+}
+
+struct sql_commit2_wrap_ctx {
+	sql_commit2_callback_t *callback;
+	void *context;
+};
+
+static void sql_commit2_wrap(const char *error, void *context)
+{
+	struct sql_commit2_wrap_ctx *ctx = context;
+	struct sql_commit_result result = { .error = error };
+
+	ctx->callback(&result, ctx->context);
+	i_free(ctx);
+}
+
+#undef sql_transaction_commit2
+void sql_transaction_commit2(struct sql_transaction_context **_ctx,
+			     sql_commit2_callback_t *callback, void *context)
+{
+	struct sql_transaction_context *ctx = *_ctx;
+
+	*_ctx = NULL;
+	if (ctx->db->v.transaction_commit2 != NULL)
+		ctx->db->v.transaction_commit2(ctx, callback, context);
+	else {
+		struct sql_commit2_wrap_ctx *wrap;
+
+		wrap = i_new(struct sql_commit2_wrap_ctx, 1);
+		wrap->callback = callback;
+		wrap->context = context;
+		ctx->db->v.transaction_commit(ctx, sql_commit2_wrap, wrap);
+	}
 }
 
 int sql_transaction_commit_s(struct sql_transaction_context **_ctx,
@@ -372,10 +690,35 @@ void sql_update(struct sql_transaction_context *ctx, const char *query)
 	ctx->db->v.update(ctx, query, NULL);
 }
 
+void sql_update_stmt(struct sql_transaction_context *ctx,
+		     struct sql_statement **_stmt)
+{
+	struct sql_statement *stmt = *_stmt;
+
+	*_stmt = NULL;
+	if (ctx->db->v.update_stmt != NULL)
+		ctx->db->v.update_stmt(ctx, stmt, NULL);
+	else
+		default_sql_update_stmt(ctx, stmt, NULL);
+}
+
 void sql_update_get_rows(struct sql_transaction_context *ctx, const char *query,
 			 unsigned int *affected_rows)
 {
 	ctx->db->v.update(ctx, query, affected_rows);
+}
+
+void sql_update_stmt_get_rows(struct sql_transaction_context *ctx,
+			      struct sql_statement **_stmt,
+			      unsigned int *affected_rows)
+{
+	struct sql_statement *stmt = *_stmt;
+
+	*_stmt = NULL;
+	if (ctx->db->v.update_stmt != NULL)
+		ctx->db->v.update_stmt(ctx, stmt, affected_rows);
+	else
+		default_sql_update_stmt(ctx, stmt, affected_rows);
 }
 
 void sql_db_set_state(struct sql_db *db, enum sql_db_state state)
@@ -414,7 +757,8 @@ struct sql_result sql_not_connected_result = {
 		sql_result_not_connected_free,
 		sql_result_not_connected_next_row,
 		NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-		sql_result_not_connected_get_error
+		sql_result_not_connected_get_error,
+		NULL,
 	},
 	.failed_try_retry = TRUE
 };

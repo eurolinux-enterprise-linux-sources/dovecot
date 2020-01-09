@@ -60,12 +60,19 @@ service director {
     mode = 0600
     user = $default_login_user
   }
+  # NOTE: director-userdb socket is actually used only for passdb lookups, not
+userdb lookups
   unix_listener director-userdb {
     mode = 0600
   }
   inet_listener {
     port = 9090
   }
+  ## uncomment this if you want to use
+  ## doveadm director status -a ip:9091
+  #inet_listener director-doveadm {
+  #   port = 9091
+  #}
 }
 ---%<-------------------------------------------------------------------------
 
@@ -85,6 +92,12 @@ You can use:
 
 You can also add :port after the IP/host. The default port is the same as what
 director service's inet_listener is using (the port 9090 above).
+
+Note that the same director must not be listed multiple times with different
+IPs. This especially means that a hostname can't expand to both IPv4 and IPv6
+address. Otherwise Dovecot becomes confused about what directors actually
+exist. This also means that a single director ring must use either IPv4 or IPv6
+addresses, but not both at the same time.
 
 For example if you have 3 directors, you could set:
 
@@ -124,6 +137,14 @@ service pop3-login {
 }
 ---%<-------------------------------------------------------------------------
 
+Consistent hashing should be enabled for new director clusters. It's not
+possible to change this setting without a complete director cluster shutdown.
+Using it reduces users being moved around when doing backend changes.
+
+---%<-------------------------------------------------------------------------
+director_consistent_hashing = yes # Supported by v2.2.16+
+---%<-------------------------------------------------------------------------
+
 If you want to enable director for LMTP, also set:
 
 ---%<-------------------------------------------------------------------------
@@ -132,6 +153,8 @@ If you want to enable director for LMTP, also set:
 lmtp_proxy = yes
 
 protocol lmtp {
+  # NOTE: director-userdb socket is actually used only for passdb lookups, not
+userdb lookups
   auth_socket_path = director-userdb
 }
 
@@ -158,13 +181,13 @@ haven't yet expired. You can configure this setting from:
 director_user_expire = 15 min
 ---%<-------------------------------------------------------------------------
 
-'doveadm director move' needs to be able to connect to the 'ipc' socket. Make
-sure the director process can do it:
+'doveadm director kick' and 'doveadm director move' need to be able to connect
+to the 'ipc' socket. Make sure the director process can do it:
 
 ---%<-------------------------------------------------------------------------
 service ipc {
   unix_listener ipc {
-    user = dovecot
+    user = dovecot # This is already the default in v2.3.1+
   }
 }
 ---%<-------------------------------------------------------------------------
@@ -223,6 +246,8 @@ The director also needs the following configuration:
 doveadm_proxy_port = 24245
 
 protocol doveadm {
+  # NOTE: director-userdb socket is actually used only for passdb lookups, not
+userdb lookups
   auth_socket_path = director-userdb
 }
 ---%<-------------------------------------------------------------------------
@@ -243,13 +268,15 @@ Forcefully moving users to a different backend
 This is useful if you need to do maintenance on one of the backend servers and
 want (active) clients to move to a different backend:
 
- 1. Disable any system that will undo changes you make to backend server
-    weights, such as poolmon.
+ 1. Disable any watchdog system that will undo changes you make to backend
+    server weights, such as poolmon.
+     * Not needed if the watchdog is new enough to use HOST-UP/HOST-DOWN
+       commands rather than change weights.
  2. Set the weight of the backend server to be worked on to 0: 'doveadm
     director add <backend server ip> 0'
- 3. Flush current assignments to disable new connections to this server:
+ 3. Flush current assignments to disable new connections to this backend:
     'doveadm director flush <backend server ip>'
- 4. *From the backend server* close all open sessions: 'doveadm kick 0.0.0.0/0'
+     * This will also kick the existing connections to the backend in v2.2.19+.
 
 Most IMAP clients will silently just reconnect to the (new backend) server
 after being kicked (at least Apple Mail 6.0 and Thunderbird 14.0).
@@ -259,4 +286,81 @@ For moving specific users to other servers (e.g. because there are too many
 move' command in v2.0.14+. This requires the ipc permissions to be configured
 correctly (see above).
 
-(This file was created from the wiki on 2013-12-19 04:42)
+Tags
+----
+
+(Requires v2.2.16+)
+
+*WARNING*: This feature isn't working perfectly in v2.2.26.1 and older. If two
+users with different tags have the same 32bit hash, they may end up going to
+the wrong tag's backend.
+
+With tags you can use a single director ring to serve multiple backend
+clusters. Each backend cluster is assigned a tag name, which can be anything
+you want. By default everything has an empty tag. A passdb lookup can return
+"director_tag" field containing the wanted tag name. If there aren't any
+backend servers with the wanted tag, it's treated the same as if there aren't
+any backend servers available (= wait for 30 secs for a backend and then return
+temporary failure).
+
+Tags can be added to configuration by adding @tag suffix to IPs/hosts. For
+example:
+
+---%<-------------------------------------------------------------------------
+director_mail_servers = 10.0.0.100-10.0.0.110@name1 10.0.0.120@name2
+---%<-------------------------------------------------------------------------
+
+"doveadm director add" can also add tags either with @tag suffix or with -t
+parameter. "doveadm director status user@domain" requires giving the user's
+correct tag with -t parameter or the results won't be correct (empty tag's
+results are shown). Tags can't currently be changed for an existing host
+without removing it first.
+
+Director and Backend in same server (broken)
+--------------------------------------------
+
+NOTE: This feature never actually worked. It would require further development
+to fix (director would need to add "proxy" field to extra fields and notify
+auth that the auth_request can be freed).
+
+Have the passdb lookup return 'director_proxy_maybe=y'. LMTP however doesn't
+currently support mixing recipients to both being proxied and store locally.
+
+Flush socket
+------------
+
+(Requires v2.2.26+)
+
+This allows calling a script for each user (hash) that is moved between
+backends. This is triggered by "doveadm director move" and "doveadm director
+flush" commands. What happens is:
+
+ * User's connections are kicked from the director cluster
+ * Flush socket is called and waited on.
+ * User logins are delayed until the flush socket is finished, or the user move
+   times out after 30 seconds (hardcoded).
+ * Only the director that initiated the doveadm command will call the flush
+   socket.
+    * director_user_kick_delay is ignored by the initiating director, but used
+      by the other directors.
+
+Configuration:
+
+---%<-------------------------------------------------------------------------
+director_flush_script = user-flush
+service user-flush {
+  executable = script /usr/local/bin/user-flush.sh
+  unix_listener user-flush {
+    user = dovecot
+  }
+}
+---%<-------------------------------------------------------------------------
+
+The user-flush.sh will receive as parameters:
+
+ * "FLUSH"
+ * username hash
+ * old host's IP
+ * new host's IP
+
+(This file was created from the wiki on 2018-05-23 04:42)

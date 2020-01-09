@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -11,7 +11,6 @@
 #include "notify-plugin.h"
 #include "mail-log-plugin.h"
 
-#include <stdlib.h>
 
 #define MAILBOX_NAME_LOG_LEN 64
 #define HEADER_LOG_LEN 80
@@ -79,6 +78,7 @@ struct mail_log_user {
 
 	enum mail_log_field fields;
 	enum mail_log_event events;
+	bool cached_only;
 };
 
 struct mail_log_message {
@@ -166,6 +166,9 @@ static void mail_log_mail_user_created(struct mail_user *user)
 	str = mail_user_plugin_getenv(user, "mail_log_events");
 	muser->events = str == NULL ? MAIL_LOG_DEFAULT_EVENTS :
 		mail_log_parse_events(str);
+
+	muser->cached_only =
+		mail_user_plugin_getenv(user, "mail_log_cached_only") != NULL;
 }
 
 static void mail_log_append_mailbox_name(string_t *str, struct mail *mail)
@@ -264,6 +267,8 @@ mail_log_append_mail_message_real(struct mail_log_mail_txn_context *ctx,
 			   this consistently with all mailbox formats */
 			mail_log_append_uid(ctx, msg, text, 0);
 		}
+		/* make sure UID is assigned to this mail */
+		mail->transaction->flags |= MAILBOX_TRANSACTION_FLAG_ASSIGN_UIDS;
 		str_append(text, ", ");
 	}
 	if ((muser->fields & MAIL_LOG_FIELD_MSGID) != 0) {
@@ -332,7 +337,12 @@ mail_log_append_mail_message(struct mail_log_mail_txn_context *ctx,
 	}
 
 	T_BEGIN {
+		enum mail_lookup_abort orig_lookup_abort = mail->lookup_abort;
+
+		if (event != MAIL_LOG_EVENT_SAVE && muser->cached_only)
+			mail->lookup_abort = MAIL_LOOKUP_ABORT_NOT_IN_CACHE;
 		mail_log_append_mail_message_real(ctx, mail, event, desc);
+		mail->lookup_abort = orig_lookup_abort;
 	} T_END;
 }
 
@@ -380,9 +390,10 @@ static void mail_log_mail_expunge(void *txn, struct mail *mail)
 {
 	struct mail_log_mail_txn_context *ctx =
 		(struct mail_log_mail_txn_context *)txn;
-	
+	struct mail_private *p = (struct mail_private*)mail;
+
 	mail_log_append_mail_message(ctx, mail, MAIL_LOG_EVENT_EXPUNGE,
-				     "expunge");
+				     p->autoexpunged ? "autoexpunge" : "expunge");
 }
 
 static void mail_log_mail_update_flags(void *txn, struct mail *mail,

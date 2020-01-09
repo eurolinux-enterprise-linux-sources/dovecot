@@ -1,26 +1,38 @@
+if HAVE_LDAP
+LIB_LDAP=lib-ldap
+endif
+
 LIBDOVECOT_SUBDIRS = \
 	lib-test \
 	lib \
 	lib-settings \
 	lib-auth \
+	lib-dns \
 	lib-master \
 	lib-charset \
-	lib-dns \
+	lib-ssl-iostream \
+	lib-dcrypt \
 	lib-dict \
 	lib-sasl \
-	lib-ssl-iostream \
+	lib-stats \
 	lib-http \
 	lib-fs \
 	lib-mail \
+	lib-smtp \
 	lib-imap \
-	lib-imap-storage
+	lib-imap-storage \
+	lib-program-client \
+	lib-oauth2
 
 SUBDIRS = \
 	$(LIBDOVECOT_SUBDIRS) \
+	lib-dict-extra \
+	lib-dovecot \
+	$(LIB_LDAP) \
+	lib-fts \
 	lib-imap-client \
 	lib-imap-urlauth \
 	lib-compression \
-	lib-dovecot \
 	lib-index \
 	lib-storage \
 	lib-sql \
@@ -35,6 +47,7 @@ SUBDIRS = \
 	ipc \
 	master \
 	login-common \
+	imap-hibernate \
 	imap-login \
 	imap \
 	imap-urlauth \

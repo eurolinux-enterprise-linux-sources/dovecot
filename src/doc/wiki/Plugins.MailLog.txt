@@ -4,7 +4,7 @@ Mail logger plugin
 This plugin can be used to log several actions done in a mail session:
 
  * Setting and removing \Deleted flag
- * Expunging
+ * Expunging (includes autoexpunge)
  * Copying mails to another mailbox
  * Mailbox creations
  * Mailbox deletions
@@ -17,7 +17,7 @@ example:
 
 ---%<-------------------------------------------------------------------------
 imap(user): copy -> Trash: uid=908, msgid=<123.foo@bar>
-imap(user): deleted: uid=908, msgid=<123.foo@bar>
+imap(user): delete: uid=908, msgid=<123.foo@bar>
 imap(user): expunged: uid=908, msgid=<123.foo@bar>
 ---%<-------------------------------------------------------------------------
 
@@ -37,12 +37,18 @@ You can configure what and how mail_log plugin logs:
 
 ---%<-------------------------------------------------------------------------
 plugin {
-  # Events to log. Also available: flag_change save mailbox_create
+  # Events to log. Defined in src/plugins/mail-log/mail-log-plugin.c - also
+available: flag_change save mailbox_create
+  # autoexpunge is included in expunge
   mail_log_events = delete undelete expunge copy mailbox_delete mailbox_rename
 
-  # Also available: flags vsize from subject
+  # Also available: Defined in src/plugins/mail-log/mail-log-plugin.c - flags
+vsize from subject
   mail_log_fields = uid box msgid size
+
+  # Don't log fields that require opening the email (v2.2.28+).
+  #mail_log_cached_only = yes
 }
 ---%<-------------------------------------------------------------------------
 
-(This file was created from the wiki on 2013-12-19 04:42)
+(This file was created from the wiki on 2018-05-23 04:42)

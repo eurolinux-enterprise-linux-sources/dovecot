@@ -19,9 +19,11 @@ libstorage_index_la_SOURCES = \
 	index-mail.c \
 	index-mail-binary.c \
 	index-mail-headers.c \
-	index-mailbox-check.c \
+	index-mailbox-size.c \
+	index-pop3-uidl.c \
 	index-rebuild.c \
 	index-search.c \
+	index-search-mime.c \
 	index-search-result.c \
 	index-sort.c \
 	index-sort-string.c \
@@ -40,6 +42,8 @@ headers = \
 	istream-mail.h \
 	index-attachment.h \
 	index-mail.h \
+	index-mailbox-size.h \
+	index-pop3-uidl.h \
 	index-rebuild.h \
 	index-search-private.h \
 	index-search-result.h \

@@ -1,12 +1,9 @@
 noinst_LTLIBRARIES = libdict.la
 noinst_LIBRARIES = libdict_backend.a
 
-dict_drivers = @dict_drivers@
-
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
-	-I$(top_srcdir)/src/lib-fs \
 	-I$(top_srcdir)/src/lib-sql \
 	-I$(top_srcdir)/src/lib-settings \
 	$(SQL_CFLAGS)
@@ -15,12 +12,10 @@ base_sources = \
 	dict.c \
 	dict-client.c \
 	dict-file.c \
-	dict-cdb.c \
-	dict-fs.c \
 	dict-memcached.c \
 	dict-memcached-ascii.c \
 	dict-redis.c \
-	dict-register.c \
+	dict-fail.c \
 	dict-transaction-memory.c
 
 libdict_la_SOURCES = \
@@ -28,6 +23,7 @@ libdict_la_SOURCES = \
 
 libdict_backend_a_SOURCES = \
 	dict-db.c \
+	dict-cdb.c \
 	dict-sql.c \
 	dict-sql-settings.c
 
@@ -88,7 +84,7 @@ test_libs = \
 	../lib/liblib.la
 
 test_dict_SOURCES = test-dict.c
-test_dict_LDADD = dict.lo $(test_libs)
+test_dict_LDADD = libdict.la $(test_libs)
 test_dict_DEPENDENCIES = $(noinst_LTLIBRARIES) $(test_libs)
 
 check: check-am check-test

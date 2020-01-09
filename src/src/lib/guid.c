@@ -1,7 +1,9 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "ioloop.h"
 #include "buffer.h"
+#include "str.h"
 #include "sha1.h"
 #include "hash.h"
 #include "hex-binary.h"
@@ -35,7 +37,7 @@ const char *guid_generate(void)
 }
 
 void guid_128_host_hash_get(const char *host,
-			    unsigned char hash_r[GUID_128_HOST_HASH_SIZE])
+			    unsigned char hash_r[STATIC_ARRAY GUID_128_HOST_HASH_SIZE])
 {
 	unsigned char full_hash[SHA1_RESULTLEN];
 
@@ -65,7 +67,15 @@ void guid_128_generate(guid_128_t guid_r)
 		guid_static[2] = (pid & 0x00ff0000) >> 16;
 		guid_static[3] = (pid & 0xff000000) >> 24;
 		guid_128_host_hash_get(my_hostdomain(), guid_static+4);
-	} else if ((uint32_t)ts.tv_nsec < (uint32_t)-1) {
+	} else if (ioloop_timeval.tv_sec > ts.tv_sec ||
+		   (ioloop_timeval.tv_sec == ts.tv_sec &&
+		    ioloop_timeval.tv_usec * 1000 > ts.tv_nsec)) {
+		/* use ioloop's time since we have it. it doesn't provide any
+		   more uniqueness, but it allows finding out more reliably
+		   when a GUID was created. */
+		ts.tv_sec = ioloop_timeval.tv_sec;
+		ts.tv_nsec = ioloop_timeval.tv_usec*1000;
+	} else if (ts.tv_nsec < 999999999L) {
 		ts.tv_nsec++;
 	} else {
 		ts.tv_sec++;
@@ -114,12 +124,51 @@ const char *guid_128_to_string(const guid_128_t guid)
 	return binary_to_hex(guid, GUID_128_SIZE);
 }
 
-unsigned int guid_128_hash(const uint8_t *guid)
+unsigned int guid_128_hash(const guid_128_t guid)
 {
 	return mem_hash(guid, GUID_128_SIZE);
 }
 
-int guid_128_cmp(const uint8_t *guid1, const uint8_t *guid2)
+int guid_128_cmp(const guid_128_t guid1, const guid_128_t guid2)
 {
 	return memcmp(guid1, guid2, GUID_128_SIZE);
+}
+
+const char *guid_128_to_uuid_string(const guid_128_t guid, enum uuid_format format)
+{
+	switch(format) {
+	case FORMAT_COMPACT:
+		return guid_128_to_string(guid);
+	case FORMAT_RECORD:
+		return t_strdup_printf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+				guid[0], guid[1], guid[2], guid[3], guid[4],
+				guid[5], guid[6], guid[7], guid[8], guid[9],
+				guid[10], guid[11], guid[12], guid[13], guid[14],
+				guid[15]);
+	case FORMAT_MICROSOFT:
+		return t_strdup_printf("{%s}", guid_128_to_uuid_string(guid, FORMAT_RECORD));
+	}
+	i_unreached();
+}
+
+int guid_128_from_uuid_string(const char *str, guid_128_t guid_r)
+{
+	size_t i,len,m=0;
+	int ret;
+	T_BEGIN {
+		len = strlen(str);
+		string_t *str2 = t_str_new(len);
+		for(i=0; i < len; i++) {
+			/* Microsoft format */
+			if (i==0 && str[i] == '{') { m=1; continue; }
+			else if (i == len-1 && str[i] == '}') continue;
+			/* 8-4-4-4-12 */
+			if (((i==8+m) || (i==13+m) || (i==18+m) || (i==23+m)) &&
+			    str[i] == '-') continue;
+			str_append_c(str2, str[i]);
+		}
+		ret = guid_128_from_string(str_c(str2), guid_r);
+	} T_END;
+
+	return ret;
 }

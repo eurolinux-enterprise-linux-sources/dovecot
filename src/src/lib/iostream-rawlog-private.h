@@ -1,20 +1,15 @@
 #ifndef IOSTREAM_RAWLOG_PRIVATE_H
 #define IOSTREAM_RAWLOG_PRIVATE_H
 
-#define IOSTREAM_RAWLOG_MAX_PREFIX_LEN 3
+#include "iostream-rawlog.h"
 
-enum iostream_rawlog_flags {
-	IOSTREAM_RAWLOG_FLAG_AUTOCLOSE	= 0x01,
-	IOSTREAM_RAWLOG_FLAG_BUFFERED	= 0x02,
-	IOSTREAM_RAWLOG_FLAG_TIMESTAMP	= 0x04
-};
+#define IOSTREAM_RAWLOG_MAX_PREFIX_LEN 3
 
 struct rawlog_iostream {
 	struct iostream_private *iostream;
 	enum iostream_rawlog_flags flags;
 
-	char *rawlog_path;
-	int rawlog_fd;
+	struct ostream *rawlog_output;
 	buffer_t *buffer;
 
 	bool input;

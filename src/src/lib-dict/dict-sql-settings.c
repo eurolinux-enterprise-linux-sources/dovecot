@@ -1,8 +1,9 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "str.h"
+#include "hash.h"
 #include "settings.h"
 #include "dict-sql-settings.h"
 
@@ -15,7 +16,8 @@ enum section_type {
 };
 
 struct dict_sql_map_field {
-	const char *sql_field, *variable;
+	struct dict_sql_field sql_field;
+	const char *variable;
 };
 
 struct setting_parser_ctx {
@@ -28,15 +30,26 @@ struct setting_parser_ctx {
 };
 
 #define DEF_STR(name) DEF_STRUCT_STR(name, dict_sql_map)
+#define DEF_BOOL(name) DEF_STRUCT_BOOL(name, dict_sql_map)
 
 static const struct setting_def dict_sql_map_setting_defs[] = {
 	DEF_STR(pattern),
 	DEF_STR(table),
 	DEF_STR(username_field),
 	DEF_STR(value_field),
+	DEF_STR(value_type),
+	DEF_BOOL(value_hexblob),
 
 	{ 0, NULL, 0 }
 };
+
+struct dict_sql_settings_cache {
+	pool_t pool;
+	const char *path;
+	struct dict_sql_settings *set;
+};
+
+static HASH_TABLE(const char *, struct dict_sql_settings_cache *) dict_sql_settings_cache;
 
 static const char *pattern_read_name(const char **pattern)
 {
@@ -118,14 +131,55 @@ static const char *dict_sql_fields_map(struct setting_parser_ctx *ctx)
 	return NULL;
 }
 
+static bool
+dict_sql_value_type_parse(const char *value_type, enum dict_sql_type *type_r)
+{
+	if (strcmp(value_type, "string") == 0)
+		*type_r = DICT_SQL_TYPE_STRING;
+	else if (strcmp(value_type, "hexblob") == 0)
+		*type_r = DICT_SQL_TYPE_HEXBLOB;
+	else if (strcmp(value_type, "int") == 0)
+		*type_r = DICT_SQL_TYPE_INT;
+	else if (strcmp(value_type, "uint") == 0)
+		*type_r = DICT_SQL_TYPE_UINT;
+	else
+		return FALSE;
+	return TRUE;
+}
+
 static const char *dict_sql_map_finish(struct setting_parser_ctx *ctx)
 {
+	unsigned int i;
+
 	if (ctx->cur_map.pattern == NULL)
 		return "Missing setting: pattern";
 	if (ctx->cur_map.table == NULL)
 		return "Missing setting: table";
 	if (ctx->cur_map.value_field == NULL)
 		return "Missing setting: value_field";
+
+	ctx->cur_map.value_fields = (const char *const *)
+		p_strsplit_spaces(ctx->pool, ctx->cur_map.value_field, ",");
+	ctx->cur_map.values_count = str_array_length(ctx->cur_map.value_fields);
+
+	enum dict_sql_type *value_types =
+		p_new(ctx->pool, enum dict_sql_type, ctx->cur_map.values_count);
+	if (ctx->cur_map.value_type != NULL) {
+		const char *const *types =
+			t_strsplit_spaces(ctx->cur_map.value_type, ",");
+		if (str_array_length(types) != ctx->cur_map.values_count)
+			return "Number of fields in value_fields doesn't match value_type";
+		for (i = 0; i < ctx->cur_map.values_count; i++) {
+			if (!dict_sql_value_type_parse(types[i], &value_types[i]))
+				return "Invalid value in value_type";
+		}
+	} else {
+		for (i = 0; i < ctx->cur_map.values_count; i++) {
+			value_types[i] = ctx->cur_map.value_hexblob ?
+				DICT_SQL_TYPE_HEXBLOB : DICT_SQL_TYPE_STRING;
+		}
+	}
+	ctx->cur_map.value_types = value_types;
 
 	if (ctx->cur_map.username_field == NULL) {
 		/* not all queries require this */
@@ -139,7 +193,7 @@ static const char *dict_sql_map_finish(struct setting_parser_ctx *ctx)
 			return "Missing fields for pattern variables";
 	}
 	array_append(&ctx->set->maps, &ctx->cur_map, 1);
-	memset(&ctx->cur_map, 0, sizeof(ctx->cur_map));
+	i_zero(&ctx->cur_map);
 	return NULL;
 }
 
@@ -148,6 +202,7 @@ parse_setting(const char *key, const char *value,
 	      struct setting_parser_ctx *ctx)
 {
 	struct dict_sql_map_field *field;
+	size_t value_len;
 
 	switch (ctx->type) {
 	case SECTION_ROOT:
@@ -166,8 +221,26 @@ parse_setting(const char *key, const char *value,
 					   key, NULL);
 		}
 		field = array_append_space(&ctx->cur_fields);
-		field->sql_field = p_strdup(ctx->pool, key);
-		field->variable = p_strdup(ctx->pool, value + 1);
+		field->sql_field.name = p_strdup(ctx->pool, key);
+		value_len = strlen(value);
+		if (strncmp(value, "${hexblob:", 10) == 0 &&
+		    value[value_len-1] == '}') {
+			field->variable = p_strndup(ctx->pool, value + 10,
+						    value_len-10-1);
+			field->sql_field.value_type = DICT_SQL_TYPE_HEXBLOB;
+		} else if (strncmp(value, "${int:", 6) == 0 &&
+			   value[value_len-1] == '}') {
+			field->variable = p_strndup(ctx->pool, value + 6,
+						    value_len-6-1);
+			field->sql_field.value_type = DICT_SQL_TYPE_INT;
+		} else if (strncmp(value, "${uint:", 7) == 0 &&
+			   value[value_len-1] == '}') {
+			field->variable = p_strndup(ctx->pool, value + 7,
+						    value_len-7-1);
+			field->sql_field.value_type = DICT_SQL_TYPE_UINT;
+		} else {
+			field->variable = p_strdup(ctx->pool, value + 1);
+		}
 		return NULL;
 	}
 	return t_strconcat("Unknown setting: ", key, NULL);
@@ -211,25 +284,62 @@ parse_section(const char *type, const char *name ATTR_UNUSED,
 }
 
 struct dict_sql_settings *
-dict_sql_settings_read(pool_t pool, const char *path, const char **error_r)
+dict_sql_settings_read(const char *path, const char **error_r)
 {
 	struct setting_parser_ctx ctx;
+	struct dict_sql_settings_cache *cache;
+	pool_t pool;
 
-	memset(&ctx, 0, sizeof(ctx));
+	if (!hash_table_is_created(dict_sql_settings_cache)) {
+		hash_table_create(&dict_sql_settings_cache, default_pool, 0,
+				  str_hash, strcmp);
+	}
+
+	cache = hash_table_lookup(dict_sql_settings_cache, path);
+	if (cache != NULL)
+		return cache->set;
+
+	i_zero(&ctx);
+	pool = pool_alloconly_create("dict sql settings", 1024);
 	ctx.pool = pool;
 	ctx.set = p_new(pool, struct dict_sql_settings, 1);
 	t_array_init(&ctx.cur_fields, 16);
 	p_array_init(&ctx.set->maps, pool, 8);
 
 	if (!settings_read(path, NULL, parse_setting, parse_section,
-			   &ctx, error_r))
+			   &ctx, error_r)) {
+		pool_unref(&pool);
 		return NULL;
+	}
 
 	if (ctx.set->connect == NULL) {
 		*error_r = t_strdup_printf("Error in configuration file %s: "
 					   "Missing connect setting", path);
+		pool_unref(&pool);
 		return NULL;
 	}
 
+	cache = p_new(pool, struct dict_sql_settings_cache, 1);
+	cache->pool = pool;
+	cache->path = p_strdup(pool, path);
+	cache->set = ctx.set;
+
+	hash_table_insert(dict_sql_settings_cache, cache->path, cache);
 	return ctx.set;
+}
+
+void dict_sql_settings_deinit(void)
+{
+	struct hash_iterate_context *iter;
+	struct dict_sql_settings_cache *cache;
+	const char *key;
+
+	if (!hash_table_is_created(dict_sql_settings_cache))
+		return;
+
+	iter = hash_table_iterate_init(dict_sql_settings_cache);
+	while (hash_table_iterate(iter, dict_sql_settings_cache, &key, &cache))
+		pool_unref(&cache->pool);
+	hash_table_iterate_deinit(&iter);
+	hash_table_destroy(&dict_sql_settings_cache);
 }

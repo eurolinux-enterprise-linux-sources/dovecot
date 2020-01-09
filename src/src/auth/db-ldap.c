@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 
@@ -18,7 +18,6 @@
 #include "db-ldap.h"
 
 #include <stddef.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 #define HAVE_LDAP_SASL
@@ -50,6 +49,8 @@
 #  define LDAP_OPT_SUCCESS LDAP_SUCCESS
 #endif
 
+static const char *LDAP_ESCAPE_CHARS = "*,\\#+<>;\"()= ";
+
 struct db_ldap_result {
 	int refcount;
 	LDAPMessage *msg;
@@ -75,6 +76,8 @@ struct db_ldap_result_iterate_context {
 
 	bool skip_null_values;
 	bool iter_dn_values;
+	LDAPMessage *ldap_msg;
+	LDAP *ld;
 };
 
 struct db_ldap_sasl_bind_context {
@@ -170,47 +173,50 @@ db_ldap_result_iterate_init_full(struct ldap_connection *conn,
 				 LDAPMessage *res, bool skip_null_values,
 				 bool iter_dn_values);
 
-static int deref2str(const char *str)
+static int deref2str(const char *str, int *ref_r)
 {
 	if (strcasecmp(str, "never") == 0)
-		return LDAP_DEREF_NEVER;
-	if (strcasecmp(str, "searching") == 0)
-		return LDAP_DEREF_SEARCHING;
-	if (strcasecmp(str, "finding") == 0)
-		return LDAP_DEREF_FINDING;
-	if (strcasecmp(str, "always") == 0)
-		return LDAP_DEREF_ALWAYS;
-
-	i_fatal("LDAP: Unknown deref option '%s'", str);
+		*ref_r = LDAP_DEREF_NEVER;
+	else if (strcasecmp(str, "searching") == 0)
+		*ref_r = LDAP_DEREF_SEARCHING;
+	else if (strcasecmp(str, "finding") == 0)
+		*ref_r = LDAP_DEREF_FINDING;
+	else if (strcasecmp(str, "always") == 0)
+		*ref_r = LDAP_DEREF_ALWAYS;
+	else
+		return -1;
+	return 0;
 }
 
-static int scope2str(const char *str)
+static int scope2str(const char *str, int *scope_r)
 {
 	if (strcasecmp(str, "base") == 0)
-		return LDAP_SCOPE_BASE;
-	if (strcasecmp(str, "onelevel") == 0)
-		return LDAP_SCOPE_ONELEVEL;
-	if (strcasecmp(str, "subtree") == 0)
-		return LDAP_SCOPE_SUBTREE;
-
-	i_fatal("LDAP: Unknown scope option '%s'", str);
+		*scope_r = LDAP_SCOPE_BASE;
+	else if (strcasecmp(str, "onelevel") == 0)
+		*scope_r = LDAP_SCOPE_ONELEVEL;
+	else if (strcasecmp(str, "subtree") == 0)
+		*scope_r = LDAP_SCOPE_SUBTREE;
+	else
+		return -1;
+	return 0;
 }
 
 #ifdef OPENLDAP_TLS_OPTIONS
-static int tls_require_cert2str(const char *str)
+static int tls_require_cert2str(const char *str, int *value_r)
 {
 	if (strcasecmp(str, "never") == 0)
-		return LDAP_OPT_X_TLS_NEVER;
-	if (strcasecmp(str, "hard") == 0)
-		return LDAP_OPT_X_TLS_HARD;
-	if (strcasecmp(str, "demand") == 0)
-		return LDAP_OPT_X_TLS_DEMAND;
-	if (strcasecmp(str, "allow") == 0)
-		return LDAP_OPT_X_TLS_ALLOW;
-	if (strcasecmp(str, "try") == 0)
-		return LDAP_OPT_X_TLS_TRY;
-
-	i_fatal("LDAP: Unknown tls_require_cert value '%s'", str);
+		*value_r = LDAP_OPT_X_TLS_NEVER;
+	else if (strcasecmp(str, "hard") == 0)
+		*value_r = LDAP_OPT_X_TLS_HARD;
+	else if (strcasecmp(str, "demand") == 0)
+		*value_r = LDAP_OPT_X_TLS_DEMAND;
+	else if (strcasecmp(str, "allow") == 0)
+		*value_r = LDAP_OPT_X_TLS_ALLOW;
+	else if (strcasecmp(str, "try") == 0)
+		*value_r = LDAP_OPT_X_TLS_TRY;
+	else
+		return -1;
+	return 0;
 }
 #endif
 
@@ -307,7 +313,7 @@ static int db_ldap_request_bind(struct ldap_connection *conn,
 				   request->auth_request->mech_password,
 				   LDAP_AUTH_SIMPLE);
 	if (request->msgid == -1) {
-		auth_request_log_error(request->auth_request, "ldap",
+		auth_request_log_error(request->auth_request, AUTH_SUBSYS_DB,
 				       "ldap_bind(%s) failed: %s",
 				       brequest->dn, ldap_get_error(conn));
 		if (ldap_handle_error(conn) < 0) {
@@ -334,7 +340,7 @@ static int db_ldap_request_search(struct ldap_connection *conn,
 			    srequest->base, conn->set.ldap_scope,
 			    srequest->filter, srequest->attributes, 0);
 	if (request->msgid == -1) {
-		auth_request_log_error(request->auth_request, "ldap",
+		auth_request_log_error(request->auth_request, AUTH_SUBSYS_DB,
 				       "ldap_search(%s) parsing failed: %s",
 				       srequest->filter, ldap_get_error(conn));
 		if (ldap_handle_error(conn) < 0) {
@@ -434,7 +440,7 @@ db_ldap_check_limits(struct ldap_connection *conn, struct ldap_request *request)
 				   aqueue_idx(conn->request_queue, 0));
 	secs_diff = ioloop_time - (*first_requestp)->create_time;
 	if (secs_diff > DB_LDAP_REQUEST_LOST_TIMEOUT_SECS) {
-		auth_request_log_error(request->auth_request, "ldap",
+		auth_request_log_error(request->auth_request, AUTH_SUBSYS_DB,
 			"Connection appears to be hanging, reconnecting");
 		ldap_conn_reconnect(conn);
 		return TRUE;
@@ -522,10 +528,10 @@ static void db_ldap_abort_requests(struct ldap_connection *conn,
 			conn->pending_count--;
 		}
 		if (error) {
-			auth_request_log_error(request->auth_request, "ldap",
+			auth_request_log_error(request->auth_request, AUTH_SUBSYS_DB,
 					       "%s", reason);
 		} else {
-			auth_request_log_info(request->auth_request, "ldap",
+			auth_request_log_info(request->auth_request, AUTH_SUBSYS_DB,
 					      "%s", reason);
 		}
 		request->callback(conn, request, NULL);
@@ -570,7 +576,7 @@ static int db_ldap_fields_get_dn(struct ldap_connection *conn,
 						     TRUE, TRUE);
 	while (db_ldap_result_iterate_next(ldap_iter, &name, &values)) {
 		if (values[1] != NULL) {
-			auth_request_log_warning(auth_request, "ldap",
+			auth_request_log_warning(auth_request, AUTH_SUBSYS_DB,
 				"Multiple values found for '%s', "
 				"using value '%s'", name, values[0]);
 		}
@@ -627,7 +633,7 @@ ldap_request_send_subquery(struct ldap_connection *conn,
 	struct ldap_field_find_subquery_context ctx;
 	string_t *tmp_str = t_str_new(64);
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	t_array_init(&ctx.attr_names, 8);
 	ctx.name = named_res->field->name;
 
@@ -653,7 +659,7 @@ ldap_request_send_subquery(struct ldap_connection *conn,
 		ldap_search(conn->ld, named_res->dn, LDAP_SCOPE_BASE,
 			    NULL, array_idx_modifiable(&ctx.attr_names, 0), 0);
 	if (request->request.msgid == -1) {
-		auth_request_log_error(request->request.auth_request, "ldap",
+		auth_request_log_error(request->request.auth_request, AUTH_SUBSYS_DB,
 				       "ldap_search(dn=%s) failed: %s",
 				       named_res->dn, ldap_get_error(conn));
 		return -1;
@@ -760,20 +766,22 @@ db_ldap_handle_request_result(struct ldap_connection *conn,
 		final_result = TRUE;
 		ret = ldap_result2error(conn->ld, res->msg, 0);
 	}
-	if (ret != LDAP_SUCCESS && request->type == LDAP_REQUEST_TYPE_SEARCH) {
+	/* LDAP_NO_SUCH_OBJECT is returned for nonexistent base */
+	if (ret != LDAP_SUCCESS && ret != LDAP_NO_SUCH_OBJECT &&
+	    request->type == LDAP_REQUEST_TYPE_SEARCH) {
 		/* handle search failures here */
 		struct ldap_request_search *srequest =
 			(struct ldap_request_search *)request;
 
 		if (!array_is_created(&srequest->named_results)) {
-			auth_request_log_error(request->auth_request, "ldap",
+			auth_request_log_error(request->auth_request, AUTH_SUBSYS_DB,
 				"ldap_search(base=%s filter=%s) failed: %s",
 				srequest->base, srequest->filter,
 				ldap_err2string(ret));
 		} else {
 			named_res = array_idx(&srequest->named_results,
 					      srequest->name_idx);
-			auth_request_log_error(request->auth_request, "ldap",
+			auth_request_log_error(request->auth_request, AUTH_SUBSYS_DB,
 				"ldap_search(base=%s) failed: %s",
 				named_res->dn, ldap_err2string(ret));
 		}
@@ -783,7 +791,7 @@ db_ldap_handle_request_result(struct ldap_connection *conn,
 		/* expand any @results */
 		if (!final_result) {
 			if (db_ldap_search_save_result(srequest, res) < 0) {
-				auth_request_log_error(request->auth_request, "ldap",
+				auth_request_log_error(request->auth_request, AUTH_SUBSYS_DB,
 					"LDAP search returned multiple entries");
 				res = NULL;
 			} else {
@@ -816,7 +824,7 @@ db_ldap_handle_request_result(struct ldap_connection *conn,
 		if (res != NULL && srequest != NULL && srequest->result != NULL)
 			request->callback(conn, request, srequest->result->msg);
 
-		request->callback(conn, request, res->msg);
+		request->callback(conn, request, res == NULL ? NULL : res->msg);
 	} T_END;
 
 	if (idx > 0) {
@@ -900,7 +908,7 @@ static void ldap_input(struct ldap_connection *conn)
 		if (conn->ld == NULL)
 			return;
 
-		memset(&timeout, 0, sizeof(timeout));
+		i_zero(&timeout);
 		ret = ldap_result(conn->ld, LDAP_RES_ANY, 0, &timeout, &msg);
 #ifdef OPENLDAP_ASYNC_WORKAROUND
 		if (ret == 0) {
@@ -984,11 +992,46 @@ static void ldap_connection_timeout(struct ldap_connection *conn)
 {
 	i_assert(conn->conn_state == LDAP_CONN_STATE_BINDING);
 
-	i_error("LDAP: Initial binding to LDAP server timed out");
+	i_error("LDAP %s: Initial binding to LDAP server timed out",
+		conn->config_path);
 	db_ldap_conn_close(conn);
 }
 
-static int db_ldap_bind(struct ldap_connection *conn)
+#ifdef HAVE_LDAP_SASL
+static int db_ldap_bind_sasl(struct ldap_connection *conn)
+{
+	struct db_ldap_sasl_bind_context context;
+	int ret;
+
+	i_zero(&context);
+	context.authcid = conn->set.dn;
+	context.passwd = conn->set.dnpass;
+	context.realm = conn->set.sasl_realm;
+	context.authzid = conn->set.sasl_authz_id;
+
+	/* There doesn't seem to be a way to do SASL binding
+	   asynchronously.. */
+	ret = ldap_sasl_interactive_bind_s(conn->ld, NULL,
+					   conn->set.sasl_mech,
+					   NULL, NULL, LDAP_SASL_QUIET,
+					   sasl_interact, &context);
+	if (db_ldap_connect_finish(conn, ret) < 0)
+		return -1;
+	
+	conn->conn_state = LDAP_CONN_STATE_BOUND_DEFAULT;
+
+	return 0;
+}
+#else
+static int db_ldap_bind_sasl(struct ldap_connection *conn ATTR_UNUSED)
+{
+	i_unreached(); /* already checked at init */
+
+	return -1;
+}
+#endif
+
+static int db_ldap_bind_simple(struct ldap_connection *conn)
 {
 	int msgid;
 
@@ -1017,6 +1060,19 @@ static int db_ldap_bind(struct ldap_connection *conn)
 	return 0;
 }
 
+static int db_ldap_bind(struct ldap_connection *conn)
+{
+	if (conn->set.sasl_bind) {
+		if (db_ldap_bind_sasl(conn) < 0)
+			return -1;
+	} else {
+		if (db_ldap_bind_simple(conn) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
 static void db_ldap_get_fd(struct ldap_connection *conn)
 {
 	int ret;
@@ -1024,58 +1080,54 @@ static void db_ldap_get_fd(struct ldap_connection *conn)
 	/* get the connection's fd */
 	ret = ldap_get_option(conn->ld, LDAP_OPT_DESC, (void *)&conn->fd);
 	if (ret != LDAP_SUCCESS) {
-		i_fatal("LDAP: Can't get connection fd: %s",
-			ldap_err2string(ret));
+		i_fatal("LDAP %s: Can't get connection fd: %s",
+			conn->config_path, ldap_err2string(ret));
 	}
 	if (conn->fd <= STDERR_FILENO) {
 		/* Solaris LDAP library seems to be broken */
-		i_fatal("LDAP: Buggy LDAP library returned wrong fd: %d",
-			conn->fd);
+		i_fatal("LDAP %s: Buggy LDAP library returned wrong fd: %d",
+			conn->config_path, conn->fd);
 	}
 	i_assert(conn->fd != -1);
 	net_set_nonblock(conn->fd, TRUE);
 }
 
 static void ATTR_NULL(1)
-db_ldap_set_opt(struct ldap_connection *conn, int opt, const void *value,
-		const char *optname, const char *value_str)
+db_ldap_set_opt(struct ldap_connection *conn, LDAP *ld, int opt,
+		const void *value, const char *optname, const char *value_str)
 {
 	int ret;
 
-	ret = ldap_set_option(conn == NULL ? NULL : conn->ld, opt, value);
+	ret = ldap_set_option(ld, opt, value);
 	if (ret != LDAP_SUCCESS) {
-		i_fatal("LDAP: Can't set option %s to %s: %s",
-			optname, value_str, ldap_err2string(ret));
+		i_fatal("LDAP %s: Can't set option %s to %s: %s",
+			conn->config_path, optname, value_str, ldap_err2string(ret));
 	}
 }
 
 static void ATTR_NULL(1)
-db_ldap_set_opt_str(struct ldap_connection *conn, int opt, const char *value,
-		    const char *optname)
+db_ldap_set_opt_str(struct ldap_connection *conn, LDAP *ld, int opt,
+		    const char *value, const char *optname)
 {
 	if (value != NULL)
-		db_ldap_set_opt(conn, opt, value, optname, value);
+		db_ldap_set_opt(conn, ld, opt, value, optname, value);
 }
 
 static void db_ldap_set_tls_options(struct ldap_connection *conn)
 {
-	if (!conn->set.tls)
-		return;
-
 #ifdef OPENLDAP_TLS_OPTIONS
-	db_ldap_set_opt_str(NULL, LDAP_OPT_X_TLS_CACERTFILE,
+	db_ldap_set_opt_str(conn, NULL, LDAP_OPT_X_TLS_CACERTFILE,
 			    conn->set.tls_ca_cert_file, "tls_ca_cert_file");
-	db_ldap_set_opt_str(NULL, LDAP_OPT_X_TLS_CACERTDIR,
+	db_ldap_set_opt_str(conn, NULL, LDAP_OPT_X_TLS_CACERTDIR,
 			    conn->set.tls_ca_cert_dir, "tls_ca_cert_dir");
-	db_ldap_set_opt_str(NULL, LDAP_OPT_X_TLS_CERTFILE,
+	db_ldap_set_opt_str(conn, NULL, LDAP_OPT_X_TLS_CERTFILE,
 			    conn->set.tls_cert_file, "tls_cert_file");
-	db_ldap_set_opt_str(NULL, LDAP_OPT_X_TLS_KEYFILE,
+	db_ldap_set_opt_str(conn, NULL, LDAP_OPT_X_TLS_KEYFILE,
 			    conn->set.tls_key_file, "tls_key_file");
-	db_ldap_set_opt_str(NULL, LDAP_OPT_X_TLS_CIPHER_SUITE,
+	db_ldap_set_opt_str(conn, NULL, LDAP_OPT_X_TLS_CIPHER_SUITE,
 			    conn->set.tls_cipher_suite, "tls_cipher_suite");
 	if (conn->set.tls_require_cert != NULL) {
-		int value = tls_require_cert2str(conn->set.tls_require_cert);
-		db_ldap_set_opt(NULL, LDAP_OPT_X_TLS_REQUIRE_CERT, &value,
+		db_ldap_set_opt(conn, NULL, LDAP_OPT_X_TLS_REQUIRE_CERT, &conn->set.ldap_tls_require_cert_parsed,
 				"tls_require_cert", conn->set.tls_require_cert);
 	}
 #else
@@ -1083,9 +1135,10 @@ static void db_ldap_set_tls_options(struct ldap_connection *conn)
 	    conn->set.tls_ca_cert_dir != NULL ||
 	    conn->set.tls_cert_file != NULL ||
 	    conn->set.tls_key_file != NULL ||
-	    conn->set.tls_cipher_suite != NULL)
-		i_warning("LDAP: tls_* settings ignored, "
-			  "your LDAP library doesn't seem to support them");
+	    conn->set.tls_cipher_suite != NULL) {
+		i_fatal("LDAP %s: tls_* settings aren't supported by your LDAP library - they must not be set",
+			conn->config_path);
+	}
 #endif
 }
 
@@ -1094,61 +1147,84 @@ static void db_ldap_set_options(struct ldap_connection *conn)
 	unsigned int ldap_version;
 	int value;
 
-	db_ldap_set_opt(conn, LDAP_OPT_DEREF, &conn->set.ldap_deref,
+#ifdef LDAP_OPT_NETWORK_TIMEOUT
+	struct timeval tv;
+	int ret;
+
+	tv.tv_sec = DB_LDAP_CONNECT_TIMEOUT_SECS; tv.tv_usec = 0;
+	ret = ldap_set_option(conn->ld, LDAP_OPT_NETWORK_TIMEOUT, &tv);
+	if (ret != LDAP_SUCCESS) {
+		i_fatal("LDAP %s: Can't set network-timeout: %s",
+			conn->config_path, ldap_err2string(ret));
+	}
+#endif
+
+	db_ldap_set_opt(conn, conn->ld, LDAP_OPT_DEREF, &conn->set.ldap_deref,
 			"deref", conn->set.deref);
 #ifdef LDAP_OPT_DEBUG_LEVEL
-	value = atoi(conn->set.debug_level);
-	if (value != 0) {
-		db_ldap_set_opt(NULL, LDAP_OPT_DEBUG_LEVEL, &value,
+	if (str_to_int(conn->set.debug_level, &value) >= 0 && value != 0) {
+		db_ldap_set_opt(conn, NULL, LDAP_OPT_DEBUG_LEVEL, &value,
 				"debug_level", conn->set.debug_level);
 	}
 #endif
 
-	if (conn->set.ldap_version < 3) {
-		if (conn->set.sasl_bind)
-			i_fatal("LDAP: sasl_bind=yes requires ldap_version=3");
-		if (conn->set.tls)
-			i_fatal("LDAP: tls=yes requires ldap_version=3");
-	}
-
 	ldap_version = conn->set.ldap_version;
-	db_ldap_set_opt(conn, LDAP_OPT_PROTOCOL_VERSION, &ldap_version,
+	db_ldap_set_opt(conn, conn->ld, LDAP_OPT_PROTOCOL_VERSION, &ldap_version,
 			"protocol_version", dec2str(ldap_version));
 	db_ldap_set_tls_options(conn);
 }
 
+static void db_ldap_init_ld(struct ldap_connection *conn)
+{
+	int ret;
+
+	if (conn->set.uris != NULL) {
+#ifdef LDAP_HAVE_INITIALIZE
+		ret = ldap_initialize(&conn->ld, conn->set.uris);
+		if (ret != LDAP_SUCCESS) {
+			i_fatal("LDAP %s: ldap_initialize() failed with uris %s: %s",
+				conn->config_path, conn->set.uris,
+				ldap_err2string(ret));
+		}
+#else
+		i_unreached(); /* already checked at init */
+#endif
+	} else {
+		conn->ld = ldap_init(conn->set.hosts, LDAP_PORT);
+		if (conn->ld == NULL) {
+			i_fatal("LDAP %s: ldap_init() failed with hosts: %s",
+				conn->config_path, conn->set.hosts);
+		}
+	}
+	db_ldap_set_options(conn);
+}
+
 int db_ldap_connect(struct ldap_connection *conn)
 {
-	bool debug = atoi(conn->set.debug_level) > 0;
+	int debug_level;
+	bool debug;
 	struct timeval start, end;
 	int ret;
+
+	debug = FALSE;
+	if (str_to_int(conn->set.debug_level, &debug_level) >= 0)
+		debug = debug_level > 0;
 
 	if (conn->conn_state != LDAP_CONN_STATE_DISCONNECTED)
 		return 0;
 
 	if (debug) {
 		if (gettimeofday(&start, NULL) < 0)
-			memset(&start, 0, sizeof(start));
+			i_zero(&start);
 	}
 	i_assert(conn->pending_count == 0);
-	if (conn->ld == NULL) {
-		if (conn->set.uris != NULL) {
-#ifdef LDAP_HAVE_INITIALIZE
-			if (ldap_initialize(&conn->ld, conn->set.uris) != LDAP_SUCCESS)
-				conn->ld = NULL;
-#else
-			i_fatal("LDAP: Your LDAP library doesn't support "
-				"'uris' setting, use 'hosts' instead.");
-#endif
-		} else
-			conn->ld = ldap_init(conn->set.hosts, LDAP_PORT);
 
-		if (conn->ld == NULL)
-			i_fatal("LDAP: ldap_init() failed with hosts: %s",
-				conn->set.hosts);
-
-		db_ldap_set_options(conn);
+	if (conn->delayed_connect) {
+		conn->delayed_connect = FALSE;
+		timeout_remove(&conn->to);
 	}
+	if (conn->ld == NULL)
+		db_ldap_init_ld(conn);
 
 	if (conn->set.tls) {
 #ifdef LDAP_HAVE_START_TLS_S
@@ -1157,45 +1233,21 @@ int db_ldap_connect(struct ldap_connection *conn)
 			if (ret == LDAP_OPERATIONS_ERROR &&
 			    conn->set.uris != NULL &&
 			    strncmp(conn->set.uris, "ldaps:", 6) == 0) {
-				i_fatal("LDAP: Don't use both tls=yes "
-					"and ldaps URI");
+				i_fatal("LDAP %s: Don't use both tls=yes "
+					"and ldaps URI", conn->config_path);
 			}
-			i_error("LDAP: ldap_start_tls_s() failed: %s",
-				ldap_err2string(ret));
+			i_error("LDAP %s: ldap_start_tls_s() failed: %s",
+				conn->config_path, ldap_err2string(ret));
 			return -1;
 		}
 #else
-		i_error("LDAP: Your LDAP library doesn't support TLS");
+		i_unreached(); /* already checked at init */
+#endif
+	}
+
+	if (db_ldap_bind(conn) < 0)
 		return -1;
-#endif
-	}
 
-	if (conn->set.sasl_bind) {
-#ifdef HAVE_LDAP_SASL
-		struct db_ldap_sasl_bind_context context;
-
-		memset(&context, 0, sizeof(context));
-		context.authcid = conn->set.dn;
-		context.passwd = conn->set.dnpass;
-		context.realm = conn->set.sasl_realm;
-		context.authzid = conn->set.sasl_authz_id;
-
-		/* There doesn't seem to be a way to do SASL binding
-		   asynchronously.. */
-		ret = ldap_sasl_interactive_bind_s(conn->ld, NULL,
-						   conn->set.sasl_mech,
-						   NULL, NULL, LDAP_SASL_QUIET,
-						   sasl_interact, &context);
-		if (db_ldap_connect_finish(conn, ret) < 0)
-			return -1;
-#else
-		i_fatal("LDAP: sasl_bind=yes but no SASL support compiled in");
-#endif
-		conn->conn_state = LDAP_CONN_STATE_BOUND_DEFAULT;
-	} else {
-		if (db_ldap_bind(conn) < 0)
-			return -1;
-	}
 	if (debug) {
 		if (gettimeofday(&end, NULL) == 0) {
 			int msecs = timeval_diff_msecs(&end, &start);
@@ -1206,6 +1258,22 @@ int db_ldap_connect(struct ldap_connection *conn)
 	db_ldap_get_fd(conn);
 	conn->io = io_add(conn->fd, IO_READ, ldap_input, conn);
 	return 0;
+}
+
+static void db_ldap_connect_callback(struct ldap_connection *conn)
+{
+	i_assert(conn->conn_state == LDAP_CONN_STATE_DISCONNECTED);
+	(void)db_ldap_connect(conn);
+}
+
+void db_ldap_connect_delayed(struct ldap_connection *conn)
+{
+	if (conn->delayed_connect)
+		return;
+	conn->delayed_connect = TRUE;
+
+	i_assert(conn->to == NULL);
+	conn->to = timeout_add_short(0, db_ldap_connect_callback, conn);
 }
 
 void db_ldap_enable_input(struct ldap_connection *conn, bool enable)
@@ -1239,6 +1307,7 @@ static void db_ldap_conn_close(struct ldap_connection *conn)
 	unsigned int i;
 
 	conn->conn_state = LDAP_CONN_STATE_DISCONNECTED;
+	conn->delayed_connect = FALSE;
 	conn->default_bind_msgid = -1;
 
 	if (conn->to != NULL)
@@ -1353,7 +1422,7 @@ void db_ldap_set_attrs(struct ldap_connection *conn, const char *attrlist,
 		}
 
 		if (*name == '\0')
-			i_error("ldap: Invalid attrs entry: %s", attr_data);
+			i_error("LDAP %s: Invalid attrs entry: %s", conn->config_path, attr_data);
 		else if (skip_attr == NULL || strcmp(skip_attr, name) != 0) {
 			field = array_append_space(attr_map);
 			if (name[0] == '@') {
@@ -1363,6 +1432,7 @@ void db_ldap_set_attrs(struct ldap_connection *conn, const char *attrlist,
 			} else if (name[0] == '!' && name == ldap_attr) {
 				/* !ldapAttr */
 				name = "";
+				i_assert(ldap_attr[0] == '!');
 				ldap_attr++;
 				field->skip = TRUE;
 			}
@@ -1395,31 +1465,25 @@ db_ldap_value_get_var_expand_table(struct auth_request *auth_request,
 }
 
 #define IS_LDAP_ESCAPED_CHAR(c) \
-	((c) == '*' || (c) == '(' || (c) == ')' || (c) == '\\')
+	((((unsigned char)(c)) & 0x80) != 0 || strchr(LDAP_ESCAPE_CHARS, (c)) != NULL)
 
 const char *ldap_escape(const char *str,
 			const struct auth_request *auth_request ATTR_UNUSED)
 {
-	const char *p;
-	string_t *ret;
+	string_t *ret = NULL;
 
-	for (p = str; *p != '\0'; p++) {
-		if (IS_LDAP_ESCAPED_CHAR(*p))
-			break;
+	for (const char *p = str; *p != '\0'; p++) {
+		if (IS_LDAP_ESCAPED_CHAR(*p)) {
+			if (ret == NULL) {
+				ret = t_str_new((size_t) (p - str) + 64);
+				str_append_n(ret, str, (size_t) (p - str));
+			}
+			str_printfa(ret, "\\%02X", (unsigned char)*p);
+		} else if (ret != NULL)
+			str_append_c(ret, *p);
 	}
 
-	if (*p == '\0')
-		return str;
-
-	ret = t_str_new((size_t) (p - str) + 64);
-	str_append_n(ret, str, (size_t) (p - str));
-
-	for (; *p != '\0'; p++) {
-		if (IS_LDAP_ESCAPED_CHAR(*p))
-			str_append_c(ret, '\\');
-		str_append_c(ret, *p);
-	}
-	return str_c(ret);
+	return ret == NULL ? str : str_c(ret);
 }
 
 static bool
@@ -1503,7 +1567,7 @@ db_ldap_result_iterate_init_full(struct ldap_connection *conn,
 	const char *suffix;
 	pool_t pool;
 
-	pool = pool_alloconly_create("ldap result iter", 1024);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"ldap result iter", 1024);
 	ctx = p_new(pool, struct db_ldap_result_iterate_context, 1);
 	ctx->pool = pool;
 	ctx->auth_request = ldap_request->request.auth_request;
@@ -1511,8 +1575,11 @@ db_ldap_result_iterate_init_full(struct ldap_connection *conn,
 	ctx->skip_null_values = skip_null_values;
 	ctx->iter_dn_values = iter_dn_values;
 	hash_table_create(&ctx->ldap_attrs, pool, 0, strcase_hash, strcasecmp);
-	if (ctx->auth_request->set->debug)
+	ctx->var = str_new(ctx->pool, 256);
+	if (ctx->auth_request->debug)
 		ctx->debug = t_str_new(256);
+	ctx->ldap_msg = res;
+	ctx->ld = conn->ld;
 
 	get_ldap_fields(ctx, conn, res, "");
 	if (array_is_created(&ldap_request->named_results)) {
@@ -1569,7 +1636,7 @@ static const char *db_ldap_field_expand(const char *data, void *context)
 		return db_ldap_field_get_default(data);
 	}
 	if (ldap_value->values[1] != NULL) {
-		auth_request_log_warning(ctx->auth_request, "ldap",
+		auth_request_log_warning(ctx->auth_request, AUTH_SUBSYS_DB,
 			"Multiple values found for '%s', using value '%s'",
 			field_name, ldap_value->values[0]);
 	}
@@ -1589,16 +1656,28 @@ static const char *db_ldap_field_ptr_expand(const char *data, void *context)
 	return db_ldap_field_expand(field_name, ctx);
 }
 
+static const char *
+db_ldap_field_dn_expand(const char *data ATTR_UNUSED, void *context ATTR_UNUSED)
+{
+	struct db_ldap_result_iterate_context *ctx = context;
+	char *dn = ldap_get_dn(ctx->ld, ctx->ldap_msg);
+	const char *dn_dup = t_strdup(dn);
+	ldap_memfree(dn);
+	return dn_dup;
+}
+
+static struct var_expand_func_table ldap_var_funcs_table[] = {
+	{ "ldap", db_ldap_field_expand },
+	{ "ldap_ptr", db_ldap_field_ptr_expand },
+	{ "ldap_dn", db_ldap_field_dn_expand },
+	{ NULL, NULL }
+};
+
 static const char *const *
 db_ldap_result_return_value(struct db_ldap_result_iterate_context *ctx,
 			    const struct ldap_field *field,
 			    struct db_ldap_value *ldap_value)
 {
-	static struct var_expand_func_table var_funcs_table[] = {
-		{ "ldap", db_ldap_field_expand },
-		{ "ldap_ptr", db_ldap_field_ptr_expand },
-		{ NULL, NULL }
-	};
 	const struct var_expand_table *var_table;
 	const char *const *values;
 
@@ -1620,7 +1699,7 @@ db_ldap_result_return_value(struct db_ldap_result_iterate_context *ctx,
 			return values;
 		}
 		if (values[0] != NULL && values[1] != NULL) {
-			auth_request_log_warning(ctx->auth_request, "ldap",
+			auth_request_log_warning(ctx->auth_request, AUTH_SUBSYS_DB,
 				"Multiple values found for '%s', "
 				"using value '%s'",
 				field->name, values[0]);
@@ -1632,12 +1711,8 @@ db_ldap_result_return_value(struct db_ldap_result_iterate_context *ctx,
 		      (and less importantly the same for other variables) */
 		var_table = db_ldap_value_get_var_expand_table(ctx->auth_request,
 							       values[0]);
-		if (ctx->var == NULL)
-			ctx->var = str_new(ctx->pool, 256);
-		else
-			str_truncate(ctx->var, 0);
 		var_expand_with_funcs(ctx->var, field->value, var_table,
-				      var_funcs_table, ctx);
+				      ldap_var_funcs_table, ctx);
 		ctx->val_1_arr[0] = str_c(ctx->var);
 		values = ctx->val_1_arr;
 	}
@@ -1650,6 +1725,7 @@ bool db_ldap_result_iterate_next(struct db_ldap_result_iterate_context *ctx,
 {
 	const struct ldap_field *field;
 	struct db_ldap_value *ldap_value;
+	unsigned int pos;
 
 	do {
 		if (ctx->attr_idx == array_count(ctx->attr_map))
@@ -1665,8 +1741,22 @@ bool db_ldap_result_iterate_next(struct db_ldap_result_iterate_context *ctx,
 	else if (ctx->debug && *field->ldap_attr_name != '\0')
 		str_printfa(ctx->debug, "; %s missing", field->ldap_attr_name);
 
-	*name_r = field->name;
+	str_truncate(ctx->var, 0);
 	*values_r = db_ldap_result_return_value(ctx, field, ldap_value);
+
+	if (strchr(field->name, '%') == NULL)
+		*name_r = field->name;
+	else {
+		/* expand %variables also for LDAP name fields. we'll use the
+		   same ctx->var, which may already contain the value. */
+		str_append_c(ctx->var, '\0');
+		pos = str_len(ctx->var);
+
+		var_expand_with_funcs(ctx->var, field->name,
+			auth_request_get_var_expand_table(ctx->auth_request, NULL),
+			ldap_var_funcs_table, ctx);
+		*name_r = str_c(ctx->var) + pos;
+	}
 
 	if (ctx->skip_null_values && (*values_r)[0] == NULL) {
 		/* no values. don't confuse the caller with this reply. */
@@ -1681,11 +1771,12 @@ db_ldap_result_finish_debug(struct db_ldap_result_iterate_context *ctx)
 	struct hash_iterate_context *iter;
 	char *name;
 	struct db_ldap_value *value;
-	unsigned int orig_len, unused_count = 0;
+	unsigned int unused_count = 0;
+	size_t orig_len;
 
 	orig_len = str_len(ctx->debug);
 	if (orig_len == 0) {
-		auth_request_log_debug(ctx->auth_request, "ldap",
+		auth_request_log_debug(ctx->auth_request, AUTH_SUBSYS_DB,
 				       "no fields returned by the server");
 		return;
 	}
@@ -1707,7 +1798,7 @@ db_ldap_result_finish_debug(struct db_ldap_result_iterate_context *ctx)
 		str_truncate(ctx->debug, str_len(ctx->debug)-1);
 		str_append(ctx->debug, " unused");
 	}
-	auth_request_log_debug(ctx->auth_request, "ldap",
+	auth_request_log_debug(ctx->auth_request, AUTH_SUBSYS_DB,
 			       "result: %s", str_c(ctx->debug) + 1);
 }
 
@@ -1775,35 +1866,61 @@ struct ldap_connection *db_ldap_init(const char *config_path, bool userdb)
 		i_fatal("ldap %s: %s", config_path, error);
 
 	if (conn->set.base == NULL)
-		i_fatal("LDAP: No base given");
+		i_fatal("LDAP %s: No base given", config_path);
 
 	if (conn->set.uris == NULL && conn->set.hosts == NULL)
-		i_fatal("LDAP: No uris or hosts set");
+		i_fatal("LDAP %s: No uris or hosts set", config_path);
 #ifndef LDAP_HAVE_INITIALIZE
 	if (conn->set.uris != NULL) {
-		i_fatal("LDAP: Dovecot compiled without support for LDAP uris "
-			"(ldap_initialize not found)");
+		i_fatal("LDAP %s: uris set, but Dovecot compiled without support for LDAP uris "
+			"(ldap_initialize() not supported by LDAP library)", config_path);
+	}
+#endif
+#ifndef LDAP_HAVE_START_TLS_S
+	if (conn->set.tls)
+		i_fatal("LDAP %s: tls=yes, but your LDAP library doesn't support TLS", config_path);
+#endif
+#ifndef HAVE_LDAP_SASL
+	if (conn->set.sasl_bind)
+		i_fatal("LDAP %s: sasl_bind=yes but no SASL support compiled in", conn->config_path);
+#endif
+	if (conn->set.ldap_version < 3) {
+		if (conn->set.sasl_bind)
+			i_fatal("LDAP %s: sasl_bind=yes requires ldap_version=3", config_path);
+		if (conn->set.tls)
+			i_fatal("LDAP %s: tls=yes requires ldap_version=3", config_path);
+	}
+#ifdef OPENLDAP_TLS_OPTIONS
+	if (conn->set.tls_require_cert != NULL) {
+		if (tls_require_cert2str(conn->set.tls_require_cert,
+					 &conn->set.ldap_tls_require_cert_parsed) < 0)
+			i_fatal("LDAP %s: Unknown tls_require_cert value '%s'",
+				config_path, conn->set.tls_require_cert);
 	}
 #endif
 
 	if (*conn->set.ldaprc_path != '\0') {
 		str = getenv("LDAPRC");
 		if (str != NULL && strcmp(str, conn->set.ldaprc_path) != 0) {
-			i_fatal("LDAP: Multiple different ldaprc_path "
+			i_fatal("LDAP %s: Multiple different ldaprc_path "
 				"settings not allowed (%s and %s)",
-				str, conn->set.ldaprc_path);
+				config_path, str, conn->set.ldaprc_path);
 		}
 		env_put(t_strconcat("LDAPRC=", conn->set.ldaprc_path, NULL));
 	}
 
-        conn->set.ldap_deref = deref2str(conn->set.deref);
-	conn->set.ldap_scope = scope2str(conn->set.scope);
+        if (deref2str(conn->set.deref, &conn->set.ldap_deref) < 0)
+		i_fatal("LDAP %s: Unknown deref option '%s'", config_path, conn->set.deref);
+	if (scope2str(conn->set.scope, &conn->set.ldap_scope) < 0)
+		i_fatal("LDAP %s: Unknown scope option '%s'", config_path, conn->set.scope);
 
 	i_array_init(&conn->request_array, 512);
 	conn->request_queue = aqueue_init(&conn->request_array.arr);
 
 	conn->next = ldap_connections;
         ldap_connections = conn;
+
+	db_ldap_init_ld(conn);
 	return conn;
 }
 

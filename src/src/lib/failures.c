@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -11,7 +11,6 @@
 #include "write-full.h"
 #include "fd-close-on-exec.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <syslog.h>
@@ -45,7 +44,8 @@ static struct failure_context failure_ctx_error = { .type = LOG_TYPE_ERROR };
 
 static int log_fd = STDERR_FILENO, log_info_fd = STDERR_FILENO,
 	   log_debug_fd = STDERR_FILENO;
-static char *log_prefix = NULL, *log_stamp_format = NULL;
+static char *log_prefix = NULL;
+static char *log_stamp_format = NULL, *log_stamp_format_suffix = NULL;
 static bool failure_ignore_errors = FALSE, log_prefix_sent = FALSE;
 static bool coredump_on_error = FALSE;
 
@@ -54,12 +54,17 @@ i_internal_error_handler(const struct failure_context *ctx,
 			 const char *format, va_list args);
 
 /* kludgy .. we want to trust log_stamp_format with -Wformat-nonliteral */
-static const char *get_log_stamp_format(const char *unused)
+static const char *
+get_log_stamp_format(const char *format_arg, unsigned int timestamp_usecs)
 	ATTR_FORMAT_ARG(1);
 
-static const char *get_log_stamp_format(const char *unused ATTR_UNUSED)
+static const char *get_log_stamp_format(const char *format_arg ATTR_UNUSED,
+					unsigned int timestamp_usecs)
 {
-	return log_stamp_format;
+	if (log_stamp_format_suffix == NULL)
+		return log_stamp_format;
+	return t_strdup_printf("%s%06u%s", log_stamp_format,
+			       timestamp_usecs, log_stamp_format_suffix);
 }
 
 void failure_exit(int status)
@@ -73,16 +78,19 @@ static void log_prefix_add(const struct failure_context *ctx, string_t *str)
 {
 	const struct tm *tm = ctx->timestamp;
 	char buf[256];
-	time_t now;
+	struct timeval now;
 
 	if (log_stamp_format != NULL) {
 		if (tm == NULL) {
-			now = time(NULL);
-			tm = localtime(&now);
+			if (gettimeofday(&now, NULL) < 0)
+				i_panic("gettimeofday() failed: %m");
+			tm = localtime(&now.tv_sec);
+		} else {
+			now.tv_usec = ctx->timestamp_usecs;
 		}
 
 		if (strftime(buf, sizeof(buf),
-			     get_log_stamp_format("unused"), tm) > 0)
+			     get_log_stamp_format("unused", now.tv_usec), tm) > 0)
 			str_append(str, buf);
 	}
 	if (log_prefix != NULL)
@@ -94,7 +102,7 @@ static void log_fd_flush_stop(struct ioloop *ioloop)
 	io_loop_stop(ioloop);
 }
 
-static int log_fd_write(int fd, const unsigned char *data, unsigned int len)
+static int log_fd_write(int fd, const unsigned char *data, size_t len)
 {
 	struct ioloop *ioloop;
 	struct io *io;
@@ -260,7 +268,7 @@ void i_panic(const char *format, ...)
 	struct failure_context ctx;
 	va_list args;
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.type = LOG_TYPE_PANIC;
 
 	va_start(args, format);
@@ -273,7 +281,7 @@ void i_fatal(const char *format, ...)
 	struct failure_context ctx;
 	va_list args;
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.type = LOG_TYPE_FATAL;
 	ctx.exit_status = FATAL_DEFAULT;
 
@@ -287,7 +295,7 @@ void i_fatal_status(int status, const char *format, ...)
 	struct failure_context ctx;
 	va_list args;
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.type = LOG_TYPE_FATAL;
 	ctx.exit_status = status;
 
@@ -457,7 +465,7 @@ static void open_log_file(int *fd, const char *path)
 
 	if (*fd != STDERR_FILENO) {
 		if (close(*fd) < 0) {
-			str = t_strdup_printf("close(%d) failed: %m", *fd);
+			str = t_strdup_printf("close(%d) failed: %m\n", *fd);
 			(void)write_full(STDERR_FILENO, str, strlen(str));
 		}
 	}
@@ -516,7 +524,7 @@ static void i_failure_send_option(const char *key, const char *value)
 
 	str = t_strdup_printf("\001%c%s %s=%s\n", LOG_TYPE_OPTION+1,
 			      my_pid, key, value);
-	(void)write_full(2, str, strlen(str));
+	(void)write_full(STDERR_FILENO, str, strlen(str));
 }
 
 void i_set_failure_prefix(const char *prefix_fmt, ...)
@@ -538,10 +546,15 @@ void i_unset_failure_prefix(void)
 	log_prefix_sent = FALSE;
 }
 
-static int internal_send_split(string_t *full_str, unsigned int prefix_len)
+const char *i_get_failure_prefix(void)
+{
+	return log_prefix != NULL ? log_prefix : "";
+}
+
+static int internal_send_split(string_t *full_str, size_t prefix_len)
 {
 	string_t *str;
-	unsigned int max_text_len, pos = prefix_len;
+	size_t max_text_len, pos = prefix_len;
 
 	str = t_str_new(PIPE_BUF);
 	str_append_n(str, str_c(full_str), prefix_len);
@@ -575,7 +588,7 @@ internal_handler(const struct failure_context *ctx,
 	recursed++;
 	T_BEGIN {
 		string_t *str;
-		unsigned int prefix_len;
+		size_t prefix_len;
 
 		if (!log_prefix_sent && log_prefix != NULL) {
 			log_prefix_sent = TRUE;
@@ -622,7 +635,7 @@ static bool line_is_ok(const char *line)
 
 void i_failure_parse_line(const char *line, struct failure_line *failure)
 {
-	memset(failure, 0, sizeof(*failure));
+	i_zero(failure);
 	if (!line_is_ok(line)) {
 		failure->log_type = LOG_TYPE_ERROR;
 		failure->text = line;
@@ -702,8 +715,18 @@ void i_set_debug_file(const char *path)
 
 void i_set_failure_timestamp_format(const char *fmt)
 {
+	const char *p;
+
 	i_free(log_stamp_format);
-        log_stamp_format = i_strdup(fmt);
+	i_free_and_null(log_stamp_format_suffix);
+
+	p = strstr(fmt, "%{usecs}");
+	if (p == NULL)
+		log_stamp_format = i_strdup(fmt);
+	else {
+		log_stamp_format = i_strdup_until(fmt, p);
+		log_stamp_format_suffix = i_strdup(p + 8);
+	}
 }
 
 void i_set_failure_send_ip(const struct ip_addr *ip)
@@ -746,4 +769,5 @@ void failures_deinit(void)
 
 	i_free_and_null(log_prefix);
 	i_free_and_null(log_stamp_format);
+	i_free_and_null(log_stamp_format_suffix);
 }

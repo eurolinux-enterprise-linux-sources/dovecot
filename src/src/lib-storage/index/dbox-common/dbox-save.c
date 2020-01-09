@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -16,8 +16,12 @@ void dbox_save_add_to_index(struct dbox_save_context *ctx)
 	struct mail_save_data *mdata = &ctx->ctx.data;
 	enum mail_flags save_flags;
 
+	if ((ctx->ctx.transaction->flags & MAILBOX_TRANSACTION_FLAG_FILL_IN_STUB) == 0)
+		mail_index_append(ctx->trans, mdata->uid, &ctx->seq);
+	else
+		ctx->seq = mdata->stub_seq;
+
 	save_flags = mdata->flags & ~MAIL_RECENT;
-	mail_index_append(ctx->trans, mdata->uid, &ctx->seq);
 	mail_index_update_flags(ctx->trans, ctx->seq, MODIFY_REPLACE,
 				save_flags);
 	if (mdata->keywords != NULL) {
@@ -40,11 +44,6 @@ void dbox_save_begin(struct dbox_save_context *ctx, struct istream *input)
 
 	dbox_save_add_to_index(ctx);
 
-	if (_ctx->dest_mail == NULL) {
-		if (ctx->mail == NULL)
-			ctx->mail = mail_alloc(_ctx->transaction, 0, NULL);
-		_ctx->dest_mail = ctx->mail;
-	}
 	mail_set_seq_saving(_ctx->dest_mail, ctx->seq);
 
 	crlf_input = i_stream_create_lf(input);
@@ -52,7 +51,7 @@ void dbox_save_begin(struct dbox_save_context *ctx, struct istream *input)
 	i_stream_unref(&crlf_input);
 
 	/* write a dummy header. it'll get rewritten when we're finished */
-	memset(&dbox_msg_hdr, 0, sizeof(dbox_msg_hdr));
+	i_zero(&dbox_msg_hdr);
 	o_stream_cork(ctx->dbox_output);
 	if (o_stream_send(ctx->dbox_output, &dbox_msg_hdr,
 			  sizeof(dbox_msg_hdr)) < 0) {
@@ -102,6 +101,8 @@ void dbox_save_end(struct dbox_save_context *ctx)
 	struct mail_save_data *mdata = &ctx->ctx.data;
 	struct ostream *dbox_output = ctx->dbox_output;
 
+	i_assert(mdata->output != NULL);
+
 	if (mdata->attach != NULL && !ctx->failed) {
 		if (index_attachment_save_finish(&ctx->ctx) < 0)
 			ctx->failed = TRUE;
@@ -113,14 +114,10 @@ void dbox_save_end(struct dbox_save_context *ctx)
 		ctx->failed = TRUE;
 	}
 	if (mdata->output != dbox_output) {
-		if (mdata->output != NULL) {
-			/* e.g. zlib plugin had changed this */
-			o_stream_ref(dbox_output);
-			o_stream_destroy(&mdata->output);
-			mdata->output = dbox_output;
-		} else {
-			i_assert(ctx->failed);
-		}
+		/* e.g. zlib plugin had changed this */
+		o_stream_ref(dbox_output);
+		o_stream_destroy(&mdata->output);
+		mdata->output = dbox_output;
 	}
 	index_mail_cache_parse_deinit(ctx->ctx.dest_mail,
 				      ctx->ctx.data.received_date,
@@ -139,7 +136,7 @@ void dbox_save_write_metadata(struct mail_save_context *_ctx,
 	string_t *str;
 	uoff_t vsize;
 
-	memset(&metadata_hdr, 0, sizeof(metadata_hdr));
+	i_zero(&metadata_hdr);
 	memcpy(metadata_hdr.magic_post, DBOX_MAGIC_POST,
 	       sizeof(metadata_hdr.magic_post));
 	o_stream_nsend(output, &metadata_hdr, sizeof(metadata_hdr));
@@ -164,11 +161,15 @@ void dbox_save_write_metadata(struct mail_save_context *_ctx,
 		str_printfa(str, "%c%s\n", DBOX_METADATA_POP3_UIDL,
 			    mdata->pop3_uidl);
 		ctx->have_pop3_uidls = TRUE;
+		ctx->highest_pop3_uidl_seq =
+			I_MAX(ctx->highest_pop3_uidl_seq, ctx->seq);
 	}
 	if (mdata->pop3_order != 0) {
 		str_printfa(str, "%c%u\n", DBOX_METADATA_POP3_ORDER,
 			    mdata->pop3_order);
 		ctx->have_pop3_orders = TRUE;
+		ctx->highest_pop3_uidl_seq =
+			I_MAX(ctx->highest_pop3_uidl_seq, ctx->seq);
 	}
 
 	guid = mdata->guid;

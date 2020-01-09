@@ -1,16 +1,15 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "safe-memset.h"
 #include "iostream-openssl.h"
+#include "dovecot-openssl-common.h"
 
 #include <openssl/crypto.h>
 #include <openssl/x509.h>
-#include <openssl/engine.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include <openssl/rand.h>
 
 #if !defined(OPENSSL_NO_ECDH) && OPENSSL_VERSION_NUMBER >= 0x10000000L
 #  define HAVE_ECDH
@@ -22,48 +21,32 @@ struct ssl_iostream_password_context {
 };
 
 static bool ssl_global_initialized = FALSE;
-static ENGINE *ssl_iostream_engine;
 int dovecot_ssl_extdata_index;
 
 static int ssl_iostream_init_global(const struct ssl_iostream_settings *set,
 				    const char **error_r);
 
-const char *openssl_iostream_error(void)
-{
-	unsigned long err;
-	char *buf;
-	size_t err_size = 256;
-
-	err = ERR_get_error();
-	if (err == 0) {
-		if (errno != 0)
-			return strerror(errno);
-		return "Unknown error";
-	}
-	if (ERR_GET_REASON(err) == ERR_R_MALLOC_FAILURE)
-		i_fatal_status(FATAL_OUTOFMEM, "OpenSSL malloc() failed");
-
-	buf = t_malloc(err_size);
-	buf[err_size-1] = '\0';
-	ERR_error_string_n(err, buf, err_size-1);
-	return buf;
-}
-
-const char *openssl_iostream_key_load_error(void)
-{
-       unsigned long err = ERR_peek_error();
-
-       if (ERR_GET_LIB(err) == ERR_LIB_X509 &&
-           ERR_GET_REASON(err) == X509_R_KEY_VALUES_MISMATCH)
-               return "Key is for a different cert than ssl_cert";
-       else
-               return openssl_iostream_error();
-}
-
 static RSA *ssl_gen_rsa_key(SSL *ssl ATTR_UNUSED,
 			    int is_export ATTR_UNUSED, int keylength)
 {
+#ifdef HAVE_RSA_GENERATE_KEY_EX
+	BIGNUM *bn = BN_new();
+	RSA *rsa = RSA_new();
+
+	if (bn != NULL && BN_set_word(bn, RSA_F4) != 0 &&
+	    RSA_generate_key_ex(rsa, keylength, bn, NULL) != 0) {
+		BN_free(bn);
+		return rsa;
+	}
+
+	if (bn != NULL)
+		BN_free(bn);
+	if (rsa != NULL)
+		RSA_free(rsa);
+	return NULL;
+#else
 	return RSA_generate_key(keylength, RSA_F4, NULL, NULL);
+#endif
 }
 
 static DH *ssl_tmp_dh_callback(SSL *ssl ATTR_UNUSED,
@@ -77,7 +60,7 @@ static DH *ssl_tmp_dh_callback(SSL *ssl ATTR_UNUSED,
 	if (is_export && keylength == 512 && ssl_io->ctx->dh_512 != NULL)
 		return ssl_io->ctx->dh_512;
 	else
-		return ssl_io->ctx->dh_1024;
+		return ssl_io->ctx->dh_default;
 }
 
 static int
@@ -150,27 +133,6 @@ ssl_iostream_ctx_use_key(struct ssl_iostream_context *ctx,
 	}
 	EVP_PKEY_free(pkey);
 	return ret;
-}
-
-static bool is_pem_key(const char *cert)
-{
-	return strstr(cert, "PRIVATE KEY---") != NULL;
-}
-
-const char *ssl_iostream_get_use_certificate_error(const char *cert)
-{
-	unsigned long err;
-
-	err = ERR_peek_error();
-	if (ERR_GET_LIB(err) != ERR_LIB_PEM ||
-	    ERR_GET_REASON(err) != PEM_R_NO_START_LINE)
-		return openssl_iostream_error();
-	else if (is_pem_key(cert)) {
-		return "The file contains a private key "
-			"(you've mixed ssl_cert and ssl_key settings)";
-	} else {
-		return "There is no certificate.";
-	}
 }
 
 static int ssl_ctx_use_certificate_chain(SSL_CTX *ctx, const char *cert)
@@ -305,8 +267,8 @@ static int ssl_servername_callback(SSL *ssl, int *al ATTR_UNUSED,
 	ssl_io = SSL_get_ex_data(ssl, dovecot_ssl_extdata_index);
 	host = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 	if (SSL_get_servername_type(ssl) != -1) {
-		i_free(ssl_io->host);
-		ssl_io->host = i_strdup(host);
+		i_free(ssl_io->sni_host);
+		ssl_io->sni_host = i_strdup(host);
 	} else if (ssl_io->verbose) {
 		i_debug("SSL_get_servername() failed");
 	}
@@ -348,7 +310,7 @@ ssl_iostream_context_load_ca(struct ssl_iostream_context *ctx,
 		have_ca = TRUE;
 	}
 
-	if (!have_ca) {
+	if (!have_ca && set->require_valid_cert) {
 		*error_r = !ctx->client_ctx ?
 			"Can't verify remote client certs without CA (ssl_ca setting)" :
 			"Can't verify remote server certs without trusted CAs (ssl_client_ca_* settings)";
@@ -374,14 +336,31 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 				    SSL_OP_CIPHER_SERVER_PREFERENCE);
 	}
 	if (ctx->set->protocols != NULL) {
+#ifdef HAVE_SSL_CTX_SET_MIN_PROTO_VERSION
+		int min_protocol;
+		const char *error;
+		if (ssl_protocols_to_min_protocol(ctx->set->protocols,
+						  &min_protocol, &error) < 0) {
+			*error_r = t_strdup_printf(
+				"Unknown ssl_protocols setting: %s", error);
+			return -1;
+		} else if (SSL_CTX_set_min_proto_version(ctx->ssl_ctx,
+							 min_protocol) != 1) {
+			*error_r = t_strdup_printf(
+				"Failed to set SSL minimum protocol version to %d",
+				min_protocol);
+			return -1;
+		}
+#else
 		SSL_CTX_set_options(ctx->ssl_ctx,
 			    openssl_get_protocol_options(ctx->set->protocols));
+#endif
 	}
 
 	if (set->cert != NULL &&
-	    ssl_ctx_use_certificate_chain(ctx->ssl_ctx, set->cert) < 0) {
+	    ssl_ctx_use_certificate_chain(ctx->ssl_ctx, set->cert) == 0) {
 		*error_r = t_strdup_printf("Can't load SSL certificate: %s",
-			ssl_iostream_get_use_certificate_error(set->cert));
+			openssl_iostream_use_certificate_error(set->cert, NULL));
 		return -1;
 	}
 	if (set->key != NULL) {
@@ -416,7 +395,7 @@ ssl_iostream_context_set(struct ssl_iostream_context *ctx,
 	return 0;
 }
 
-#if defined(HAVE_ECDH) && OPENSSL_VERSION_NUMBER < 0x10002000L
+#if defined(HAVE_ECDH) && !defined(SSL_CTX_set_ecdh_auto)
 static int
 ssl_proxy_ctx_get_pkey_ec_curve_name(const struct ssl_iostream_settings *set,
 				     int *nid_r, const char **error_r)
@@ -433,6 +412,10 @@ ssl_proxy_ctx_get_pkey_ec_curve_name(const struct ssl_iostream_settings *set,
 		if ((eckey = EVP_PKEY_get1_EC_KEY(pkey)) != NULL &&
 		    (ecgrp = EC_KEY_get0_group(eckey)) != NULL)
 			nid = EC_GROUP_get_curve_name(ecgrp);
+		else {
+			/* clear errors added by the above calls */
+			openssl_iostream_clear_errors();
+		}
 		EVP_PKEY_free(pkey);
 	}
 
@@ -446,7 +429,7 @@ ssl_proxy_ctx_set_crypto_params(SSL_CTX *ssl_ctx,
 				const struct ssl_iostream_settings *set ATTR_UNUSED,
 				const char **error_r ATTR_UNUSED)
 {
-#if defined(HAVE_ECDH) && OPENSSL_VERSION_NUMBER < 0x10002000L
+#if defined(HAVE_ECDH) && !defined(SSL_CTX_set_ecdh_auto)
 	EC_KEY *ecdh;
 	int nid;
 	const char *curve_name;
@@ -459,10 +442,15 @@ ssl_proxy_ctx_set_crypto_params(SSL_CTX *ssl_ctx,
 	   used instead of ECDHE, do not reuse the same ECDH key pair for
 	   different sessions. This option improves forward secrecy. */
 	SSL_CTX_set_options(ssl_ctx, SSL_OP_SINGLE_ECDH_USE);
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+#ifdef SSL_CTX_set_ecdh_auto
 	/* OpenSSL >= 1.0.2 automatically handles ECDH temporary key parameter
 	   selection. */
-	SSL_CTX_set_ecdh_auto(ssl_ctx, 1);
+	if (!SSL_CTX_set_ecdh_auto(ssl_ctx, 1)) {
+		/* shouldn't happen */
+		*error_r = t_strdup_printf("SSL_CTX_set_ecdh_auto() failed: %s",
+					   openssl_iostream_error());
+		return -1;
+	}
 #else
 	/* For OpenSSL < 1.0.2, ECDH temporary key parameter selection must be
 	   performed manually. Attempt to select the same curve as that used
@@ -499,12 +487,25 @@ ssl_iostream_context_init_common(struct ssl_iostream_context *ctx,
 				 const struct ssl_iostream_settings *set,
 				 const char **error_r)
 {
+	long ssl_ops = SSL_OP_NO_SSLv2 |
+		(SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS);
+
 	ctx->pool = pool_alloconly_create("ssl iostream context", 4096);
 
 	/* enable all SSL workarounds, except empty fragments as it
 	   makes SSL more vulnerable against attacks */
-	SSL_CTX_set_options(ctx->ssl_ctx, SSL_OP_NO_SSLv2 |
-			    (SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS));
+#ifdef SSL_OP_NO_COMPRESSION
+	if (!set->compression)
+		ssl_ops |= SSL_OP_NO_COMPRESSION;
+#endif
+#ifdef SSL_OP_NO_TICKET
+	if (!set->tickets)
+		ssl_ops |= SSL_OP_NO_TICKET;
+#endif
+	SSL_CTX_set_options(ctx->ssl_ctx, ssl_ops);
+#ifdef SSL_MODE_RELEASE_BUFFERS
+	SSL_CTX_set_mode(ctx->ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
+#endif
 	if (ssl_proxy_ctx_set_crypto_params(ctx->ssl_ctx, set, error_r) < 0)
 		return -1;
 
@@ -515,10 +516,14 @@ int openssl_iostream_context_init_client(const struct ssl_iostream_settings *set
 					 struct ssl_iostream_context **ctx_r,
 					 const char **error_r)
 {
+	struct ssl_iostream_settings set_copy = *set;
 	struct ssl_iostream_context *ctx;
 	SSL_CTX *ssl_ctx;
 
-	if (ssl_iostream_init_global(set, error_r) < 0)
+	/* ensure this is set to TRUE */
+	set_copy.verify_remote_cert = TRUE;
+
+	if (ssl_iostream_init_global(&set_copy, error_r) < 0)
 		return -1;
 	if ((ssl_ctx = SSL_CTX_new(SSLv23_client_method())) == NULL) {
 		*error_r = t_strdup_printf("SSL_CTX_new() failed: %s",
@@ -530,7 +535,7 @@ int openssl_iostream_context_init_client(const struct ssl_iostream_settings *set
 	ctx = i_new(struct ssl_iostream_context, 1);
 	ctx->ssl_ctx = ssl_ctx;
 	ctx->client_ctx = TRUE;
-	if (ssl_iostream_context_init_common(ctx, set, error_r) < 0) {
+	if (ssl_iostream_context_init_common(ctx, &set_copy, error_r) < 0) {
 		ssl_iostream_context_deinit(&ctx);
 		return -1;
 	}
@@ -573,52 +578,36 @@ void openssl_iostream_context_deinit(struct ssl_iostream_context *ctx)
 
 void openssl_iostream_global_deinit(void)
 {
-	if (ssl_iostream_engine != NULL)
-		ENGINE_finish(ssl_iostream_engine);
-	ENGINE_cleanup();
-	EVP_cleanup();
-	CRYPTO_cleanup_all_ex_data();
-	ERR_remove_state(0);
-	ERR_free_strings();
+	dovecot_openssl_common_global_unref();
 }
 
 static int ssl_iostream_init_global(const struct ssl_iostream_settings *set,
 				    const char **error_r)
 {
 	static char dovecot[] = "dovecot";
-	unsigned char buf;
+	const char *error;
 
 	if (ssl_global_initialized)
 		return 0;
 
 	ssl_global_initialized = TRUE;
-	SSL_library_init();
-	SSL_load_error_strings();
-	OpenSSL_add_all_algorithms();
+	dovecot_openssl_common_global_ref();
 
 	dovecot_ssl_extdata_index =
 		SSL_get_ex_new_index(0, dovecot, NULL, NULL, NULL);
 
-	/* PRNG initialization might want to use /dev/urandom, make sure it
-	   does it before chrooting. We might not have enough entropy at
-	   the first try, so this function may fail. It's still been
-	   initialized though. */
-	(void)RAND_bytes(&buf, 1);
-
 	if (set->crypto_device != NULL && *set->crypto_device != '\0') {
-		ENGINE_load_builtin_engines();
-		ssl_iostream_engine = ENGINE_by_id(set->crypto_device);
-		if (ssl_iostream_engine == NULL) {
-			*error_r = t_strdup_printf(
+		switch (dovecot_openssl_common_global_set_engine(set->crypto_device, &error)) {
+		case 0:
+			error = t_strdup_printf(
 				"Unknown ssl_crypto_device: %s",
 				set->crypto_device);
+			/* fall through */
+		case -1:
+			*error_r = error;
 			/* we'll deinit at exit in any case */
 			return -1;
 		}
-		ENGINE_init(ssl_iostream_engine);
-		ENGINE_set_default_RSA(ssl_iostream_engine);
-		ENGINE_set_default_DSA(ssl_iostream_engine);
-		ENGINE_set_default_ciphers(ssl_iostream_engine);
 	}
 	return 0;
 }

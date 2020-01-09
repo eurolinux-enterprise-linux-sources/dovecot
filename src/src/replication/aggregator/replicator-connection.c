@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -19,7 +19,8 @@
 struct replicator_connection {
 	char *path;
 	struct ip_addr *ips;
-	unsigned int ips_count, ip_idx, port;
+	unsigned int ips_count, ip_idx;
+	in_port_t port;
 
 	int fd;
 	struct io *io;
@@ -83,7 +84,7 @@ static bool
 replicator_send_buf(struct replicator_connection *conn, buffer_t *buf)
 {
 	const unsigned char *data = buf->data;
-	unsigned int len = IO_BLOCK_SIZE;
+	size_t len = IO_BLOCK_SIZE;
 
 	/* try to send about IO_BLOCK_SIZE amount of data,
 	   but only full lines */
@@ -229,7 +230,7 @@ replicator_connection_create_unix(const char *path,
 
 struct replicator_connection *
 replicator_connection_create_inet(const struct ip_addr *ips,
-				  unsigned int ips_count, unsigned int port,
+				  unsigned int ips_count, in_port_t port,
 				  replicator_sync_callback_t *callback)
 {
 	struct replicator_connection *conn;
@@ -264,7 +265,7 @@ static void
 replicator_send(struct replicator_connection *conn,
 		enum replication_priority priority, const char *data)
 {
-	unsigned int data_len = strlen(data);
+	size_t data_len = strlen(data);
 
 	if (conn->fd != -1 &&
 	    o_stream_get_buffer_used_size(conn->output) == 0) {

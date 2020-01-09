@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "str.h"
@@ -41,6 +41,8 @@ static int
 cmd_notify_parse_fetch(struct imap_notify_context *ctx,
 		       const struct imap_arg *list)
 {
+	if (list->type == IMAP_ARG_EOL)
+		return -1; /* at least one attribute must be set */
 	return imap_fetch_att_list_parse(ctx->client, ctx->pool, list,
 					 &ctx->fetch_ctx, &ctx->error);
 }
@@ -59,11 +61,17 @@ cmd_notify_set_selected(struct imap_notify_context *ctx,
 	    strcasecmp(str, "NONE") == 0) {
 		/* no events for selected mailbox. this is also the default
 		   when NOTIFY command doesn't specify it explicitly */
+		if (events[1].type != IMAP_ARG_EOL)
+			return -1; /* no extra parameters */
 		return 0;
 	}
 
 	if (!imap_arg_get_list(events, &list))
 		return -1;
+	if (events[1].type != IMAP_ARG_EOL)
+		return -1; /* no extra parameters */
+	if (list->type == IMAP_ARG_EOL)
+		return -1; /* at least one event */
 
 	for (; list->type != IMAP_ARG_EOL; list++) {
 		if (cmd_notify_parse_event(list, &event) < 0)
@@ -144,7 +152,8 @@ cmd_notify_add_mailbox(struct imap_notify_context *ctx,
 	struct imap_notify_namespace *notify_ns;
 	struct imap_notify_mailboxes *notify_boxes;
 	const char *const *names;
-	unsigned int i, count, cur_len, name_len = strlen(name);
+	unsigned int i, count;
+	size_t cur_len, name_len = strlen(name);
 	char ns_sep = mail_namespace_get_sep(ns);
 
 	if ((ns->flags & NAMESPACE_FLAG_INBOX_USER) != 0 &&
@@ -206,11 +215,34 @@ static void cmd_notify_add_personal(struct imap_notify_context *ctx,
 	}
 }
 
+static int
+imap_notify_refresh_subscriptions(struct client_command_context *cmd,
+				  struct imap_notify_context *ctx)
+{
+	struct mailbox_list_iterate_context *iter;
+	struct mail_namespace *ns;
+
+	if (!ctx->have_subscriptions)
+		return 0;
+
+	/* make sure subscriptions are refreshed at least once */
+	for (ns = ctx->client->user->namespaces; ns != NULL; ns = ns->next) {
+		iter = mailbox_list_iter_init(ns->list, "*", MAILBOX_LIST_ITER_SELECT_SUBSCRIBED);
+		(void)mailbox_list_iter_next(iter);
+		if (mailbox_list_iter_deinit(&iter) < 0) {
+			client_send_list_error(cmd, ns->list);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 static void cmd_notify_add_subscribed(struct imap_notify_context *ctx,
 				      enum imap_notify_event events)
 {
 	struct mail_namespace *ns;
 
+	ctx->have_subscriptions = TRUE;
 	for (ns = ctx->client->user->namespaces; ns != NULL; ns = ns->next) {
 		cmd_notify_add_mailbox(ctx, ns, "",
 				       IMAP_NOTIFY_TYPE_SUBSCRIBED, events);
@@ -225,11 +257,8 @@ cmd_notify_add_mailbox_namespaces(struct imap_notify_context *ctx,
 {
 	struct mail_namespace *ns;
 
-	/* add to all matching namespaces */
-	for (ns = ctx->client->user->namespaces; ns != NULL; ns = ns->next) {
-		if (mail_namespace_find(ns, name) == ns)
-			cmd_notify_add_mailbox(ctx, ns, name, type, events);
-	}
+	ns = mail_namespace_find(ctx->client->user->namespaces, name);
+	cmd_notify_add_mailbox(ctx, ns, name, type, events);
 }
 
 static int
@@ -298,7 +327,18 @@ cmd_notify_set(struct imap_notify_context *ctx, const struct imap_arg *args)
 
 		if (strcasecmp(filter_mailboxes, "subtree") == 0 ||
 		    strcasecmp(filter_mailboxes, "mailboxes") == 0) {
+			if (event_group->type == IMAP_ARG_EOL)
+				return -1;
 			mailboxes = event_group++;
+			/* check that the mailboxes parameter is valid */
+			if (IMAP_ARG_IS_ASTRING(mailboxes))
+				;
+			else if (!imap_arg_get_list(mailboxes, &list))
+				return -1;
+			else if (list->type == IMAP_ARG_EOL) {
+				/* should have at least one mailbox */
+				return -1;
+			}
 		} else {
 			mailboxes = NULL;
 		}
@@ -386,13 +426,17 @@ imap_notify_box_send_status(struct client_command_context *cmd,
 	    mailbox_equals(cmd->client->mailbox, info->ns, info->vname))
 		return;
 
-	memset(&items, 0, sizeof(items));
-	memset(&result, 0, sizeof(result));
+	i_zero(&items);
+	i_zero(&result);
 
 	items.status = STATUS_UIDVALIDITY | STATUS_UIDNEXT |
 		STATUS_MESSAGES | STATUS_UNSEEN;
+	if ((ctx->global_used_events & (IMAP_NOTIFY_EVENT_FLAG_CHANGE |
+					IMAP_NOTIFY_EVENT_ANNOTATION_CHANGE)) != 0)
+		items.status |= STATUS_HIGHESTMODSEQ;
 
 	box = mailbox_alloc(info->ns->list, info->vname, MAILBOX_FLAG_READONLY);
+	mailbox_set_reason(box, "NOTIFY send STATUS");
 	if (ctx->client->enabled_features != 0)
 		(void)mailbox_enable(box, ctx->client->enabled_features);
 
@@ -521,6 +565,10 @@ bool cmd_notify(struct client_command_context *cmd)
 	} else if (ctx->global_max_mailbox_names > IMAP_NOTIFY_MAX_NAMES_PER_NS) {
 		client_send_tagline(cmd,
 			"NO [NOTIFICATIONOVERFLOW] Too many mailbox names");
+		pool_unref(&pool);
+		return TRUE;
+	} else if (imap_notify_refresh_subscriptions(cmd, ctx) < 0) {
+		/* tagline already sent */
 		pool_unref(&pool);
 		return TRUE;
 	} else if (imap_notify_begin(ctx) < 0) {

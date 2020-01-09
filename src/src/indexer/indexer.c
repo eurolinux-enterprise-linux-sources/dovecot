@@ -1,6 +1,7 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "ioloop.h"
 #include "restrict-access.h"
 #include "process-title.h"
 #include "master-service.h"
@@ -18,6 +19,7 @@ struct worker_request {
 static const struct master_service_settings *set;
 static struct indexer_queue *queue;
 static struct worker_pool *worker_pool;
+static struct timeout *to_send_more;
 
 void indexer_refresh_proctitle(void)
 {
@@ -50,25 +52,8 @@ static void worker_send_request(struct worker_connection *conn,
 	wrequest->conn = conn;
 	wrequest->request = request;
 
+	indexer_queue_request_work(request);
 	worker_connection_request(conn, request, wrequest);
-}
-
-static void queue_handle_existing_user_requests(struct indexer_queue *queue)
-{
-	struct worker_connection *conn;
-	struct indexer_request *request;
-
-	while ((request = indexer_queue_request_peek(queue)) != NULL) {
-		conn = worker_pool_find_username_connection(worker_pool,
-							    request->username);
-		if (conn == NULL)
-			break;
-
-		indexer_queue_request_remove(queue);
-		/* there is already a worker handling this user.
-		   it must be the one doing the indexing. */
-		worker_send_request(conn, request);
-	}
 }
 
 static void queue_try_send_more(struct indexer_queue *queue)
@@ -76,18 +61,24 @@ static void queue_try_send_more(struct indexer_queue *queue)
 	struct worker_connection *conn;
 	struct indexer_request *request;
 
-	queue_handle_existing_user_requests(queue);
+	if (to_send_more != NULL)
+		timeout_remove(&to_send_more);
 
-	request = indexer_queue_request_peek(queue);
-	if (request == NULL)
-		return;
-
-	/* okay, we have a request for a new user. */
-	if (!worker_pool_get_connection(worker_pool, &conn))
-		return;
-
-	indexer_queue_request_remove(queue);
-	worker_send_request(conn, request);
+	while ((request = indexer_queue_request_peek(queue)) != NULL) {
+		conn = worker_pool_find_username_connection(worker_pool,
+							    request->username);
+		if (conn != NULL) {
+			/* there is already a worker handling this user.
+			   it must be the one doing the indexing. use the same
+			   connection for sending this next request. */
+		} else {
+			/* try to find an empty worker */
+			if (!worker_pool_get_connection(worker_pool, &conn))
+				break;
+		}
+		indexer_queue_request_remove(queue);
+		worker_send_request(conn, request);
+	}
 }
 
 static void queue_listen_callback(struct indexer_queue *queue)
@@ -112,8 +103,10 @@ static void worker_status_callback(int percentage, void *context)
 	i_free(request);
 
 	/* if this was the last request for the connection, we can send more
-	   through it */
-	queue_try_send_more(queue);
+	   through it. delay it a bit, since we may be coming here from
+	   worker_connection_disconnect() and we want to finish it up. */
+	if (to_send_more == NULL)
+		to_send_more = timeout_add_short(0, queue_try_send_more, queue);
 }
 
 int main(int argc, char *argv[])
@@ -146,6 +139,8 @@ int main(int argc, char *argv[])
 	indexer_clients_destroy_all();
 	worker_pool_deinit(&worker_pool);
 	indexer_queue_deinit(&queue);
+	if (to_send_more != NULL)
+		timeout_remove(&to_send_more);
 
 	master_service_deinit(&master_service);
         return 0;

@@ -9,22 +9,38 @@ Compiling
 
 Give '--with-solr' parameter to 'configure' script. You'll also need to have
 libexpat and libcurl installed (if packages do not exist dovecot will compile
-without solr support).YUM: expat-devel, curl-devel
+without solr support). YUM: expat-devel, curl-devel
 
 Configuration
 -------------
 
+Solr Schema
+-----------
+
 Replace Solr's existing 'solr/conf/schema.xml' using 'doc/solr-schema.xml' from
-Dovecot. You may want to check if the file contains something you want to
-modify. See Solr wiki [http://wiki.apache.org/solr/SchemaXml] for how to
-configure it.
+Dovecot.
+
+If you only have a 'managed-schema' file: copy 'schema.xml' to that folder,
+delete 'managed-schema' file and remove or comment out (be aware not to have
+recursive comment) the block '<updateRequestProcessorChain
+name="add-unknown-fields-to-the-schema">' from 'solrconfig.xml'. Then restart
+Solr. The 'managed-schema' file will be rebuild from 'schema.xml'. (See 1
+[http://stackoverflow.com/questions/37989084/solr-6-1-where-is-my-collections-managed-schema-file],
+2
+[http://stackoverflow.com/questions/30673095/using-schema-xml-instead-of-managed-schema-with-solr-5-1-x])
+
+You may want to check if the file contains something you want to modify. See
+Solr wiki [http://wiki.apache.org/solr/SchemaXml] for how to configure it.
+
+Dovecot Plugin
+--------------
 
 On Dovecot's side add:
 
-Into 10-mail.conf (note add existing plugins to sting)
+Into 10-mail.conf (note add existing plugins to string)
 
 ---%<-------------------------------------------------------------------------
-mail_plugins = fts fts_solr
+mail_plugins = $mail_plugins fts fts_solr
 ---%<-------------------------------------------------------------------------
 
 Into 90-plugins.conf
@@ -46,8 +62,8 @@ contain:
 
 Important notes:
 
- * Some mail clients will not submit any search requests for certian fields if
-   they index things localy eg. Thunderbird will not send any requests for
+ * Some mail clients will not submit any search requests for certain fields if
+   they index things locally eg. Thunderbird will not send any requests for
    fields such as sender/recipients/subject when Body is not included as this
    data is contained within the local index.
 
@@ -83,7 +99,7 @@ doveadm fts rescan -u <username>
 ---%<-------------------------------------------------------------------------
 
 If you want to index a single mailbox/all mailboxes you can run the command
-shown, this will happen immediately and will blocking until action is
+shown, this will happen immediately and will block until the action is
 completed.
 
 ---%<-------------------------------------------------------------------------
@@ -112,8 +128,7 @@ Dovecot creates the following fields:
  * uid: Message's IMAP UID.
  * uidv: Mailbox's UIDVALIDITY. This changes if mailbox gets recreated.
  * box: Mailbox name
- * user: User name who owns the mailbox (indexing shared/public mailboxes is
-   probably broken currently)
+ * user: User name who owns the mailbox, or empty for public namespaces
  * hdr: Indexed message headers
  * body: Indexed message body
  * any: "Copy field" from hdr and body, i.e. searching based on this will
@@ -159,12 +174,25 @@ External Tutorials
 
 External sites with tutorials on using Solr under Dovecot
 
- * Installing Apache Solr with Dovecot for fulltext search results
-   [http://atmail.com/kb/2009/installing-apache-solr-with-dovecot-for-fulltext-search-results/]
-   - Guide for installing all the dependencies for Solr to work under
-   CentOS/Fedora. Step by step tutorial.
  * Installing Apache Solr with Dovecot for fulltext search results (ATmail
    support guide)
-   [http://support.atmail.com/display/AKB/Installing+Apache+Solr+with+Dovecot+for+fulltext+search+results]
+   [https://help.atmail.com/hc/en-us/articles/201566404-Installing-Apache-Solr-with-Dovecot-for-fulltext-search-results]
+ * Linux: http://things.m31.ch/?p=379
+ * FreeBSD: http://mor-pah.net/2016/08/15/dovecot-2-2-with-solr-6-or-5/
+ * Substring searches with ngrams:
+   https://www.dovecot.org/list/dovecot/2011-May/059338.html
 
-(This file was created from the wiki on 2013-12-19 04:42)
+Tips
+----
+
+Some additional things which might help you configuring Solr search:
+
+ * If you are using Tomcat: Set 'maxHttpHeaderSize="65536"' (connector
+   definition for port 8080 in '/etc/tomcat7/server.xml') to accept long search
+   query strings (iPhones tend to send multi-kilobyte-sized queries)
+ * Set 'df' to 'hdr' in '/etc/solr/conf/solrconfig.xml' ('/select' request
+   handler) to avoid strange 'undefined field text' errors.
+ * Please keep in mind that you will have to change the Solr URL to include the
+   core name (ie:'dovecot': 'http://localhost:8939/solr/dovecot').
+
+(This file was created from the wiki on 2018-05-23 04:42)

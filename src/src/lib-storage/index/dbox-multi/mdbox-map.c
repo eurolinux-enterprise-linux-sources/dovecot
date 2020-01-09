@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -11,7 +11,6 @@
 #include "mdbox-file.h"
 #include "mdbox-map-private.h"
 
-#include <stdlib.h>
 #include <dirent.h>
 
 #define MAX_BACKWARDS_LOOKUPS 10
@@ -170,8 +169,7 @@ static int mdbox_map_open_internal(struct mdbox_map *map, bool create_missing)
 		ret = mail_index_open(map->index, open_flags);
 	}
 	if (ret < 0) {
-		mail_storage_set_internal_error(MAP_STORAGE(map));
-		mail_index_reset_error(map->index);
+		mail_storage_set_index_error(MAP_STORAGE(map), map->index);
 		return -1;
 	}
 	if (ret == 0) {
@@ -184,10 +182,12 @@ static int mdbox_map_open_internal(struct mdbox_map *map, bool create_missing)
 	mdbox_map_cleanup(map);
 
 	if (mail_index_get_header(map->view)->uid_validity == 0) {
-		if (mdbox_map_generate_uid_validity(map) < 0 ||
-		    mdbox_map_refresh(map) < 0) {
-			mail_storage_set_internal_error(MAP_STORAGE(map));
-			mail_index_reset_error(map->index);
+		if (mdbox_map_generate_uid_validity(map) < 0) {
+			mail_storage_set_index_error(MAP_STORAGE(map), map->index);
+			mail_index_close(map->index);
+			return -1;
+		}
+		if (mdbox_map_refresh(map) < 0) {
 			mail_index_close(map->index);
 			return -1;
 		}
@@ -217,8 +217,7 @@ int mdbox_map_refresh(struct mdbox_map *map)
 	mdbox_files_sync_input(map->storage);
 
 	if (mail_index_refresh(map->view->index) < 0) {
-		mail_storage_set_internal_error(MAP_STORAGE(map));
-		mail_index_reset_error(map->index);
+		mail_storage_set_index_error(MAP_STORAGE(map), map->index);
 		return -1;
 	}
 	if (mail_index_view_get_transaction_count(map->view) > 0) {
@@ -230,13 +229,25 @@ int mdbox_map_refresh(struct mdbox_map *map)
 				MAIL_INDEX_VIEW_SYNC_FLAG_FIX_INCONSISTENT);
 	fscked = mail_index_reset_fscked(map->view->index);
 	if (mail_index_view_sync_commit(&ctx, &delayed_expunges) < 0) {
-		mail_storage_set_internal_error(MAP_STORAGE(map));
-		mail_index_reset_error(map->index);
+		mail_storage_set_index_error(MAP_STORAGE(map), map->index);
 		ret = -1;
 	}
 	if (fscked)
 		mdbox_storage_set_corrupted(map->storage);
 	return ret;
+}
+
+bool mdbox_map_is_fscked(struct mdbox_map *map)
+{
+	const struct mail_index_header *hdr;
+
+	if (map->view == NULL) {
+		/* map isn't opened yet. don't bother. */
+		return FALSE;
+	}
+
+	hdr = mail_index_get_header(map->view);
+	return (hdr->flags & MAIL_INDEX_HDR_FLAG_FSCKD) != 0;
 }
 
 static void
@@ -247,7 +258,7 @@ mdbox_map_get_ext_hdr(struct mdbox_map *map, struct mail_index_view *view,
 	size_t data_size;
 
 	mail_index_get_header_ext(view, map->map_ext_id, &data, &data_size);
-	memset(hdr_r, 0, sizeof(*hdr_r));
+	i_zero(hdr_r);
 	memcpy(hdr_r, data, I_MIN(data_size, sizeof(*hdr_r)));
 }
 
@@ -370,7 +381,7 @@ int mdbox_map_view_lookup_rec(struct mdbox_map *map,
 	const uint16_t *ref16_p;
 	const void *data;
 
-	memset(rec_r, 0, sizeof(*rec_r));
+	i_zero(rec_r);
 	mail_index_lookup_uid(view, seq, &rec_r->map_uid);
 
 	mail_index_lookup_ext(view, seq, map->map_ext_id, &data, NULL);
@@ -402,7 +413,7 @@ int mdbox_map_get_file_msgs(struct mdbox_map *map, uint32_t file_id,
 		return -1;
 	hdr = mail_index_get_header(map->view);
 
-	memset(&msg, 0, sizeof(msg));
+	i_zero(&msg);
 	for (seq = 1; seq <= hdr->messages_count; seq++) {
 		if (mdbox_map_view_lookup_rec(map, map->view, seq, &rec) < 0)
 			return -1;
@@ -479,12 +490,12 @@ mdbox_map_sync_handle(struct mdbox_map *map,
 			  "(%u,%"PRIuUOFF_T" != %u,%"PRIuUOFF_T")",
 			  map->path, seq1, offset1, seq2, offset2);
 		mdbox_storage_set_corrupted(map->storage);
-	} else {
-		while (mail_index_sync_next(sync_ctx, &sync_rec)) ;
 	}
+	while (mail_index_sync_next(sync_ctx, &sync_rec)) ;
 }
 
-int mdbox_map_atomic_lock(struct mdbox_map_atomic_context *atomic)
+int mdbox_map_atomic_lock(struct mdbox_map_atomic_context *atomic,
+			  const char *reason)
 {
 	int ret;
 
@@ -497,15 +508,17 @@ int mdbox_map_atomic_lock(struct mdbox_map_atomic_context *atomic)
 	/* use syncing to lock the transaction log, so that we always see
 	   log's head_offset = tail_offset */
 	ret = mail_index_sync_begin(atomic->map->index, &atomic->sync_ctx,
-				    &atomic->sync_view, &atomic->sync_trans, 0);
+				    &atomic->sync_view, &atomic->sync_trans,
+				    MAIL_INDEX_SYNC_FLAG_UPDATE_TAIL_OFFSET);
 	if (mail_index_reset_fscked(atomic->map->index))
 		mdbox_storage_set_corrupted(atomic->map->storage);
 	if (ret <= 0) {
 		i_assert(ret != 0);
-		mail_storage_set_internal_error(MAP_STORAGE(atomic->map));
-		mail_index_reset_error(atomic->map->index);
+		mail_storage_set_index_error(MAP_STORAGE(atomic->map),
+					     atomic->map->index);
 		return -1;
 	}
+	mail_index_sync_set_reason(atomic->sync_ctx, reason);
 	atomic->locked = TRUE;
 	/* reset refresh state so that if it's wanted to be done locked,
 	   it gets the latest changes */
@@ -531,6 +544,11 @@ void mdbox_map_atomic_set_success(struct mdbox_map_atomic_context *atomic)
 		atomic->success = TRUE;
 }
 
+void mdbox_map_atomic_unset_fscked(struct mdbox_map_atomic_context *atomic)
+{
+	mail_index_unset_fscked(atomic->sync_trans);
+}
+
 int mdbox_map_atomic_finish(struct mdbox_map_atomic_context **_atomic)
 {
 	struct mdbox_map_atomic_context *atomic = *_atomic;
@@ -543,8 +561,8 @@ int mdbox_map_atomic_finish(struct mdbox_map_atomic_context **_atomic)
 		i_assert(!atomic->locked);
 	} else if (atomic->success) {
 		if (mail_index_sync_commit(&atomic->sync_ctx) < 0) {
-			mail_storage_set_internal_error(MAP_STORAGE(atomic->map));
-			mail_index_reset_error(atomic->map->index);
+			mail_storage_set_index_error(MAP_STORAGE(atomic->map),
+						     atomic->map->index);
 			ret = -1;
 		}
 	} else {
@@ -584,7 +602,8 @@ mdbox_map_transaction_begin(struct mdbox_map_atomic_context *atomic,
 	return ctx;
 }
 
-int mdbox_map_transaction_commit(struct mdbox_map_transaction_context *ctx)
+int mdbox_map_transaction_commit(struct mdbox_map_transaction_context *ctx,
+				 const char *reason)
 {
 	i_assert(!ctx->committed);
 
@@ -592,12 +611,12 @@ int mdbox_map_transaction_commit(struct mdbox_map_transaction_context *ctx)
 	if (!ctx->changed)
 		return 0;
 
-	if (mdbox_map_atomic_lock(ctx->atomic) < 0)
+	if (mdbox_map_atomic_lock(ctx->atomic, reason) < 0)
 		return -1;
 
 	if (mail_index_transaction_commit(&ctx->trans) < 0) {
-		mail_storage_set_internal_error(MAP_STORAGE(ctx->atomic->map));
-		mail_index_reset_error(ctx->atomic->map->index);
+		mail_storage_set_index_error(MAP_STORAGE(ctx->atomic->map),
+					     ctx->atomic->map->index);
 		return -1;
 	}
 	mdbox_map_atomic_set_success(ctx->atomic);
@@ -653,7 +672,7 @@ int mdbox_map_update_refcount(struct mdbox_map_transaction_context *ctx,
 		/* we're getting close to the 64k limit. fail early
 		   to make it less likely that two processes increase
 		   the refcount enough times to cross the limit */
-		mail_storage_set_error(MAP_STORAGE(map), MAIL_ERROR_NOTPOSSIBLE,
+		mail_storage_set_error(MAP_STORAGE(map), MAIL_ERROR_LIMIT,
 			t_strdup_printf("Message has been copied too many times (%d + %d)",
 					old_diff, new_diff));
 		return -1;
@@ -713,7 +732,7 @@ int mdbox_map_remove_file_id(struct mdbox_map *map, uint32_t file_id)
 		}
 	}
 	if (ret == 0)
-		ret = mdbox_map_transaction_commit(map_trans);
+		ret = mdbox_map_transaction_commit(map_trans, "removing file");
 	mdbox_map_transaction_free(&map_trans);
 	if (mdbox_map_atomic_finish(&atomic) < 0)
 		ret = -1;
@@ -909,9 +928,6 @@ mdbox_map_find_existing_append(struct mdbox_map_append_context *ctx,
 	unsigned int i, count;
 	uoff_t append_offset;
 
-	if (mail_size >= map->set->mdbox_rotate_size)
-		return NULL;
-
 	/* first try to use files already used in this append */
 	file_appends = array_get(&ctx->file_appends, &count);
 	for (i = count; i > ctx->files_nonappendable_count; i--) {
@@ -1086,7 +1102,7 @@ int mdbox_map_append_next(struct mdbox_map_append_context *ctx,
 		ret = 1;
 		existing = TRUE;
 	} else {
-		ret = mdbox_map_find_appendable_file(ctx, mail_size, flags,
+		ret = mdbox_map_find_appendable_file(ctx, mail_size, want_altpath,
 						     &file_append, output_r);
 		existing = FALSE;
 	}
@@ -1173,7 +1189,7 @@ void mdbox_map_append_abort(struct mdbox_map_append_context *ctx)
 static int
 mdbox_find_highest_file_id(struct mdbox_map *map, uint32_t *file_id_r)
 {
-	const unsigned int prefix_len = strlen(MDBOX_MAIL_FILE_PREFIX);
+	const size_t prefix_len = strlen(MDBOX_MAIL_FILE_PREFIX);
 	DIR *dir;
 	struct dirent *d;
 	unsigned int id, highest_id = 0;
@@ -1196,8 +1212,9 @@ mdbox_find_highest_file_id(struct mdbox_map *map, uint32_t *file_id_r)
 	return 0;
 }
 
-static int mdbox_map_assign_file_ids(struct mdbox_map_append_context *ctx,
-				     bool separate_transaction)
+static int
+mdbox_map_assign_file_ids(struct mdbox_map_append_context *ctx,
+			  bool separate_transaction, const char *reason)
 {
 	struct dbox_file_append_context *const *file_appends;
 	unsigned int i, count;
@@ -1206,7 +1223,7 @@ static int mdbox_map_assign_file_ids(struct mdbox_map_append_context *ctx,
 
 	/* start the syncing. we'll need it even if there are no file ids to
 	   be assigned. */
-	if (mdbox_map_atomic_lock(ctx->atomic) < 0)
+	if (mdbox_map_atomic_lock(ctx->atomic, reason) < 0)
 		return -1;
 
 	mdbox_map_get_ext_hdr(ctx->map, ctx->atomic->sync_view, &hdr);
@@ -1274,11 +1291,11 @@ int mdbox_map_append_assign_map_uids(struct mdbox_map_append_context *ctx,
 		return 0;
 	}
 
-	if (mdbox_map_assign_file_ids(ctx, TRUE) < 0)
+	if (mdbox_map_assign_file_ids(ctx, TRUE, "saving - assign uids") < 0)
 		return -1;
 
 	/* append map records to index */
-	memset(&rec, 0, sizeof(rec));
+	i_zero(&rec);
 	ref16 = 1;
 	appends = array_get(&ctx->appends, &count);
 	for (i = 0; i < count; i++) {
@@ -1315,8 +1332,8 @@ int mdbox_map_append_assign_map_uids(struct mdbox_map_append_context *ctx,
 	}
 
 	if (mail_index_transaction_commit(&ctx->trans) < 0) {
-		mail_storage_set_internal_error(MAP_STORAGE(ctx->map));
-		mail_index_reset_error(ctx->map->index);
+		mail_storage_set_index_error(MAP_STORAGE(ctx->map),
+					     ctx->map->index);
 		return -1;
 	}
 
@@ -1334,14 +1351,16 @@ int mdbox_map_append_move(struct mdbox_map_append_context *ctx,
 	struct seq_range_iter iter;
 	const uint32_t *uids;
 	unsigned int i, j, map_uids_count, appends_count;
-	uint32_t uid, seq;
+	uint32_t uid, seq, next_uid;
 
-	if (mdbox_map_assign_file_ids(ctx, FALSE) < 0)
+	/* map is locked by this call */
+	if (mdbox_map_assign_file_ids(ctx, FALSE, "purging - update uids") < 0)
 		return -1;
 
-	memset(&rec, 0, sizeof(rec));
+	i_zero(&rec);
 	appends = array_get(&ctx->appends, &appends_count);
 
+	next_uid = mail_index_get_header(ctx->atomic->sync_view)->next_uid;
 	uids = array_get(map_uids, &map_uids_count);
 	for (i = j = 0; i < map_uids_count; i++) {
 		struct mdbox_file *mfile =
@@ -1354,8 +1373,15 @@ int mdbox_map_append_move(struct mdbox_map_append_context *ctx,
 		j++;
 
 		if (!mail_index_lookup_seq(ctx->atomic->sync_view,
-					   uids[i], &seq))
-			i_unreached();
+					   uids[i], &seq)) {
+			/* We wrote the email to the new m.* file, but another
+			   process already expunged it and purged it. Deleting
+			   the email from the new m.* file would be problematic
+			   at this point, so just add the mail back to the map
+			   with refcount=0 and the next purge will remove it. */
+			mail_index_append(ctx->atomic->sync_trans,
+					  next_uid++, &seq);
+		}
 		mail_index_update_ext(ctx->atomic->sync_trans, seq,
 				      ctx->map->map_ext_id, &rec, NULL);
 	}
@@ -1457,6 +1483,7 @@ static int mdbox_map_generate_uid_validity(struct mdbox_map *map)
 			offsetof(struct mail_index_header, uid_validity),
 			&uid_validity, sizeof(uid_validity), TRUE);
 	}
+	mail_index_sync_set_reason(sync_ctx, "uidvalidity initialization");
 	return mail_index_sync_commit(&sync_ctx);
 }
 

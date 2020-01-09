@@ -1,9 +1,8 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "test-lib.h"
 #include "priorityq.h"
 
-#include <stdlib.h>
 
 struct pq_test_item {
 	struct priorityq_item item;
@@ -62,8 +61,10 @@ void test_priorityq(void)
 			test_assert(priorityq_count(pq) == N_ELEMENTS(output) - j);
 
 			item = (struct pq_test_item *)priorityq_peek(pq);
+			i_assert(item != NULL);
 			test_assert(output[j] == item->num);
 			item = (struct pq_test_item *)priorityq_pop(pq);
+			i_assert(item != NULL);
 			test_assert(output[j] == item->num);
 		}
 		test_assert(priorityq_count(pq) == 0);
@@ -90,6 +91,7 @@ void test_priorityq(void)
 		prev = 0;
 		while (priorityq_count(pq) > 0) {
 			item = (struct pq_test_item *)priorityq_pop(pq);
+			i_assert(item != NULL);
 			test_assert(item->num >= 0 && prev <= item->num);
 			prev = item->num;
 			item->num = -1;

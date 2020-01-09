@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "common.h"
 #include "array.h"
@@ -30,7 +30,7 @@ static int service_log_fds_init(const char *log_prefix, int log_fd[2],
 	fd_close_on_exec(log_fd[0], TRUE);
 	fd_close_on_exec(log_fd[1], TRUE);
 
-	memset(&handshake, 0, sizeof(handshake));
+	i_zero(&handshake);
 	handshake.log_magic = MASTER_LOG_MAGIC;
 	handshake.prefix_len = strlen(log_prefix);
 
@@ -54,6 +54,11 @@ static int
 service_process_write_log_bye(int fd, struct service_process *process)
 {
 	const char *data;
+
+	if (process->service->log_process_internal_fd == -1) {
+		/* another log process was just destroyed */
+		return 0;
+	}
 
 	data = t_strdup_printf("%d %s BYE\n",
 			       process->service->log_process_internal_fd,

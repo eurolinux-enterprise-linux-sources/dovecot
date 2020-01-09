@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 /* @UNSAFE: whole file */
 
@@ -19,6 +19,7 @@ struct real_buffer {
 	unsigned int alloced:1;
 	unsigned int dynamic:1;
 };
+typedef int buffer_check_sizes[COMPILE_ERROR_IF_TRUE(sizeof(struct real_buffer) > sizeof(buffer_t)) ?1:1];
 
 static void buffer_alloc(struct real_buffer *buf, size_t size)
 {
@@ -29,7 +30,10 @@ static void buffer_alloc(struct real_buffer *buf, size_t size)
 
 	i_assert(size > buf->alloc);
 
-	buf->w_buffer = p_realloc(buf->pool, buf->w_buffer, buf->alloc, size);
+	if (buf->w_buffer == NULL)
+		buf->w_buffer = p_malloc(buf->pool, size);
+	else
+		buf->w_buffer = p_realloc(buf->pool, buf->w_buffer, buf->alloc, size);
 	buf->alloc = size;
 
 	buf->r_buffer = buf->w_buffer;
@@ -93,6 +97,7 @@ buffer_check_limits(struct real_buffer *buf, size_t pos, size_t data_size)
 	i_assert(buf->used <= buf->alloc);
 }
 
+#undef buffer_create_from_data
 void buffer_create_from_data(buffer_t *buffer, void *data, size_t size)
 {
 	struct real_buffer *buf;
@@ -100,7 +105,7 @@ void buffer_create_from_data(buffer_t *buffer, void *data, size_t size)
 	i_assert(sizeof(*buffer) >= sizeof(struct real_buffer));
 
 	buf = (struct real_buffer *)buffer;
-	memset(buf, 0, sizeof(*buf));
+	i_zero(buf);
 	buf->alloc = size;
 	buf->r_buffer = buf->w_buffer = data;
 	/* clear the whole memory area. unnecessary usually, but if the
@@ -109,6 +114,7 @@ void buffer_create_from_data(buffer_t *buffer, void *data, size_t size)
 	memset(data, 0, size);
 }
 
+#undef buffer_create_from_const_data
 void buffer_create_from_const_data(buffer_t *buffer,
 				   const void *data, size_t size)
 {
@@ -117,7 +123,7 @@ void buffer_create_from_const_data(buffer_t *buffer,
 	i_assert(sizeof(*buffer) >= sizeof(struct real_buffer));
 
 	buf = (struct real_buffer *)buffer;
-	memset(buf, 0, sizeof(*buf));
+	i_zero(buf);
 
 	buf->used = buf->alloc = size;
 	buf->r_buffer = data;
@@ -131,7 +137,10 @@ buffer_t *buffer_create_dynamic(pool_t pool, size_t init_size)
 	buf = p_new(pool, struct real_buffer, 1);
 	buf->pool = pool;
 	buf->dynamic = TRUE;
-	buffer_alloc(buf, init_size);
+	/* buffer_alloc() reserves +1 for str_c() NIL, so add +1 here to
+	   init_size so we can actually write that much to the buffer without
+	   realloc */
+	buffer_alloc(buf, init_size+1);
 	return (buffer_t *)buf;
 }
 
@@ -176,7 +185,8 @@ void buffer_write(buffer_t *_buf, size_t pos,
 	struct real_buffer *buf = (struct real_buffer *)_buf;
 
 	buffer_check_limits(buf, pos, data_size);
-	memcpy(buf->w_buffer + pos, data, data_size);
+	if (data_size > 0)
+		memcpy(buf->w_buffer + pos, data, data_size);
 }
 
 void buffer_append(buffer_t *buf, const void *data, size_t data_size)
@@ -319,6 +329,20 @@ size_t buffer_get_size(const buffer_t *_buf)
 	return buf->alloc;
 }
 
+size_t buffer_get_writable_size(const buffer_t *_buf)
+{
+	const struct real_buffer *buf = (const struct real_buffer *)_buf;
+
+	if (!buf->dynamic || buf->alloc == 0)
+		return buf->alloc;
+
+	/* we reserve +1 for str_c() NUL in buffer_check_limits(), so don't
+	   include that in our return value. otherwise the caller might
+	   increase the buffer's alloc size unnecessarily when it just wants
+	   to access the entire buffer. */
+	return buf->alloc-1;
+}
+
 bool buffer_cmp(const buffer_t *buf1, const buffer_t *buf2)
 {
 	if (buf1->used != buf2->used)
@@ -340,3 +364,28 @@ void buffer_verify_pool(buffer_t *_buf)
 		i_assert(ret == buf->w_buffer);
 	}
 }
+
+void buffer_truncate_rshift_bits(buffer_t *buf, size_t bits)
+{
+	/* no-op if it's shorten than bits in any case.. */
+	if (buf->used * 8 < bits) return;
+
+	if (bits > 0) {
+		/* truncate it to closest byte boundary */
+		size_t bytes = ((bits + 7) & -8U)/8;
+		/* remainding bits */
+		bits = bits % 8;
+		buffer_set_used_size(buf, I_MIN(bytes, buf->used));
+		unsigned char *ptr = buffer_get_modifiable_data(buf, &bytes);
+		/* right shift over byte array */
+		if (bits > 0) {
+			for(size_t i=bytes-1;i>0;i--)
+				ptr[i] = (ptr[i]>>(8-bits)) +
+					 ((ptr[i-1]&(0xff>>(bits)))<<bits);
+			ptr[0] = ptr[0]>>(8-bits);
+		}
+	} else {
+		buffer_set_used_size(buf, 0);
+	}
+}
+

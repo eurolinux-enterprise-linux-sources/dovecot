@@ -22,13 +22,13 @@ struct pool_vfuncs {
 	void (*ref)(pool_t pool);
 	void (*unref)(pool_t *pool);
 
-	void *(*malloc)(pool_t pool, size_t size);
+	void *(*malloc)(pool_t pool, size_t size) ATTR_RETURNS_NONNULL;
 	void (*free)(pool_t pool, void *mem);
 
 	/* memory in old_size..new_size will be zeroed */
 	void *(*realloc)(pool_t pool, void *mem,
 			 size_t old_size, size_t new_size)
-		ATTR_WARN_UNUSED_RESULT;
+		ATTR_WARN_UNUSED_RESULT ATTR_RETURNS_NONNULL;
 
 	/* Frees all the memory in pool. NOTE: system_pool doesn't support
 	   this and crashes if it's used */
@@ -57,6 +57,11 @@ extern pool_t unsafe_data_stack_pool;
 /* Create a new alloc-only pool. Note that `size' specifies the initial
    malloc()ed block size, part of it is used internally. */
 pool_t pool_alloconly_create(const char *name, size_t size);
+/* Like alloconly pool, but clear the memory before freeing it. The idea is
+   that you could allocate memory for storing sensitive information from this
+   pool, and be sure that it gets cleared from the memory when it's no longer
+   needed. */
+pool_t pool_alloconly_create_clean(const char *name, size_t size);
 
 /* When allocating memory from returned pool, the data stack frame must be
    the same as it was when calling this function. pool_unref() also checks
@@ -68,17 +73,29 @@ pool_t pool_datastack_create(void);
    old_size + 1. */
 size_t pool_get_exp_grown_size(pool_t pool, size_t old_size, size_t min_size);
 
-/* Pools should be used through these macros: */
-#define pool_get_name(pool) (pool)->v->get_name(pool)
-#define pool_ref(pool) (pool)->v->ref(pool)
-#define pool_unref(pool) ((*pool))->v->unref(pool)
-
+/* We require sizeof(type) to be <= UINT_MAX. This allows compiler to optimize
+   away the entire MALLOC_MULTIPLY() call on 64bit systems. */
 #define p_new(pool, type, count) \
-	((type *) p_malloc(pool, sizeof(type) * (count)))
+	((type *) p_malloc(pool, MALLOC_MULTIPLY((unsigned int)sizeof(type), (count))) + \
+	 COMPILE_ERROR_IF_TRUE(sizeof(type) > UINT_MAX))
 
-#define p_malloc(pool, size) (pool)->v->malloc(pool, size)
-#define p_realloc(pool, mem, old_size, new_size) \
-	(pool)->v->realloc(pool, mem, old_size, new_size)
+#define p_realloc_type(pool, mem, type, old_count, new_count) \
+	((type *) p_realloc(pool, mem, \
+	 MALLOC_MULTIPLY((unsigned int)sizeof(type), (old_count)), \
+	 MALLOC_MULTIPLY((unsigned int)sizeof(type), (new_count))) + \
+		COMPILE_ERROR_IF_TRUE(sizeof(type) > UINT_MAX))
+
+static inline void * ATTR_MALLOC ATTR_RETURNS_NONNULL
+p_malloc(pool_t pool, size_t size)
+{
+	return pool->v->malloc(pool, size);
+}
+
+static inline void * ATTR_WARN_UNUSED_RESULT ATTR_RETURNS_NONNULL
+p_realloc(pool_t pool, void *mem, size_t old_size, size_t new_size)
+{
+	return pool->v->realloc(pool, mem, old_size, new_size);
+}
 
 /* Free the memory. Currently it also sets memory to NULL, but that shouldn't
    be relied on as it's only an extra safety check. It might as well be later
@@ -86,17 +103,42 @@ size_t pool_get_exp_grown_size(pool_t pool, size_t old_size, size_t min_size);
    in some "optimization".. */
 #define p_free(pool, mem) \
 	STMT_START { \
-          (pool)->v->free(pool, mem); \
-          (mem) = NULL; \
+		p_free_internal(pool, mem);	\
+		(mem) = NULL;			\
 	} STMT_END
 
 /* A macro that's guaranteed to set mem = NULL. */
 #define p_free_and_null(pool, mem) p_free(pool, mem)
 
-#define p_clear(pool) (pool)->v->clear(pool)
+static inline void p_free_internal(pool_t pool, void *mem)
+{
+	pool->v->free(pool, mem);
+}
 
-#define p_get_max_easy_alloc_size(pool) \
-	(pool)->v->get_max_easy_alloc_size(pool)
+static inline void p_clear(pool_t pool)
+{
+	pool->v->clear(pool);
+}
+
+static inline size_t p_get_max_easy_alloc_size(pool_t pool)
+{
+	return pool->v->get_max_easy_alloc_size(pool);
+}
+
+static inline const char *pool_get_name(pool_t pool)
+{
+	return pool->v->get_name(pool);
+}
+
+static inline void pool_ref(pool_t pool)
+{
+	pool->v->ref(pool);
+}
+
+static inline void pool_unref(pool_t *pool)
+{
+	(*pool)->v->unref(pool);
+}
 
 /* These functions are only for pools created with pool_alloconly_create(): */
 

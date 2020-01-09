@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -72,11 +72,11 @@ static int epoll_event_mask(struct io_list *list)
 		if (io == NULL)
 			continue;
 
-		if (io->io.condition & IO_READ)
+		if ((io->io.condition & IO_READ) != 0)
 			events |= IO_EPOLL_INPUT;
-		if (io->io.condition & IO_WRITE)
+		if ((io->io.condition & IO_WRITE) != 0)
 			events |= IO_EPOLL_OUTPUT;
-		if (io->io.condition & IO_ERROR)
+		if ((io->io.condition & IO_ERROR) != 0)
 			events |= IO_EPOLL_ERROR;
 	}
 
@@ -97,7 +97,7 @@ void io_loop_handle_add(struct io_file *io)
 
 	first = ioloop_iolist_add(*list, io);
 
-	memset(&event, 0, sizeof(event));
+	i_zero(&event);
 	event.data.ptr = *list;
 	event.events = epoll_event_mask(*list);
 
@@ -105,7 +105,7 @@ void io_loop_handle_add(struct io_file *io)
 
 	if (epoll_ctl(ctx->epfd, op, io->fd, &event) < 0) {
 		if (errno == EPERM && op == EPOLL_CTL_ADD) {
-			i_fatal("epoll_ctl(add, %d) failed: %m "
+			i_panic("epoll_ctl(add, %d) failed: %m "
 				"(fd doesn't support epoll%s)", io->fd,
 				io->fd != STDIN_FILENO ? "" :
 				" - instead of '<file', try 'cat file|'");
@@ -136,7 +136,7 @@ void io_loop_handle_remove(struct io_file *io, bool closed)
 	last = ioloop_iolist_del(*list, io);
 
 	if (!closed) {
-		memset(&event, 0, sizeof(event));
+		i_zero(&event);
 		event.data.ptr = *list;
 		event.events = epoll_event_mask(*list);
 
@@ -161,7 +161,7 @@ void io_loop_handle_remove(struct io_file *io, bool closed)
 	i_free(io);
 }
 
-void io_loop_handler_run(struct ioloop *ioloop)
+void io_loop_handler_run_internal(struct ioloop *ioloop)
 {
 	struct ioloop_handler_context *ctx = ioloop->handler_context;
 	struct epoll_event *events;
@@ -173,18 +173,21 @@ void io_loop_handler_run(struct ioloop *ioloop)
 	int msecs, ret, i, j;
 	bool call;
 
+	i_assert(ctx != NULL);
+
         /* get the time left for next timeout task */
 	msecs = io_loop_get_wait_time(ioloop, &tv);
 
 	events = array_get_modifiable(&ctx->events, &events_count);
-	if (events_count > 0) {
+	if (ioloop->io_files != NULL && events_count > ctx->deleted_count) {
 		ret = epoll_wait(ctx->epfd, events, events_count, msecs);
 		if (ret < 0 && errno != EINTR)
 			i_fatal("epoll_wait(): %m");
 	} else {
 		/* no I/Os, but we should have some timeouts.
 		   just wait for them. */
-		i_assert(msecs >= 0);
+		if (msecs < 0)
+			i_panic("BUG: No IOs or timeouts set. Not waiting for infinity.");
 		usleep(msecs*1000);
 		ret = 0;
 	}

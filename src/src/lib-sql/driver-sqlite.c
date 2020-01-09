@@ -1,8 +1,9 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "str.h"
+#include "hex-binary.h"
 #include "sql-api-private.h"
 
 #ifdef BUILD_SQLITE
@@ -133,7 +134,7 @@ static void driver_sqlite_exec(struct sql_db *_db, const char *query)
 	if (driver_sqlite_connect(_db) < 0)
 		return;
 
-	db->rc = sqlite3_exec(db->sqlite, query, NULL, 0, NULL);
+	db->rc = sqlite3_exec(db->sqlite, query, NULL, NULL, NULL);
 	if (db->rc != SQLITE_OK) {
 		i_error("sqlite: exec(%s) failed: %s (%d)",
 			query, sqlite3_errmsg(db->sqlite), db->rc);
@@ -392,40 +393,55 @@ driver_sqlite_update(struct sql_transaction_context *_ctx, const char *query,
 		*affected_rows = sqlite3_changes(db->sqlite);
 }
 
+static const char *
+driver_sqlite_escape_blob(struct sql_db *_db ATTR_UNUSED,
+			  const unsigned char *data, size_t size)
+{
+	string_t *str = t_str_new(128);
+
+	str_append(str, "x'");
+	binary_to_hex_append(str, data, size);
+	str_append_c(str, '\'');
+	return str_c(str);
+}
+
 const struct sql_db driver_sqlite_db = {
 	.name = "sqlite",
 	.flags = SQL_DB_FLAG_BLOCKING,
 
 	.v = {
-		driver_sqlite_init_v,
-		driver_sqlite_deinit_v,
-		driver_sqlite_connect,
-		driver_sqlite_disconnect,
-		driver_sqlite_escape_string,
-		driver_sqlite_exec,
-		driver_sqlite_query,
-		driver_sqlite_query_s,
+		.init = driver_sqlite_init_v,
+		.deinit = driver_sqlite_deinit_v,
+		.connect = driver_sqlite_connect,
+		.disconnect = driver_sqlite_disconnect,
+		.escape_string = driver_sqlite_escape_string,
+		.exec = driver_sqlite_exec,
+		.query = driver_sqlite_query,
+		.query_s = driver_sqlite_query_s,
 
-		driver_sqlite_transaction_begin,
-		driver_sqlite_transaction_commit,
-		driver_sqlite_transaction_commit_s,
-		driver_sqlite_transaction_rollback,
-		driver_sqlite_update
+		.transaction_begin = driver_sqlite_transaction_begin,
+		.transaction_commit = driver_sqlite_transaction_commit,
+		.transaction_commit_s = driver_sqlite_transaction_commit_s,
+		.transaction_rollback = driver_sqlite_transaction_rollback,
+
+		.update = driver_sqlite_update,
+
+		.escape_blob = driver_sqlite_escape_blob,
 	}
 };
 
 const struct sql_result driver_sqlite_result = {
 	.v = {
-		driver_sqlite_result_free,
-		driver_sqlite_result_next_row,
-		driver_sqlite_result_get_fields_count,
-		driver_sqlite_result_get_field_name,
-		driver_sqlite_result_find_field,
-		driver_sqlite_result_get_field_value,
-		driver_sqlite_result_get_field_value_binary,
-		driver_sqlite_result_find_field_value,
-		driver_sqlite_result_get_values,
-		driver_sqlite_result_get_error
+		.free = driver_sqlite_result_free,
+		.next_row = driver_sqlite_result_next_row,
+		.get_fields_count = driver_sqlite_result_get_fields_count,
+		.get_field_name = driver_sqlite_result_get_field_name,
+		.find_field = driver_sqlite_result_find_field,
+		.get_field_value = driver_sqlite_result_get_field_value,
+		.get_field_value_binary = driver_sqlite_result_get_field_value_binary,
+		.find_field_value = driver_sqlite_result_find_field_value,
+		.get_values = driver_sqlite_result_get_values,
+		.get_error = driver_sqlite_result_get_error,
 	}
 };
 
@@ -437,10 +453,9 @@ driver_sqlite_result_error_next_row(struct sql_result *result ATTR_UNUSED)
 
 const struct sql_result driver_sqlite_error_result = {
 	.v = {
-		driver_sqlite_result_free,
-		driver_sqlite_result_error_next_row,
-		NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-		driver_sqlite_result_get_error
+		.free = driver_sqlite_result_free,
+		.next_row = driver_sqlite_result_error_next_row,
+		.get_error = driver_sqlite_result_get_error,
 	}
 };
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "fs-api.h"
@@ -6,6 +6,7 @@
 #include "mail-index-modseq.h"
 #include "mail-search-build.h"
 #include "mailbox-list-private.h"
+#include "index-pop3-uidl.h"
 #include "dbox-mail.h"
 #include "dbox-save.h"
 #include "sdbox-file.h"
@@ -161,7 +162,7 @@ int sdbox_read_header(struct sdbox_mailbox *mbox,
 		}
 		ret = -1;
 	} else {
-		memset(hdr, 0, sizeof(*hdr));
+		i_zero(hdr);
 		memcpy(hdr, data, I_MIN(data_size, sizeof(*hdr)));
 		if (guid_128_is_empty(hdr->mailbox_guid))
 			ret = -1;
@@ -186,7 +187,7 @@ static void sdbox_update_header(struct sdbox_mailbox *mbox,
 	bool need_resize;
 
 	if (sdbox_read_header(mbox, &hdr, TRUE, &need_resize) < 0) {
-		memset(&hdr, 0, sizeof(hdr));
+		i_zero(&hdr);
 		need_resize = TRUE;
 	}
 
@@ -262,6 +263,12 @@ int sdbox_mailbox_create_indexes(struct mailbox *box,
 						 update->min_highest_modseq);
 	}
 
+	if (box->inbox_user && box->creating) {
+		/* initialize pop3-uidl header when creating mailbox
+		   (not on mailbox_update()) */
+		index_pop3_uidl_set_max_uid(box, trans, 0);
+	}
+
 	sdbox_update_header(mbox, trans, update);
 	if (new_trans != NULL) {
 		if (mail_index_transaction_commit(&new_trans) < 0) {
@@ -313,7 +320,7 @@ static int sdbox_mailbox_alloc_index(struct sdbox_mailbox *mbox)
 		mail_index_ext_register(mbox->box.index, "dbox-hdr",
 					sizeof(struct sdbox_index_header), 0, 0);
 	/* set the initialization data in case the mailbox is created */
-	memset(&hdr, 0, sizeof(hdr));
+	i_zero(&hdr);
 	guid_128_generate(hdr.mailbox_guid);
 	mail_index_set_ext_init_data(mbox->box.index, mbox->hdr_ext_id,
 				     &hdr, sizeof(hdr));
@@ -325,17 +332,16 @@ static int sdbox_mailbox_open(struct mailbox *box)
 	struct sdbox_mailbox *mbox = (struct sdbox_mailbox *)box;
 	struct sdbox_index_header hdr;
 	bool need_resize;
+	time_t path_ctime;
+
+	if (dbox_mailbox_check_existence(box, &path_ctime) < 0)
+		return -1;
 
 	if (sdbox_mailbox_alloc_index(mbox) < 0)
 		return -1;
 
-	if (dbox_mailbox_open(box) < 0)
+	if (dbox_mailbox_open(box, path_ctime) < 0)
 		return -1;
-
-	if (box->creating) {
-		/* wait for mailbox creation to initialize the index */
-		return 0;
-	}
 
 	if (box->creating) {
 		/* wait for mailbox creation to initialize the index */
@@ -347,7 +353,7 @@ static int sdbox_mailbox_open(struct mailbox *box)
 		/* looks like the mailbox is corrupted */
 		(void)sdbox_sync(mbox, SDBOX_SYNC_FLAG_FORCE);
 		if (sdbox_read_header(mbox, &hdr, TRUE, &need_resize) < 0)
-			memset(&hdr, 0, sizeof(hdr));
+			i_zero(&hdr);
 	}
 
 	if (guid_128_is_empty(hdr.mailbox_guid)) {
@@ -368,6 +374,32 @@ static void sdbox_mailbox_close(struct mailbox *box)
 	if (mbox->corrupted_rebuild_count != 0)
 		(void)sdbox_sync(mbox, 0);
 	index_storage_mailbox_close(box);
+}
+
+static int
+sdbox_mailbox_create(struct mailbox *box,
+		     const struct mailbox_update *update, bool directory)
+{
+	struct sdbox_mailbox *mbox = (struct sdbox_mailbox *)box;
+	struct sdbox_index_header hdr;
+	bool need_resize;
+
+	if (dbox_mailbox_create(box, update, directory) < 0)
+		return -1;
+	if (directory || !guid_128_is_empty(mbox->mailbox_guid))
+		return 0;
+
+	/* another process just created the mailbox. read the mailbox_guid. */
+	if (sdbox_read_header(mbox, &hdr, FALSE, &need_resize) < 0) {
+		mail_storage_set_critical(box->storage,
+			"sdbox %s: Failed to read newly created dbox header",
+			mailbox_get_path(&mbox->box));
+		return -1;
+	}
+	memcpy(mbox->mailbox_guid, hdr.mailbox_guid,
+	       sizeof(mbox->mailbox_guid));
+	i_assert(!guid_128_is_empty(mbox->mailbox_guid));
+	return 0;
 }
 
 static int
@@ -403,7 +435,8 @@ struct mail_storage sdbox_storage = {
 	.class_flags = MAIL_STORAGE_CLASS_FLAG_FILE_PER_MSG |
 		MAIL_STORAGE_CLASS_FLAG_HAVE_MAIL_GUIDS |
 		MAIL_STORAGE_CLASS_FLAG_HAVE_MAIL_SAVE_GUIDS |
-		MAIL_STORAGE_CLASS_FLAG_BINARY_DATA,
+		MAIL_STORAGE_CLASS_FLAG_BINARY_DATA |
+		MAIL_STORAGE_CLASS_FLAG_STUBS,
 
 	.v = {
                 NULL,
@@ -414,7 +447,8 @@ struct mail_storage sdbox_storage = {
 		dbox_storage_get_list_settings,
 		sdbox_storage_autodetect,
 		sdbox_mailbox_alloc,
-		NULL
+		NULL,
+		NULL,
 	}
 };
 
@@ -431,7 +465,8 @@ struct mail_storage dbox_storage = {
 		dbox_storage_get_list_settings,
 		sdbox_storage_autodetect,
 		sdbox_mailbox_alloc,
-		NULL
+		NULL,
+		NULL,
 	}
 };
 
@@ -443,7 +478,7 @@ struct mailbox sdbox_mailbox = {
 		sdbox_mailbox_open,
 		sdbox_mailbox_close,
 		index_storage_mailbox_free,
-		dbox_mailbox_create,
+		sdbox_mailbox_create,
 		dbox_mailbox_update,
 		index_storage_mailbox_delete,
 		index_storage_mailbox_rename,

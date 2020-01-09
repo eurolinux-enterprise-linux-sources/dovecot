@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 /* @UNSAFE: whole file */
 
@@ -18,7 +18,7 @@
 #undef hash_table_lookup_full
 #undef hash_table_insert
 #undef hash_table_update
-#undef hash_table_remove
+#undef hash_table_try_remove
 #undef hash_table_count
 #undef hash_table_iterate_init
 #undef hash_table_iterate
@@ -129,6 +129,8 @@ void hash_table_destroy(struct hash_table **_table)
 
 	*_table = NULL;
 
+	i_assert(table->frozen == 0);
+
 	if (!table->node_pool->alloconly_pool) {
 		hash_table_destroy_nodes(table);
 		destroy_node_list(table, table->free_nodes);
@@ -141,6 +143,8 @@ void hash_table_destroy(struct hash_table **_table)
 
 void hash_table_clear(struct hash_table *table, bool free_nodes)
 {
+	i_assert(table->frozen == 0);
+
 	if (!table->node_pool->alloconly_pool)
 		hash_table_destroy_nodes(table);
 
@@ -296,6 +300,8 @@ hash_table_compress(struct hash_table *table, struct hash_node *root)
 {
 	struct hash_node *node, *next;
 
+	i_assert(table->frozen == 0);
+
 	/* remove deleted nodes from the list */
 	for (node = root; node->next != NULL; ) {
 		next = node->next;
@@ -326,7 +332,7 @@ static void hash_table_compress_removed(struct hash_table *table)
         table->removed_count = 0;
 }
 
-void hash_table_remove(struct hash_table *table, const void *key)
+bool hash_table_try_remove(struct hash_table *table, const void *key)
 {
 	struct hash_node *node;
 	unsigned int hash;
@@ -335,7 +341,7 @@ void hash_table_remove(struct hash_table *table, const void *key)
 
 	node = hash_table_lookup_node(table, key, hash);
 	if (unlikely(node == NULL))
-		i_panic("key not found from hash");
+		return FALSE;
 
 	node->key = NULL;
 	table->nodes_count--;
@@ -344,6 +350,7 @@ void hash_table_remove(struct hash_table *table, const void *key)
 		table->removed_count++;
 	else if (!hash_table_resize(table, FALSE))
 		hash_table_compress(table, &table->nodes[hash % table->size]);
+	return TRUE;
 }
 
 unsigned int hash_table_count(const struct hash_table *table)
@@ -432,6 +439,8 @@ static bool hash_table_resize(struct hash_table *table, bool grow)
 	struct hash_node *old_nodes, *node, *next;
 	unsigned int next_size, old_size, i;
 	float nodes_per_list;
+
+	i_assert(table->frozen == 0);
 
         nodes_per_list = (float) table->nodes_count / (float) table->size;
 	if (nodes_per_list > 0.3 && nodes_per_list < 2.0)

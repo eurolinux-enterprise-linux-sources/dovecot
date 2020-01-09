@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "module-dir.h"
@@ -99,12 +99,15 @@ cmd_quota_recalc_run(struct doveadm_mail_cmd_context *ctx ATTR_UNUSED,
 		return -1;
 	}
 
-	memset(&trans, 0, sizeof(trans));
+	i_zero(&trans);
 	trans.quota = quser->quota;
-	trans.recalculate = TRUE;
+	trans.recalculate = QUOTA_RECALCULATE_FORCED;
 
-	array_foreach(&quser->quota->roots, root)
+	array_foreach(&quser->quota->roots, root) {
 		(void)(*root)->backend.v.update(*root, &trans);
+		if ((*root)->backend.v.flush != NULL)
+			(*root)->backend.v.flush(*root);
+	}
 	return 0;
 }
 
@@ -118,9 +121,23 @@ cmd_quota_recalc_alloc(void)
 	return ctx;
 }
 
-static struct doveadm_mail_cmd quota_commands[] = {
-	{ cmd_quota_get_alloc, "quota get", NULL },
-	{ cmd_quota_recalc_alloc, "quota recalc", NULL }
+static struct doveadm_cmd_ver2 quota_commands[] = {
+	{
+		.name = "quota get",
+		.usage = "",
+		.mail_cmd = cmd_quota_get_alloc,
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAMS_END
+	},
+	{
+		.name = "quota recalc",
+		.usage = "",
+		.mail_cmd = cmd_quota_recalc_alloc,
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAMS_END
+	}
 };
 
 void doveadm_quota_plugin_init(struct module *module ATTR_UNUSED)
@@ -128,7 +145,7 @@ void doveadm_quota_plugin_init(struct module *module ATTR_UNUSED)
 	unsigned int i;
 
 	for (i = 0; i < N_ELEMENTS(quota_commands); i++)
-		doveadm_mail_register_cmd(&quota_commands[i]);
+		doveadm_cmd_register_ver2(&quota_commands[i]);
 }
 
 void doveadm_quota_plugin_deinit(void)

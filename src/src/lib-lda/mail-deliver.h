@@ -5,6 +5,12 @@
 #include "mail-types.h"
 #include "mail-error.h"
 
+#include <sys/time.h>
+
+/* How many seconds to wait for replies from SMTP before failing. Used for
+   sending rejects, forward, etc. */
+#define LDA_SUBMISSION_TIMEOUT_SECS 30
+
 struct mail_storage;
 struct mail_save_context;
 struct mailbox;
@@ -20,6 +26,10 @@ struct mail_deliver_context {
 	pool_t pool;
 	const struct lda_settings *set;
 	struct mail_deliver_session *session;
+	unsigned int timeout_secs;
+
+	unsigned int session_time_msecs;
+	struct timeval delivery_time_started;
 
 	struct duplicate_context *dup_ctx;
 
@@ -45,8 +55,8 @@ struct mail_deliver_context {
 	   the mailbox. */
 	struct mail *dest_mail;
 
-	/* mail_deliver_log() caches the var expand table here */
-	struct var_expand_table *var_expand_table;
+	/* mail_deliver_log() caches the var expand table values here */
+	struct mail_deliver_cache *cache;
 
 	/* Error message for a temporary failure. This is necessary only when
 	   there is no storage where to get the error message from. */
@@ -73,7 +83,8 @@ typedef int deliver_mail_func_t(struct mail_deliver_context *ctx,
 extern deliver_mail_func_t *deliver_mail;
 
 const struct var_expand_table *
-mail_deliver_get_log_var_expand_table(struct mail *mail, const char *message);
+mail_deliver_ctx_get_log_var_expand_table(struct mail_deliver_context *ctx,
+					  const char *message);
 void mail_deliver_log(struct mail_deliver_context *ctx, const char *fmt, ...)
 	ATTR_FORMAT(2, 3);
 
@@ -101,5 +112,8 @@ int mail_deliver(struct mail_deliver_context *ctx,
 /* Sets the deliver_mail hook and returns the previous hook,
    which the new_hook should call if it's non-NULL. */
 deliver_mail_func_t *mail_deliver_hook_set(deliver_mail_func_t *new_hook);
+
+/* Must be called before any storage is created. */
+void mail_deliver_hooks_init(void);
 
 #endif

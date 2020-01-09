@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -126,12 +126,15 @@ driver_sqlpool_new_conn_trans(struct sqlpool_transaction_context *trans,
 			      struct sql_db *conndb)
 {
 	struct sql_transaction_context *conn_trans;
+	struct sql_transaction_query *query;
 
 	conn_trans = sql_transaction_begin(conndb);
 	/* backend will use our queries list (we might still append more
 	   queries to the list) */
 	conn_trans->head = trans->ctx.head;
 	conn_trans->tail = trans->ctx.tail;
+	for (query = conn_trans->head; query != NULL; query = query->next)
+		query->trans = conn_trans;
 	return conn_trans;
 }
 
@@ -790,24 +793,44 @@ driver_sqlpool_update(struct sql_transaction_context *_ctx, const char *query,
 				  query, affected_rows);
 }
 
+static const char *
+driver_sqlpool_escape_blob(struct sql_db *_db,
+			   const unsigned char *data, size_t size)
+{
+	struct sqlpool_db *db = (struct sqlpool_db *)_db;
+	const struct sqlpool_connection *conns;
+	unsigned int i, count;
+
+	/* use the first ready connection */
+	conns = array_get(&db->all_connections, &count);
+	for (i = 0; i < count; i++) {
+		if (SQL_DB_IS_READY(conns[i].db))
+			return sql_escape_blob(conns[i].db, data, size);
+	}
+	/* no ready connections. just use the first one (we're guaranteed
+	   to always have one) */
+	return sql_escape_blob(conns[0].db, data, size);
+}
+
 struct sql_db driver_sqlpool_db = {
 	"",
 
 	.v = {
-		NULL,
-		driver_sqlpool_deinit,
-		driver_sqlpool_connect,
-		driver_sqlpool_disconnect,
-		driver_sqlpool_escape_string,
-		driver_sqlpool_exec,
-		driver_sqlpool_query,
-		driver_sqlpool_query_s,
+		.deinit = driver_sqlpool_deinit,
+		.connect = driver_sqlpool_connect,
+		.disconnect = driver_sqlpool_disconnect,
+		.escape_string = driver_sqlpool_escape_string,
+		.exec = driver_sqlpool_exec,
+		.query = driver_sqlpool_query,
+		.query_s = driver_sqlpool_query_s,
 
-		driver_sqlpool_transaction_begin,
-		driver_sqlpool_transaction_commit,
-		driver_sqlpool_transaction_commit_s,
-		driver_sqlpool_transaction_rollback,
+		.transaction_begin = driver_sqlpool_transaction_begin,
+		.transaction_commit = driver_sqlpool_transaction_commit,
+		.transaction_commit_s = driver_sqlpool_transaction_commit_s,
+		.transaction_rollback = driver_sqlpool_transaction_rollback,
 
-		driver_sqlpool_update
+		.update = driver_sqlpool_update,
+
+		.escape_blob = driver_sqlpool_escape_blob,
 	}
 };

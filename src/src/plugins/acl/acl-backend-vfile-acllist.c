@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -45,6 +45,9 @@ static bool acl_list_get_root_dir(struct acl_backend_vfile *backend,
 	struct mail_storage *storage;
 	const char *rootdir, *maildir;
 	enum mailbox_list_path_type type;
+
+	if (backend->backend.globals_only)
+		return FALSE;
 
 	storage = mailbox_list_get_namespace(backend->backend.list)->storage;
 	type = (storage->class_flags & MAIL_STORAGE_CLASS_FLAG_NO_ROOT) != 0 ?
@@ -137,8 +140,7 @@ static int acl_backend_vfile_acllist_read(struct acl_backend_vfile *backend)
 
 		if (p == line || *p != ' ' || p[1] == '\0') {
 			i_error("Broken acllist file: %s", path);
-			if (unlink(path) < 0 && errno != ENOENT)
-				i_error("unlink(%s) failed: %m", path);
+			i_unlink_if_exists(path);
 			i_close_fd(&fd);
 			return -1;
 		}
@@ -280,7 +282,8 @@ acl_backend_vfile_acllist_try_rebuild(struct acl_backend_vfile *backend)
 	}
 
 	if (o_stream_nfinish(output) < 0) {
-		i_error("write(%s) failed: %m", str_c(path));
+		i_error("write(%s) failed: %s", str_c(path),
+			o_stream_get_error(output));
 		ret = -1;
 	}
 	if (mailbox_list_iter_deinit(&iter) < 0)
@@ -316,8 +319,7 @@ acl_backend_vfile_acllist_try_rebuild(struct acl_backend_vfile *backend)
 		(void)acl_lookup_dict_rebuild(auser->acl_lookup_dict);
 	} else {
 		acllist_clear(backend, 0);
-		if (unlink(str_c(path)) < 0 && errno != ENOENT)
-			i_error("unlink(%s) failed: %m", str_c(path));
+		i_unlink_if_exists(str_c(path));
 	}
 	backend->rebuilding_acllist = FALSE;
 	return ret;
@@ -333,8 +335,7 @@ int acl_backend_vfile_acllist_rebuild(struct acl_backend_vfile *backend)
 		/* delete it to make sure it gets rebuilt later */
 		if (!acl_list_get_path(backend, &acllist_path))
 			i_unreached();
-		if (unlink(acllist_path) < 0 && errno != ENOENT)
-			i_error("unlink(%s) failed: %m", acllist_path);
+		i_unlink_if_exists(acllist_path);
 		return -1;
 	}
 }

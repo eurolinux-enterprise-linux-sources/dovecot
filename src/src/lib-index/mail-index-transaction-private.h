@@ -26,6 +26,7 @@ struct mail_index_transaction_vfuncs {
 };
 
 union mail_index_transaction_module_context {
+	struct mail_index_transaction_vfuncs super;
 	struct mail_index_module_register *reg;
 };
 
@@ -36,10 +37,11 @@ struct mail_index_flag_update {
 };
 
 struct mail_index_transaction {
+	struct mail_index_transaction *prev, *next;
 	int refcount;
 
 	enum mail_index_transaction_flags flags;
-	struct mail_index_transaction_vfuncs v;
+	struct mail_index_transaction_vfuncs v, *vlast;
 	struct mail_index_view *view;
 	struct mail_index_view *latest_view;
 
@@ -92,6 +94,7 @@ struct mail_index_transaction {
 	unsigned int index_deleted:1;
 	unsigned int index_undeleted:1;
 	unsigned int commit_deleted_index:1;
+	unsigned int tail_offset_changed:1;
 	/* non-extension updates. flag updates don't change this because
 	   they may be added and removed, so be sure to check that the updates
 	   array is non-empty also. */
@@ -105,8 +108,10 @@ struct mail_index_transaction {
 	 (array_is_created(&(t)->updates) && array_count(&(t)->updates) > 0) || \
 	 (t)->index_deleted || (t)->index_undeleted)
 
-extern void (*hook_mail_index_transaction_created)
-		(struct mail_index_transaction *t);
+typedef void hook_mail_index_transaction_created_t(struct mail_index_transaction *t);
+
+void mail_index_transaction_hook_register(hook_mail_index_transaction_created_t *hook);
+void mail_index_transaction_hook_unregister(hook_mail_index_transaction_created_t *hook);
 
 struct mail_index_record *
 mail_index_transaction_lookup(struct mail_index_transaction *t, uint32_t seq);
@@ -119,7 +124,7 @@ void mail_index_transaction_sort_appends(struct mail_index_transaction *t);
 void mail_index_transaction_sort_expunges(struct mail_index_transaction *t);
 uint32_t mail_index_transaction_get_next_uid(struct mail_index_transaction *t);
 void mail_index_transaction_set_log_updates(struct mail_index_transaction *t);
-void mail_index_update_day_headers(struct mail_index_transaction *t);
+void mail_index_update_day_headers(struct mail_index_transaction *t, time_t day_stamp);
 
 unsigned int
 mail_index_transaction_get_flag_update_pos(struct mail_index_transaction *t,
@@ -135,6 +140,13 @@ bool mail_index_cancel_flag_updates(struct mail_index_transaction *t,
 bool mail_index_cancel_keyword_updates(struct mail_index_transaction *t,
 				       uint32_t seq);
 
+/* As input the array's each element starts with struct seq_range where
+   uid1..uid2 are actually sequences within the transaction view. This function
+   changes the sequences into UIDs. If the transaction has any appends, they
+   must have already been assigned UIDs. */
+void mail_index_transaction_seq_range_to_uid(struct mail_index_transaction *t,
+					     ARRAY_TYPE(seq_range) *array);
+void mail_index_transaction_finish_so_far(struct mail_index_transaction *t);
 void mail_index_transaction_finish(struct mail_index_transaction *t);
 void mail_index_transaction_export(struct mail_index_transaction *t,
 				   struct mail_transaction_log_append_ctx *append_ctx);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -9,7 +9,7 @@
 #include "imap-util.h"
 #include "index-mail.h"
 #include "mail-copy.h"
-#include "imapc-client.h"
+#include "mailbox-list-private.h"
 #include "imapc-storage.h"
 #include "imapc-sync.h"
 #include "imapc-mail.h"
@@ -65,6 +65,9 @@ int imapc_save_begin(struct mail_save_context *_ctx, struct istream *input)
 	const char *path;
 
 	i_assert(ctx->fd == -1);
+
+	if (imapc_storage_client_handle_auth_failure(ctx->mbox->storage->client))
+		return -1;
 
 	ctx->fd = imapc_client_create_temp_fd(ctx->mbox->storage->client->client,
 					      &path);
@@ -140,9 +143,6 @@ imapc_save_add_to_index(struct imapc_save_context *ctx, uint32_t uid)
 	struct index_mail *imail = (struct index_mail *)_mail;
 	uint32_t seq;
 
-	if (_mail == NULL)
-		return;
-
 	/* we'll temporarily append messages and at commit time expunge
 	   them all, since we can't guarantee that no one else has saved
 	   messages to remote server during our transaction */
@@ -152,9 +152,11 @@ imapc_save_add_to_index(struct imapc_save_context *ctx, uint32_t uid)
 	imail->data.forced_no_caching = TRUE;
 
 	if (ctx->fd != -1) {
-		imail->data.stream = i_stream_create_fd(ctx->fd, 0, TRUE);
-		imapc_mail_init_stream((struct imapc_mail *)imail, TRUE);
-		ctx->fd = -1;
+		struct imapc_mail *imapc_mail = (struct imapc_mail *)imail;
+		imail->data.stream = i_stream_create_fd_autoclose(&ctx->fd, 0);
+		imapc_mail->header_fetched = TRUE;
+		imapc_mail->body_fetched = TRUE;
+		imapc_mail_init_stream(imapc_mail);
 	}
 
 	ctx->save_count++;
@@ -172,13 +174,15 @@ static void imapc_save_callback(const struct imapc_command_reply *reply,
 			imapc_save_appenduid(ctx->ctx, reply, &uid);
 		imapc_save_add_to_index(ctx->ctx, uid);
 		ctx->ret = 0;
+	} else if (imapc_storage_client_handle_auth_failure(ctx->ctx->mbox->storage->client)) {
+		ctx->ret = -1;
 	} else if (reply->state == IMAPC_COMMAND_STATE_NO) {
 		imapc_copy_error_from_reply(ctx->ctx->mbox->storage,
 					    MAIL_ERROR_PARAMS, reply);
 		ctx->ret = -1;
 	} else {
 		mail_storage_set_critical(&ctx->ctx->mbox->storage->storage,
-			"imapc: COPY failed: %s", reply->text_full);
+			"imapc: APPEND failed: %s", reply->text_full);
 		ctx->ret = -1;
 	}
 	imapc_client_stop(ctx->ctx->mbox->storage->client->client);
@@ -243,7 +247,8 @@ static int imapc_save_append(struct imapc_save_context *ctx)
 	cmd = imapc_client_cmd(ctx->mbox->storage->client->client,
 			       imapc_save_callback, &sctx);
 	imapc_command_sendf(cmd, "APPEND %s%1s%1s %p",
-			    ctx->mbox->box.name, flags, internaldate, input);
+		imapc_mailbox_get_remote_name(ctx->mbox),
+		flags, internaldate, input);
 	i_stream_unref(&input);
 	while (sctx.ret == -2)
 		imapc_mailbox_run(ctx->mbox);
@@ -257,6 +262,7 @@ static int imapc_save_append(struct imapc_save_context *ctx)
 		sctx.ret = -2;
 		cmd = imapc_client_cmd(ctx->mbox->storage->client->client,
 				       imapc_save_noop_callback, &sctx);
+		imapc_command_set_flags(cmd, IMAPC_COMMAND_FLAG_RETRIABLE);
 		imapc_command_send(cmd, "NOOP");
 		while (sctx.ret == -2)
 			imapc_mailbox_run(ctx->mbox);
@@ -275,7 +281,8 @@ int imapc_save_finish(struct mail_save_context *_ctx)
 		if (o_stream_nfinish(_ctx->data.output) < 0) {
 			if (!mail_storage_set_error_from_errno(storage)) {
 				mail_storage_set_critical(storage,
-					"write(%s) failed: %m", ctx->temp_path);
+					"write(%s) failed: %s", ctx->temp_path,
+					o_stream_get_error(_ctx->data.output));
 			}
 			ctx->failed = TRUE;
 		}

@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -11,7 +11,6 @@
 #include "acl-plugin.h"
 #include "acl-lookup-dict.h"
 
-#include <stdlib.h>
 
 #define DICT_SHARED_BOXES_PATH "shared-boxes/"
 
@@ -155,7 +154,7 @@ acl_lookup_dict_rebuild_update(struct acl_lookup_dict *dict,
 	ARRAY_TYPE(const_string) old_ids_arr;
 	unsigned int newi, oldi, old_count, new_count;
 	string_t *path;
-	unsigned int prefix_len;
+	size_t prefix_len;
 	int ret;
 
 	/* get all existing identifiers for the user. we might be able to
@@ -262,7 +261,7 @@ static void acl_lookup_dict_iterate_read(struct acl_lookup_dict_iter *iter)
 {
 	struct dict_iterate_context *dict_iter;
 	const char *const *idp, *prefix, *key, *value;
-	unsigned int prefix_len;
+	size_t prefix_len;
 
 	idp = array_idx(&iter->iter_ids, iter->iter_idx);
 	iter->iter_idx++;

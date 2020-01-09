@@ -21,12 +21,15 @@ int mailbox_list_index_sync_begin(struct mailbox_list *list,
 				  struct mailbox_list_index_sync_context **sync_ctx_r);
 int mailbox_list_index_sync_end(struct mailbox_list_index_sync_context **_sync_ctx,
 				bool success);
-int mailbox_list_index_sync(struct mailbox_list *list);
+int mailbox_list_index_sync(struct mailbox_list *list, bool refresh);
 
 /* Add name to index, return seq in index. */
 uint32_t mailbox_list_index_sync_name(struct mailbox_list_index_sync_context *ctx,
 				      const char *name,
 				      struct mailbox_list_index_node **node_r,
 				      bool *created_r);
+
+int mailbox_list_index_sync_delete(struct mailbox_list_index_sync_context *sync_ctx,
+				   const char *name, bool delete_selectable);
 
 #endif

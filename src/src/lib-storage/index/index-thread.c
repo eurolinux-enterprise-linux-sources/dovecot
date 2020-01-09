@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 /* doc/thread-refs.txt describes the incremental algorithm we use here. */
 
@@ -13,7 +13,6 @@
 #include "index-storage.h"
 #include "index-thread-private.h"
 
-#include <stdlib.h>
 
 #define MAIL_THREAD_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, mail_thread_storage_module)
@@ -580,7 +579,7 @@ int mail_thread_init(struct mailbox *box, struct mail_search_args *args,
 		mail_thread_deinit(&ctx);
 		return -1;
 	} else {
-		memset(&ctx->added_uids, 0, sizeof(ctx->added_uids));
+		i_zero(&ctx->added_uids);
 		*ctx_r = ctx;
 		return 0;
 	}

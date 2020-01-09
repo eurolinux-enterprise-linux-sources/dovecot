@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "seq-range-array.h"
@@ -10,14 +10,12 @@
 #include "imap-fetch.h"
 #include "imap-sync.h"
 
-#include <stdlib.h>
 
 struct imap_select_context {
 	struct client_command_context *cmd;
 	struct mail_namespace *ns;
 	struct mailbox *box;
 
-	struct timeval start_time;
 	struct imap_fetch_context *fetch_ctx;
 
 	uint32_t qresync_uid_validity;
@@ -201,8 +199,6 @@ static void select_context_free(struct imap_select_context *ctx)
 static void cmd_select_finish(struct imap_select_context *ctx, int ret)
 {
 	const char *resp_code;
-	struct timeval end_time;
-	int time_msecs;
 
 	if (ret < 0) {
 		if (ctx->box != NULL)
@@ -211,13 +207,9 @@ static void cmd_select_finish(struct imap_select_context *ctx, int ret)
 	} else {
 		resp_code = mailbox_is_readonly(ctx->box) ?
 			"READ-ONLY" : "READ-WRITE";
-		if (gettimeofday(&end_time, NULL) < 0)
-			memset(&end_time, 0, sizeof(end_time));
-		time_msecs = timeval_diff_msecs(&end_time, &ctx->start_time);
 		client_send_tagline(ctx->cmd, t_strdup_printf(
-			"OK [%s] %s completed (%d.%03d secs).", resp_code,
-			ctx->cmd->client->mailbox_examined ? "Examine" : "Select",
-			time_msecs/1000, time_msecs%1000));
+			"OK [%s] %s completed", resp_code,
+			ctx->cmd->client->mailbox_examined ? "Examine" : "Select"));
 	}
 	select_context_free(ctx);
 }
@@ -245,6 +237,7 @@ static int select_qresync(struct imap_select_context *ctx)
 	struct imap_fetch_context *fetch_ctx;
 	struct mail_search_args *search_args;
 	struct imap_fetch_qresync_args qresync_args;
+	int ret;
 
 	search_args = mail_search_build_init();
 	search_args->args = p_new(search_args->pool, struct mail_search_arg, 1);
@@ -252,7 +245,7 @@ static int select_qresync(struct imap_select_context *ctx)
 	search_args->args->value.seqset = ctx->qresync_known_uids;
 	imap_search_add_changed_since(search_args, ctx->qresync_modseq);
 
-	memset(&qresync_args, 0, sizeof(qresync_args));
+	i_zero(&qresync_args);
 	qresync_args.qresync_sample_seqset = &ctx->qresync_sample_seqset;
 	qresync_args.qresync_sample_uidset = &ctx->qresync_sample_uidset;
 
@@ -262,7 +255,8 @@ static int select_qresync(struct imap_select_context *ctx)
 		return -1;
 	}
 
-	fetch_ctx = imap_fetch_alloc(ctx->cmd->client, ctx->cmd->pool);
+	fetch_ctx = imap_fetch_alloc(ctx->cmd->client, ctx->cmd->pool,
+		t_strdup_printf("%s %s", ctx->cmd->name, ctx->cmd->args));
 
 	imap_fetch_init_nofail_handler(fetch_ctx, imap_fetch_uid_init);
 	imap_fetch_init_nofail_handler(fetch_ctx, imap_fetch_flags_init);
@@ -280,10 +274,9 @@ static int select_qresync(struct imap_select_context *ctx)
 		ctx->cmd->context = ctx;
 		return 0;
 	}
-	if (imap_fetch_end(fetch_ctx) < 0)
-		return -1;
+	ret = imap_fetch_end(fetch_ctx);
 	imap_fetch_free(&fetch_ctx);
-	return 1;
+	return ret < 0 ? -1 : 1;
 }
 
 static int
@@ -299,6 +292,7 @@ select_open(struct imap_select_context *ctx, const char *mailbox, bool readonly)
 	else
 		flags |= MAILBOX_FLAG_DROP_RECENT;
 	ctx->box = mailbox_alloc(ctx->ns->list, mailbox, flags);
+	mailbox_set_reason(ctx->box, readonly ? "EXAMINE" : "SELECT");
 	if (mailbox_open(ctx->box) < 0) {
 		client_send_box_error(ctx->cmd, ctx->box);
 		mailbox_free(&ctx->box);
@@ -371,16 +365,10 @@ select_open(struct imap_select_context *ctx, const char *mailbox, bool readonly)
 
 static void close_selected_mailbox(struct client *client)
 {
-	struct mailbox *box;
-
 	if (client->mailbox == NULL)
 		return;
 
-	client_search_updates_free(client);
-	box = client->mailbox;
-	client->mailbox = NULL;
-
-	mailbox_free(&box);
+	imap_client_close_mailbox(client);
 	/* CLOSED response is required by QRESYNC */
 	client_send_line(client, "* OK [CLOSED] Previous mailbox closed.");
 }
@@ -411,7 +399,6 @@ bool cmd_select_full(struct client_command_context *cmd, bool readonly)
 		client_send_tagline(cmd, error);
 		return TRUE;
 	}
-	(void)gettimeofday(&ctx->start_time, NULL);
 
 	if (imap_arg_get_list(&args[1], &list_args)) {
 		if (!select_parse_options(ctx, list_args)) {

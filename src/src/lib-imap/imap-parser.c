@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -91,16 +91,18 @@ void imap_parser_ref(struct imap_parser *parser)
 	parser->refcount++;
 }
 
-void imap_parser_unref(struct imap_parser **parser)
+void imap_parser_unref(struct imap_parser **_parser)
 {
-	i_assert((*parser)->refcount > 0);
+	struct imap_parser *parser = *_parser;
 
-	if (--(*parser)->refcount > 0)
+	*_parser = NULL;
+
+	i_assert(parser->refcount > 0);
+	if (--parser->refcount > 0)
 		return;
 
-	pool_unref(&(*parser)->pool);
-	i_free(*parser);
-	*parser = NULL;
+	pool_unref(&parser->pool);
+	i_free(parser);
 }
 
 void imap_parser_reset(struct imap_parser *parser)
@@ -517,7 +519,7 @@ static bool imap_parser_is_next_resp_text(struct imap_parser *parser)
 static bool imap_parser_is_next_text(struct imap_parser *parser)
 {
 	const struct imap_arg *arg;
-	unsigned int len;
+	size_t len;
 
 	if (parser->cur_list != &parser->root_list)
 		return FALSE;
@@ -594,6 +596,15 @@ static int imap_parser_read_arg(struct imap_parser *parser)
 			parser->str_first_escape = -1;
 			break;
 		case '~':
+			/* This could be either literal8 or atom */
+			if (data_size == 1) {
+				/* wait for the next char */
+				return FALSE;
+			}
+			if (data[1] != '{') {
+				parser->cur_type = ARG_PARSE_ATOM;
+				break;
+			}
 			if ((parser->flags & IMAP_PARSE_FLAG_LITERAL8) == 0) {
 				parser->error = "literal8 not allowed here";
 				return FALSE;

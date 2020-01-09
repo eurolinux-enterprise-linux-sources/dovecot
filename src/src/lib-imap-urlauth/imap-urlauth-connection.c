@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -360,7 +360,7 @@ imap_urlauth_request_fail(struct imap_urlauth_connection *conn,
 	callback = urlreq->callback;
 	urlreq->callback = NULL;
 	if (callback != NULL) {
-		memset(&reply, 0, sizeof(reply));
+		i_zero(&reply);
 		reply.url = urlreq->url;
 		reply.flags = urlreq->flags;
 		reply.succeeded = FALSE;
@@ -371,11 +371,12 @@ imap_urlauth_request_fail(struct imap_urlauth_connection *conn,
 		} T_END;
 	}
 
+	void *urlreq_context = urlreq->context;
 	imap_urlauth_request_drop(conn, urlreq);
 
 	if (ret < 0) {
 		/* Drop any related requests upon error */
-		imap_urlauth_request_abort_by_context(conn, urlreq->context);
+		imap_urlauth_request_abort_by_context(conn, urlreq_context);
 	}
 
 	if (ret != 0)
@@ -493,9 +494,8 @@ imap_urlauth_connection_create_temp_fd(struct imap_urlauth_connection *conn,
 	}
 
 	/* we just want the fd, unlink it */
-	if (unlink(str_c(path)) < 0) {
+	if (i_unlink(str_c(path)) < 0) {
 		/* shouldn't happen.. */
-		i_error("unlink(%s) failed: %m", str_c(path));
 		i_close_fd(&fd);
 		return -1;
 	}
@@ -607,8 +607,8 @@ imap_urlauth_fetch_reply_set_literal_stream(struct imap_urlauth_connection *conn
 	uoff_t fd_size;
 
 	if (conn->literal_fd != -1) {
-		reply->input = i_stream_create_fd(conn->literal_fd,
-						  (size_t)-1, TRUE);
+		reply->input = i_stream_create_fd_autoclose(&conn->literal_fd,
+							    (size_t)-1);
 		if (i_stream_get_size(reply->input, TRUE, &fd_size) < 1 ||
 		    fd_size != conn->literal_size) {
 			i_stream_unref(&reply->input);
@@ -648,7 +648,7 @@ imap_urlauth_connection_read_literal(struct imap_urlauth_connection *conn)
 	i_assert(conn->literal_bytes_left == 0);
 
 	/* reply */
-	memset(&reply, 0, sizeof(reply));
+	i_zero(&reply);
 	reply.url = urlreq->url;
 	reply.flags = urlreq->flags;
 	reply.bodypartstruct = urlreq->bodypartstruct;
@@ -835,7 +835,8 @@ static int imap_urlauth_input_next(struct imap_urlauth_connection *conn)
 		if ((response = i_stream_next_line(conn->input)) == NULL)
 			return 0;
 
-		i_error("imap-urlauth: Received input while no requests were pending");
+		i_error("imap-urlauth: Received input while no requests were pending: %s",
+			str_sanitize(response, 80));
 		imap_urlauth_connection_abort(conn, NULL);
 		return -1;
 	case IMAP_URLAUTH_STATE_REQUEST_PENDING:

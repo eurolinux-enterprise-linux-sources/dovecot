@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -14,7 +14,6 @@
 #include "squat-trie-private.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
 
@@ -60,8 +59,7 @@ static int squat_trie_map(struct squat_trie *trie, bool building);
 
 void squat_trie_delete(struct squat_trie *trie)
 {
-	if (unlink(trie->path) < 0 && errno != ENOENT)
-		i_error("unlink(%s) failed: %m", trie->path);
+	i_unlink_if_exists(trie->path);
 	squat_uidlist_delete(trie->uidlist);
 }
 
@@ -176,8 +174,8 @@ static void squat_trie_close(struct squat_trie *trie)
 {
 	trie->corrupted = FALSE;
 	node_free(trie, &trie->root);
-	memset(&trie->root, 0, sizeof(trie->root));
-	memset(&trie->hdr, 0, sizeof(trie->hdr));
+	i_zero(&trie->root);
+	i_zero(&trie->hdr);
 
 	squat_trie_close_fd(trie);
 	if (trie->file_cache != NULL)
@@ -208,7 +206,7 @@ void squat_trie_set_full_len(struct squat_trie *trie, unsigned int len)
 
 static void squat_trie_header_init(struct squat_trie *trie)
 {
-	memset(&trie->hdr, 0, sizeof(trie->hdr));
+	i_zero(&trie->hdr);
 	trie->hdr.version = SQUAT_TRIE_VERSION;
 	trie->hdr.indexid = time(NULL);
 	trie->hdr.uidvalidity = trie->uidvalidity;
@@ -237,7 +235,7 @@ static int squat_trie_open_fd(struct squat_trie *trie)
 	return 0;
 }
 
-static int squat_trie_open(struct squat_trie *trie)
+int squat_trie_open(struct squat_trie *trie)
 {
 	squat_trie_close(trie);
 
@@ -484,6 +482,9 @@ node_read_children(struct squat_trie *trie, struct squat_node *node, int level)
 						   level);
 			children = NODE_CHILDREN_NODES(node);
 		}
+
+		i_assert(children != NULL);
+
 		child = &children[child_idx];
 
 		/* 1) child offset */
@@ -1148,7 +1149,7 @@ squat_trie_iterate_next(struct squat_trie_iterate_context *ctx,
 	if (shift_count != 0)
 		i_array_init(&ctx->cur.shifts, shift_count);
 	else
-		memset(&ctx->cur.shifts, 0, sizeof(ctx->cur.shifts));
+		i_zero(&ctx->cur.shifts);
 	return squat_trie_iterate_first(ctx);
 }
 
@@ -1491,7 +1492,7 @@ static int squat_trie_map(struct squat_trie *trie, bool building)
 			return -1;
 		if ((trie->flags & SQUAT_INDEX_FLAG_MMAP_DISABLE) != 0 &&
 		    trie->file_cache == NULL)
-			trie->file_cache = file_cache_new(trie->fd);
+			trie->file_cache = file_cache_new_path(trie->fd, trie->path);
 	}
 
 	ret = squat_trie_map_header(trie);
@@ -1508,7 +1509,7 @@ static int squat_trie_map(struct squat_trie *trie, bool building)
 
 	if (changed || trie->hdr.root_offset == 0) {
 		node_free(trie, &trie->root);
-		memset(&trie->root, 0, sizeof(trie->root));
+		i_zero(&trie->root);
 		trie->root.want_sequential = TRUE;
 		trie->root.unused_uids = trie->hdr.root_unused_uids;
 		trie->root.next_uid = trie->hdr.root_next_uid;
@@ -1682,7 +1683,8 @@ static int squat_trie_write(struct squat_trie_build_context *ctx)
 		o_stream_nsend(output, &trie->hdr, sizeof(trie->hdr));
 	}
 	if (o_stream_nfinish(output) < 0) {
-		i_error("write() to %s failed: %m", path);
+		i_error("write(%s) failed: %s", path,
+			o_stream_get_error(output));
 		ret = -1;
 	}
 	o_stream_destroy(&output);
@@ -1704,8 +1706,7 @@ static int squat_trie_write(struct squat_trie_build_context *ctx)
 	}
 
 	if (ret < 0) {
-		if (unlink(path) < 0 && errno != ENOENT)
-			i_error("unlink(%s) failed: %m", path);
+		i_unlink_if_exists(path);
 		if (file_lock != NULL)
 			file_lock_free(&file_lock);
 	} else {
@@ -1976,7 +1977,7 @@ squat_trie_lookup_real(struct squat_trie *trie, const char *str,
 	array_clear(definite_uids);
 	array_clear(maybe_uids);
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.trie = trie;
 	ctx.type = type;
 	ctx.definite_uids = definite_uids;
@@ -2051,11 +2052,15 @@ squat_trie_lookup_real(struct squat_trie *trie, const char *str,
 	} else {
 		/* zero string length - list all root UIDs as definite
 		   answers */
+#if 0 /* FIXME: this code is never actually reached now. */
 		ret = squat_uidlist_get_seqrange(trie->uidlist,
 						 trie->root.uid_list_idx,
 						 &ctx.tmp_uids);
 		squat_trie_filter_type(type, &ctx.tmp_uids,
 				       definite_uids);
+#else
+		i_unreached();
+#endif
 	}
 	seq_range_array_remove_seq_range(maybe_uids, definite_uids);
 	squat_trie_add_unknown(trie, maybe_uids);

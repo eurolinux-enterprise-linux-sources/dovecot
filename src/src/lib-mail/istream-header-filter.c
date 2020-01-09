@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,7 +6,6 @@
 #include "istream-private.h"
 #include "istream-header-filter.h"
 
-#include <stdlib.h>
 
 struct header_filter_istream {
 	struct istream_private istream;
@@ -31,12 +30,19 @@ struct header_filter_istream {
 	unsigned int header_read:1;
 	unsigned int seen_eoh:1;
 	unsigned int header_parsed:1;
+	unsigned int headers_edited:1;
 	unsigned int exclude:1;
 	unsigned int crlf:1;
+	unsigned int crlf_preserve:1;
 	unsigned int hide_body:1;
 	unsigned int add_missing_eoh:1;
 	unsigned int end_body_with_lf:1;
 	unsigned int last_lf_added:1;
+	unsigned int last_orig_crlf:1;
+	unsigned int last_added_newline:1;
+	unsigned int eoh_not_matched:1;
+	unsigned int callbacks_called:1;
+	unsigned int prev_matched:1;
 };
 
 header_filter_callback *null_header_filter_callback = NULL;
@@ -125,12 +131,14 @@ static bool match_line_changed(struct header_filter_istream *mstream)
 			     cmp_uint) != NULL;
 }
 
-static void add_eol(struct header_filter_istream *mstream)
+static void add_eol(struct header_filter_istream *mstream, bool orig_crlf)
 {
-	if (mstream->crlf)
+	if (mstream->crlf || (orig_crlf && mstream->crlf_preserve))
 		buffer_append(mstream->hdr_buf, "\r\n", 2);
 	else
 		buffer_append_c(mstream->hdr_buf, '\n');
+	mstream->last_orig_crlf = orig_crlf;
+	mstream->last_added_newline = TRUE;
 }
 
 static ssize_t hdr_stream_update_pos(struct header_filter_istream *mstream)
@@ -149,8 +157,8 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 {
 	struct message_header_line *hdr;
 	uoff_t highwater_offset;
+	size_t max_buffer_size;
 	ssize_t ret, ret2;
-	bool matched;
 	int hdr_ret;
 
 	if (mstream->hdr_ctx == NULL) {
@@ -179,53 +187,79 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 		}
 	}
 
+	max_buffer_size = i_stream_get_max_buffer_size(&mstream->istream.istream);
+	if (mstream->hdr_buf->used >= max_buffer_size)
+		return -2;
+
 	while ((hdr_ret = message_parse_header_next(mstream->hdr_ctx,
 						    &hdr)) > 0) {
-		mstream->cur_line++;
+		bool matched;
 
+		if (!hdr->continued)
+			mstream->cur_line++;
 		if (hdr->eoh) {
 			mstream->seen_eoh = TRUE;
 			matched = TRUE;
-			if (!mstream->header_parsed &&
-			    mstream->callback != NULL) {
+			if (mstream->header_parsed && !mstream->headers_edited) {
+				if (mstream->eoh_not_matched)
+					matched = !matched;
+			} else if (mstream->callback != NULL) {
 				mstream->callback(mstream, hdr, &matched,
 						  mstream->context);
+				mstream->callbacks_called = TRUE;
 			}
 
 			if (!matched) {
 				mstream->seen_eoh = FALSE;
+				mstream->eoh_not_matched = TRUE;
 				continue;
 			}
 
-			add_eol(mstream);
+			add_eol(mstream, hdr->crlf_newline);
 			continue;
 		}
 
-		matched = mstream->headers_count == 0 ? FALSE :
-			i_bsearch(hdr->name, mstream->headers,
-				  mstream->headers_count,
-				  sizeof(*mstream->headers),
-				  bsearch_strcasecmp) != NULL;
+		if (hdr->continued) {
+			/* Header line continued - use only the first line's
+			   matched-result. Otherwise multiline headers might
+			   end up being only partially picked, which wouldn't
+			   be very good. However, allow callbacks to modify
+			   the headers in any way they want. */
+			matched = mstream->prev_matched;
+		} else if (mstream->headers_count == 0) {
+			/* no include/exclude headers - default matching */
+			matched = FALSE;
+		} else {
+			matched = i_bsearch(hdr->name, mstream->headers,
+					    mstream->headers_count,
+					    sizeof(*mstream->headers),
+					    bsearch_strcasecmp) != NULL;
+		}
 		if (mstream->callback == NULL) {
 			/* nothing gets excluded */
-		} else if (mstream->cur_line > mstream->parsed_lines) {
-			/* first time in this line */
+		} else if (!mstream->header_parsed || mstream->headers_edited) {
+			/* first time in this line or we have actually modified
+			   the header so we always want to call the callbacks */
 			bool orig_matched = matched;
 
 			mstream->parsed_lines = mstream->cur_line;
 			mstream->callback(mstream, hdr, &matched,
 					  mstream->context);
-			if (matched != orig_matched) {
-				i_array_init(&mstream->match_change_lines, 8);
+			mstream->callbacks_called = TRUE;
+			if (matched != orig_matched &&
+			    !hdr->continued && !mstream->headers_edited) {
+				if (!array_is_created(&mstream->match_change_lines))
+					i_array_init(&mstream->match_change_lines, 8);
 				array_append(&mstream->match_change_lines,
 					     &mstream->cur_line, 1);
 			}
-		} else {
+		} else if (!hdr->continued) {
 			/* second time in this line. was it excluded by the
 			   callback the first time? */
 			if (match_line_changed(mstream))
 				matched = !matched;
 		}
+		mstream->prev_matched = matched;
 
 		if (matched == mstream->exclude) {
 			/* ignore */
@@ -239,7 +273,7 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 			buffer_append(mstream->hdr_buf,
 				      hdr->value, hdr->value_len);
 			if (!hdr->no_newline)
-				add_eol(mstream);
+				add_eol(mstream, hdr->crlf_newline);
 
 			if (mstream->skip_count >= mstream->hdr_buf->used) {
 				/* we need more */
@@ -254,6 +288,13 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 				break;
 			}
 		}
+		if (mstream->hdr_buf->used >= max_buffer_size)
+			break;
+	}
+	if (mstream->hdr_buf->used > 0) {
+		const unsigned char *data = mstream->hdr_buf->data;
+		mstream->last_added_newline =
+			data[mstream->hdr_buf->used-1] == '\n';
 	}
 
 	if (hdr_ret < 0) {
@@ -265,8 +306,31 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 			return -1;
 		}
 		if (!mstream->seen_eoh && mstream->add_missing_eoh) {
+			bool matched = TRUE;
+
 			mstream->seen_eoh = TRUE;
-			add_eol(mstream);
+
+			if (!mstream->last_added_newline)
+				add_eol(mstream, mstream->last_orig_crlf);
+
+			if (mstream->header_parsed && !mstream->headers_edited) {
+				if (mstream->eoh_not_matched)
+					matched = !matched;
+			} else if (mstream->callback != NULL) {
+				struct message_header_line fake_eoh_hdr = {
+					.eoh = TRUE,
+					.name = "",
+				};
+				mstream->callback(mstream, &fake_eoh_hdr,
+						  &matched, mstream->context);
+				mstream->callbacks_called = TRUE;
+			}
+
+			if (!matched) {
+				mstream->seen_eoh = FALSE;
+			} else {
+				add_eol(mstream, mstream->last_orig_crlf);
+			}
 		}
 	}
 
@@ -285,11 +349,14 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 		message_parse_header_deinit(&mstream->hdr_ctx);
 		mstream->hdr_ctx = NULL;
 
-		if (!mstream->header_parsed && mstream->callback != NULL) {
+		if ((!mstream->header_parsed || mstream->headers_edited ||
+		     mstream->callbacks_called) &&
+		    mstream->callback != NULL) {
+			bool matched = FALSE;
 			mstream->callback(mstream, NULL,
 					  &matched, mstream->context);
 			/* check if the callback added more headers.
-			   this is allowed only of EOH wasn't added yet. */
+			   this is allowed only if EOH wasn't added yet. */
 			ret2 = hdr_stream_update_pos(mstream);
 			if (!mstream->seen_eoh)
 				ret += ret2;
@@ -299,6 +366,7 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 		}
 		mstream->header_parsed = TRUE;
 		mstream->header_read = TRUE;
+		mstream->callbacks_called = FALSE;
 
 		mstream->header_size.physical_size =
 			mstream->istream.parent->v_offset;
@@ -410,16 +478,18 @@ i_stream_header_filter_seek_to_header(struct header_filter_istream *mstream,
 		message_parse_header_deinit(&mstream->hdr_ctx);
 	mstream->skip_count = v_offset;
 	mstream->cur_line = 0;
+	mstream->prev_matched = FALSE;
 	mstream->header_read = FALSE;
 	mstream->seen_eoh = FALSE;
+	mstream->last_added_newline = TRUE;
 }
 
-static void skip_header(struct header_filter_istream *mstream)
+static int skip_header(struct header_filter_istream *mstream)
 {
 	size_t pos;
 
 	if (mstream->header_read)
-		return;
+		return 0;
 
 	if (mstream->istream.access_counter !=
 	    mstream->istream.parent->real_stream->access_counter) {
@@ -432,6 +502,7 @@ static void skip_header(struct header_filter_istream *mstream)
 		pos = i_stream_get_data_size(&mstream->istream.istream);
 		i_stream_skip(&mstream->istream.istream, pos);
 	}
+	return mstream->istream.istream.stream_errno != 0 ? -1 : 0;
 }
 
 static void
@@ -470,7 +541,8 @@ static void i_stream_header_filter_seek(struct istream_private *stream,
 	/* if we haven't parsed the whole header yet, we don't know if we
 	   want to seek inside header or body. so make sure we've parsed the
 	   header. */
-	skip_header(mstream);
+	if (skip_header(mstream) < 0)
+		return;
 	stream_reset_to(mstream, v_offset);
 
 	if (v_offset < mstream->header_size.virtual_size) {
@@ -500,15 +572,43 @@ i_stream_header_filter_stat(struct istream_private *stream, bool exact)
 	const struct stat *st;
 	uoff_t old_offset;
 
-	if (i_stream_stat(stream->parent, exact, &st) < 0)
+	if (i_stream_stat(stream->parent, exact, &st) < 0) {
+		stream->istream.stream_errno = stream->parent->stream_errno;
 		return -1;
+	}
 	stream->statbuf = *st;
 	if (stream->statbuf.st_size == -1 || !exact)
 		return 0;
 
 	/* fix the filtered header size */
 	old_offset = stream->istream.v_offset;
-	skip_header(mstream);
+	if (skip_header(mstream) < 0)
+		return -1;
+
+	if (mstream->hide_body) {
+		/* no body */
+		stream->statbuf.st_size = mstream->header_size.physical_size;
+	} else if (!mstream->end_body_with_lf) {
+		/* no last-LF */
+	} else if (mstream->last_lf_added) {
+		/* yes, we have added LF */
+		stream->statbuf.st_size += mstream->crlf ? 2 : 1;
+	} else if (mstream->last_lf_offset != (uoff_t)-1) {
+		/* no, we didn't need to add LF */
+	} else {
+		/* check if we need to add LF */
+		i_stream_seek(stream->parent, st->st_size - 1);
+		(void)i_stream_read(stream->parent);
+		if (stream->parent->stream_errno != 0) {
+			stream->istream.stream_errno =
+				stream->parent->stream_errno;
+			return -1;
+		}
+		i_assert(stream->parent->eof);
+		ssize_t ret = handle_end_body_with_lf(mstream, -1);
+		if (ret > 0)
+			stream->statbuf.st_size += ret;
+	}
 
 	stream->statbuf.st_size -=
 		(off_t)mstream->header_size.physical_size -
@@ -554,11 +654,18 @@ i_stream_create_header_filter(struct istream *input,
 	mstream->callback = callback;
 	mstream->context = context;
 	mstream->exclude = (flags & HEADER_FILTER_EXCLUDE) != 0;
-	mstream->crlf = (flags & HEADER_FILTER_NO_CR) == 0;
+	if ((flags & HEADER_FILTER_CRLF_PRESERVE) != 0)
+		mstream->crlf_preserve = TRUE;
+	else if ((flags & HEADER_FILTER_NO_CR) != 0)
+		mstream->crlf = FALSE;
+	else
+		mstream->crlf = TRUE;
 	mstream->hide_body = (flags & HEADER_FILTER_HIDE_BODY) != 0;
 	mstream->add_missing_eoh = (flags & HEADER_FILTER_ADD_MISSING_EOH) != 0;
 	mstream->end_body_with_lf =
 		(flags & HEADER_FILTER_END_BODY_WITH_LF) != 0;
+	mstream->last_lf_offset = (uoff_t)-1;
+	mstream->last_added_newline = TRUE;
 
 	mstream->istream.iostream.destroy = i_stream_header_filter_destroy;
 	mstream->istream.read = i_stream_header_filter_read;
@@ -577,4 +684,5 @@ void i_stream_header_filter_add(struct header_filter_istream *input,
 				const void *data, size_t size)
 {
 	buffer_append(input->hdr_buf, data, size);
+	input->headers_edited = TRUE;
 }

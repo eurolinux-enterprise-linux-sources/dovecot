@@ -27,8 +27,9 @@ enum connection_disconnect_reason {
 
 struct connection_vfuncs {
 	void (*destroy)(struct connection *conn);
-	/* For UNIX socket clients this gets called immediately with
-	   success=TRUE, for IP connections it gets called later:
+	/* For UNIX socket clients this gets called immediately (unless
+	   delayed_unix_client_connected_callback=TRUE) with success=TRUE,
+	   for IP connections it gets called later:
 
 	   If connect() fails, sets success=FALSE and errno. Streams aren't
 	   initialized in that situation either. destroy() is called after
@@ -57,6 +58,19 @@ struct connection_settings {
 
 	bool client;
 	bool dont_send_version;
+	/* By default when only input_args() is used, or when
+	   connection_input_line_default() is used, empty lines aren't allowed
+	   since it would result in additional args[0] == NULL check. Setting
+	   this to TRUE passes it through instead of logging an error. */
+	bool allow_empty_args_input;
+	/* Don't call client_connected() immediately on
+	   connection_client_connect() with UNIX sockets. This is mainly
+	   to make the functionality identical with inet sockets, which may
+	   simplify the calling code. */
+	bool delayed_unix_client_connected_callback;
+	/* If connect() to UNIX socket fails with EAGAIN, retry for this many
+	   milliseconds before giving up (0 = try once) */
+	unsigned int unix_client_connect_msecs;
 };
 
 struct connection {
@@ -71,10 +85,13 @@ struct connection {
 
 	struct timeout *to;
 	time_t last_input;
+	struct timeval last_input_tv;
+	struct timeval connect_started;
+	struct timeval connect_finished;
 
 	/* for IP client: */
 	struct ip_addr ip;
-	unsigned int port;
+	in_port_t port;
 
 	/* received minor version */
 	unsigned int minor_version;
@@ -82,6 +99,8 @@ struct connection {
 	enum connection_disconnect_reason disconnect_reason;
 
 	unsigned int version_received:1;
+	unsigned int unix_socket:1;
+	unsigned int from_streams:1;
 };
 
 struct connection_list {
@@ -97,14 +116,21 @@ void connection_init_server(struct connection_list *list,
 			    int fd_in, int fd_out);
 void connection_init_client_ip(struct connection_list *list,
 			       struct connection *conn,
-			       const struct ip_addr *ip, unsigned int port);
+			       const struct ip_addr *ip, in_port_t port);
 void connection_init_client_unix(struct connection_list *list,
 				 struct connection *conn, const char *path);
+void connection_init_from_streams(struct connection_list *list,
+			    struct connection *conn, const char *name,
+			    struct istream *input, struct ostream *output);
 
 int connection_client_connect(struct connection *conn);
 
 void connection_disconnect(struct connection *conn);
 void connection_deinit(struct connection *conn);
+
+void connection_input_halt(struct connection *conn);
+void connection_input_resume(struct connection *conn);
+void connection_streams_changed(struct connection *conn);
 
 /* Returns -1 = disconnected, 0 = nothing new, 1 = something new.
    If input_full_behavior is ALLOW, may return also -2 = buffer full. */
@@ -114,6 +140,9 @@ int connection_verify_version(struct connection *conn, const char *const *args);
 
 /* Returns human-readable reason for why connection was disconnected. */
 const char *connection_disconnect_reason(struct connection *conn);
+/* Returns human-readable reason for why connection timed out,
+   e.g. "No input for 10.023 secs". */
+const char *connection_input_timeout_reason(struct connection *conn);
 
 void connection_switch_ioloop(struct connection *conn);
 

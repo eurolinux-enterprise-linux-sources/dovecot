@@ -3,11 +3,14 @@
 
 #include "mail-storage.h"
 
+struct dsync_brain;
+
 /* Mailbox that is going to be synced. Its name was already sent in the
    mailbox tree. */
 struct dsync_mailbox {
 	guid_128_t mailbox_guid;
 	bool mailbox_lost;
+	bool mailbox_ignore;
 	bool have_guids, have_save_guids, have_only_guid128;
 
 	uint32_t uid_validity, uid_next, messages_count, first_recent_uid;
@@ -34,5 +37,8 @@ struct dsync_mailbox_attribute {
 void dsync_mailbox_attribute_dup(pool_t pool,
 				 const struct dsync_mailbox_attribute *src,
 				 struct dsync_mailbox_attribute *dest_r);
+
+int dsync_mailbox_lock(struct dsync_brain *brain, struct mailbox *box,
+		       struct file_lock **lock_r);
 
 #endif

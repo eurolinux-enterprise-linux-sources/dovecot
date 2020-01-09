@@ -1,7 +1,8 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
+#include "hash-method.h"
 #include "settings-parser.h"
 #include "master-service-private.h"
 #include "master-service-settings.h"
@@ -32,7 +33,7 @@ static struct file_listener_settings *auth_unix_listeners[] = {
 	&auth_unix_listeners_array[5]
 };
 static buffer_t auth_unix_listeners_buf = {
-	auth_unix_listeners, sizeof(auth_unix_listeners), { 0, }
+	auth_unix_listeners, sizeof(auth_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 
@@ -72,7 +73,7 @@ static struct file_listener_settings *auth_worker_unix_listeners[] = {
 	&auth_worker_unix_listeners_array[0]
 };
 static buffer_t auth_worker_unix_listeners_buf = {
-	auth_worker_unix_listeners, sizeof(auth_worker_unix_listeners), { 0, }
+	auth_worker_unix_listeners, sizeof(auth_worker_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 
@@ -107,10 +108,13 @@ struct service_settings auth_worker_service_settings = {
 	{ type, #name, offsetof(struct auth_passdb_settings, name), NULL }
 
 static const struct setting_define auth_passdb_setting_defines[] = {
+	DEF(SET_STR, name),
 	DEF(SET_STR, driver),
 	DEF(SET_STR, args),
 	DEF(SET_STR, default_fields),
 	DEF(SET_STR, override_fields),
+	DEF(SET_STR, mechanisms),
+	DEF(SET_STR, username_filter),
 
 	DEF(SET_ENUM, skip),
 	DEF(SET_ENUM, result_success),
@@ -120,15 +124,19 @@ static const struct setting_define auth_passdb_setting_defines[] = {
 	DEF(SET_BOOL, deny),
 	DEF(SET_BOOL, pass),
 	DEF(SET_BOOL, master),
+	DEF(SET_ENUM, auth_verbose),
 
 	SETTING_DEFINE_LIST_END
 };
 
 static const struct auth_passdb_settings auth_passdb_default_settings = {
+	.name = "",
 	.driver = "",
 	.args = "",
 	.default_fields = "",
 	.override_fields = "",
+	.mechanisms = "",
+	.username_filter = "",
 
 	.skip = "never:authenticated:unauthenticated",
 	.result_success = "return-ok:return:return-fail:continue:continue-ok:continue-fail",
@@ -137,14 +145,15 @@ static const struct auth_passdb_settings auth_passdb_default_settings = {
 
 	.deny = FALSE,
 	.pass = FALSE,
-	.master = FALSE
+	.master = FALSE,
+	.auth_verbose = "default:yes:no"
 };
 
 const struct setting_parser_info auth_passdb_setting_parser_info = {
 	.defines = auth_passdb_setting_defines,
 	.defaults = &auth_passdb_default_settings,
 
-	.type_offset = (size_t)-1,
+	.type_offset = offsetof(struct auth_passdb_settings, name),
 	.struct_size = sizeof(struct auth_passdb_settings),
 
 	.parent_offset = (size_t)-1,
@@ -158,6 +167,7 @@ const struct setting_parser_info auth_passdb_setting_parser_info = {
 	{ type, #name, offsetof(struct auth_userdb_settings, name), NULL }
 
 static const struct setting_define auth_userdb_setting_defines[] = {
+	DEF(SET_STR, name),
 	DEF(SET_STR, driver),
 	DEF(SET_STR, args),
 	DEF(SET_STR, default_fields),
@@ -168,11 +178,14 @@ static const struct setting_define auth_userdb_setting_defines[] = {
 	DEF(SET_ENUM, result_failure),
 	DEF(SET_ENUM, result_internalfail),
 
+	DEF(SET_ENUM, auth_verbose),
+
 	SETTING_DEFINE_LIST_END
 };
 
 static const struct auth_userdb_settings auth_userdb_default_settings = {
 	/* NOTE: when adding fields, update also auth.c:userdb_dummy_set */
+	.name = "",
 	.driver = "",
 	.args = "",
 	.default_fields = "",
@@ -181,14 +194,16 @@ static const struct auth_userdb_settings auth_userdb_default_settings = {
 	.skip = "never:found:notfound",
 	.result_success = "return-ok:return:return-fail:continue:continue-ok:continue-fail",
 	.result_failure = "continue:return:return-ok:return-fail:continue-ok:continue-fail",
-	.result_internalfail = "continue:return:return-ok:return-fail:continue-ok:continue-fail"
+	.result_internalfail = "continue:return:return-ok:return-fail:continue-ok:continue-fail",
+
+	.auth_verbose = "default:yes:no"
 };
 
 const struct setting_parser_info auth_userdb_setting_parser_info = {
 	.defines = auth_userdb_setting_defines,
 	.defaults = &auth_userdb_default_settings,
 
-	.type_offset = (size_t)-1,
+	.type_offset = offsetof(struct auth_userdb_settings, name),
 	.struct_size = sizeof(struct auth_userdb_settings),
 
 	.parent_offset = (size_t)-1,
@@ -215,6 +230,7 @@ static const struct setting_define auth_setting_defines[] = {
 	DEF(SET_SIZE, cache_size),
 	DEF(SET_TIME, cache_ttl),
 	DEF(SET_TIME, cache_negative_ttl),
+	DEF(SET_BOOL, cache_verify_password_with_worker),
 	DEF(SET_STR, username_chars),
 	DEF(SET_STR, username_translation),
 	DEF(SET_STR, username_format),
@@ -226,6 +242,19 @@ static const struct setting_define auth_setting_defines[] = {
 	DEF(SET_STR, proxy_self),
 	DEF(SET_TIME, failure_delay),
 
+	DEF(SET_STR, policy_server_url),
+	DEF(SET_STR, policy_server_api_header),
+	DEF(SET_UINT, policy_server_timeout_msecs),
+	DEF(SET_STR, policy_hash_mech),
+	DEF(SET_STR, policy_hash_nonce),
+	DEF(SET_STR, policy_request_attributes),
+	DEF(SET_BOOL, policy_reject_on_fail),
+	DEF(SET_BOOL, policy_check_before_auth),
+	DEF(SET_BOOL, policy_check_after_auth),
+	DEF(SET_BOOL, policy_report_after_auth),
+	DEF(SET_UINT, policy_hash_truncate),
+
+	DEF(SET_BOOL, stats),
 	DEF(SET_BOOL, verbose),
 	DEF(SET_BOOL, debug),
 	DEF(SET_BOOL, debug_passwords),
@@ -244,6 +273,9 @@ static const struct setting_define auth_setting_defines[] = {
 	DEF_NOPREFIX(SET_UINT, first_valid_uid),
 	DEF_NOPREFIX(SET_UINT, last_valid_uid),
 
+	DEF_NOPREFIX(SET_STR, ssl_client_ca_dir),
+	DEF_NOPREFIX(SET_STR, ssl_client_ca_file),
+
 	SETTING_DEFINE_LIST_END
 };
 
@@ -254,6 +286,7 @@ static const struct auth_settings auth_default_settings = {
 	.cache_size = 0,
 	.cache_ttl = 60*60,
 	.cache_negative_ttl = 60*60,
+	.cache_verify_password_with_worker = FALSE,
 	.username_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890.-_@",
 	.username_translation = "",
 	.username_format = "%Lu",
@@ -265,12 +298,28 @@ static const struct auth_settings auth_default_settings = {
 	.proxy_self = "",
 	.failure_delay = 2,
 
+	.policy_server_url = "",
+	.policy_server_api_header = "",
+	.policy_server_timeout_msecs = 2000,
+	.policy_hash_mech = "sha256",
+	.policy_hash_nonce = "",
+	.policy_request_attributes = "login=%{requested_username} pwhash=%{hashed_password} remote=%{rip} device_id=%{client_id} protocol=%s",
+	.policy_reject_on_fail = FALSE,
+	.policy_check_before_auth = TRUE,
+	.policy_check_after_auth = TRUE,
+	.policy_report_after_auth = TRUE,
+	.policy_hash_truncate = 12,
+
+	.stats = FALSE,
 	.verbose = FALSE,
 	.debug = FALSE,
 	.debug_passwords = FALSE,
 	.verbose_passwords = "no",
 	.ssl_require_client_cert = FALSE,
 	.ssl_username_from_cert = FALSE,
+	.ssl_client_ca_dir = "",
+	.ssl_client_ca_file = "",
+
 	.use_winbind = FALSE,
 
 	.worker_max_count = 30,
@@ -330,7 +379,7 @@ auth_settings_set_self_ips(struct auth_settings *set, pool_t pool,
 }
 
 static bool
-auth_verify_verbose_password(const struct auth_settings *set,
+auth_verify_verbose_password(struct auth_settings *set,
 			     const char **error_r)
 {
 	const char *p, *value = set->verbose_passwords;
@@ -351,8 +400,14 @@ auth_verify_verbose_password(const struct auth_settings *set,
 		return TRUE;
 	else if (strcmp(value, "sha1") == 0)
 		return TRUE;
-	else
+	else if (strcmp(value, "yes") == 0) {
+		/* just use it as alias for "plain" */
+		set->verbose_passwords = "plain";
+		return TRUE;
+	} else {
+		*error_r = "auth_verbose_passwords: Invalid value";
 		return FALSE;
+	}
 }
 
 static bool auth_settings_check(void *_set, pool_t pool,
@@ -399,6 +454,25 @@ static bool auth_settings_check(void *_set, pool_t pool,
 	}
 	set->realms_arr =
 		(const char *const *)p_strsplit_spaces(pool, set->realms, " ");
+
+	if (*set->policy_server_url != '\0') {
+		if (*set->policy_hash_nonce == '\0') {
+
+			*error_r = "auth_policy_hash_nonce must be set when policy server is used";
+			return FALSE;
+		}
+		const struct hash_method *digest = hash_method_lookup(set->policy_hash_mech);
+		if (digest == NULL) {
+			*error_r = "invalid auth_policy_hash_mech given";
+			return FALSE;
+		}
+		if (set->policy_hash_truncate > 0 && set->policy_hash_truncate >= digest->digest_size*8) {
+			*error_r = t_strdup_printf("policy_hash_truncate is not smaller than digest size (%u >= %u)",
+				set->policy_hash_truncate,
+				digest->digest_size*8);
+			return FALSE;
+		}
+	}
 
 	if (!auth_settings_set_self_ips(set, pool, error_r))
 		return FALSE;
@@ -451,7 +525,7 @@ auth_settings_read(const char *service, pool_t pool,
 	const char *error;
 	void **sets;
 
-	memset(&input, 0, sizeof(input));
+	i_zero(&input);
 	input.roots = set_roots;
 	input.module = "auth";
 	input.service = service;

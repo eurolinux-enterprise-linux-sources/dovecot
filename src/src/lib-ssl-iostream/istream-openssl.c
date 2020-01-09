@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream-private.h"
@@ -24,6 +24,7 @@ static void i_stream_ssl_destroy(struct iostream_private *stream)
 	struct ssl_istream *sstream = (struct ssl_istream *)stream;
 
 	i_free(sstream->istream.w_buffer);
+	sstream->ssl_io->ssl_input = NULL;
 	ssl_iostream_unref(&sstream->ssl_io);
 }
 
@@ -32,6 +33,7 @@ static ssize_t i_stream_ssl_read_real(struct istream_private *stream)
 	struct ssl_istream *sstream = (struct ssl_istream *)stream;
 	struct ssl_iostream *ssl_io = sstream->ssl_io;
 	unsigned char buffer[IO_BLOCK_SIZE];
+	size_t max_buffer_size = i_stream_get_max_buffer_size(&stream->istream);
 	size_t orig_max_buffer_size = stream->max_buffer_size;
 	size_t size;
 	ssize_t ret, total_ret;
@@ -41,9 +43,9 @@ static ssize_t i_stream_ssl_read_real(struct istream_private *stream)
 		return -1;
 	}
 
-	if (stream->pos >= stream->max_buffer_size) {
+	if (stream->pos >= max_buffer_size) {
 		i_stream_compress(stream);
-		if (stream->pos >= stream->max_buffer_size)
+		if (stream->pos >= max_buffer_size)
 			return -2;
 	}
 
@@ -61,9 +63,9 @@ static ssize_t i_stream_ssl_read_real(struct istream_private *stream)
 
 	if (!i_stream_try_alloc(stream, 1, &size))
 		i_unreached();
-	if (stream->pos + size > stream->max_buffer_size) {
-		i_assert(stream->max_buffer_size > stream->pos);
-		size = stream->max_buffer_size - stream->pos;
+	if (stream->pos + size > max_buffer_size) {
+		i_assert(max_buffer_size > stream->pos);
+		size = max_buffer_size - stream->pos;
 	}
 
 	while ((ret = SSL_read(ssl_io->ssl,
@@ -71,14 +73,17 @@ static ssize_t i_stream_ssl_read_real(struct istream_private *stream)
 		/* failed to read anything */
 		ret = openssl_iostream_handle_error(ssl_io, ret, "SSL_read");
 		if (ret <= 0) {
-			if (ret < 0) {
+			if (ret == 0)
+				return 0;
+			if (ssl_io->last_error != NULL) {
 				io_stream_set_error(&stream->iostream,
 						    "%s", ssl_io->last_error);
-				stream->istream.stream_errno = errno;
-				stream->istream.eof = TRUE;
-				sstream->seen_eof = TRUE;
 			}
-			return ret;
+			if (errno != EPIPE)
+				stream->istream.stream_errno = errno;
+			stream->istream.eof = TRUE;
+			sstream->seen_eof = TRUE;
+			return -1;
 		}
 		/* we did some BIO I/O, try reading again */
 	}

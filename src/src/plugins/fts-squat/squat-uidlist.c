@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -92,8 +92,7 @@ static void squat_uidlist_close(struct squat_uidlist *uidlist);
 
 void squat_uidlist_delete(struct squat_uidlist *uidlist)
 {
-	if (unlink(uidlist->path) < 0 && errno != ENOENT)
-		i_error("unlink(%s) failed: %m", uidlist->path);
+	i_unlink_if_exists(uidlist->path);
 }
 
 static void squat_uidlist_set_corrupted(struct squat_uidlist *uidlist,
@@ -195,8 +194,11 @@ uidlist_write_array(struct ostream *output, const uint32_t *uid_list,
 		prev = 0;
 		for (i = 0; i < uid_count; i++) {
 			uid = uid_list[i];
-			if (unlikely((uid & ~UID_LIST_MASK_RANGE) < prev))
+			if (unlikely((uid & ~UID_LIST_MASK_RANGE) < prev)) {
+				if (!datastack)
+					i_free(uidbuf);
 				return -1;
+			}
 			if ((uid & UID_LIST_MASK_RANGE) == 0) {
 				squat_pack_num(&bufp, (uid - prev) << 1);
 				prev = uid + 1;
@@ -372,7 +374,7 @@ static int squat_uidlist_map_header(struct squat_uidlist *uidlist)
 	}
 	if (uidlist->hdr.indexid != uidlist->trie->hdr.indexid) {
 		/* see if trie was recreated */
-		(void)squat_trie_refresh(uidlist->trie);
+		(void)squat_trie_open(uidlist->trie);
 	}
 	if (uidlist->hdr.indexid != uidlist->trie->hdr.indexid) {
 		squat_uidlist_set_corrupted(uidlist, "wrong indexid");
@@ -470,7 +472,7 @@ static int squat_uidlist_map(struct squat_uidlist *uidlist)
 	}
 	if (uidlist->file_cache == NULL &&
 	    (uidlist->trie->flags & SQUAT_INDEX_FLAG_MMAP_DISABLE) != 0)
-		uidlist->file_cache = file_cache_new(uidlist->fd);
+		uidlist->file_cache = file_cache_new_path(uidlist->fd, uidlist->path);
 	return squat_uidlist_map_header(uidlist);
 }
 
@@ -534,7 +536,7 @@ static int squat_uidlist_open(struct squat_uidlist *uidlist)
 	uidlist->fd = open(uidlist->path, O_RDWR);
 	if (uidlist->fd == -1) {
 		if (errno == ENOENT) {
-			memset(&uidlist->hdr, 0, sizeof(uidlist->hdr));
+			i_zero(&uidlist->hdr);
 			return 0;
 		}
 		i_error("open(%s) failed: %m", uidlist->path);
@@ -676,7 +678,7 @@ static int squat_uidlist_open_or_create(struct squat_uidlist *uidlist)
 	}
 	if (uidlist->locked_file_size == 0) {
 		/* write using 0 until we're finished */
-		memset(&uidlist->hdr, 0, sizeof(uidlist->hdr));
+		i_zero(&uidlist->hdr);
 		if (write_full(uidlist->fd, &uidlist->hdr,
 			       sizeof(uidlist->hdr)) < 0) {
 			i_error("write(%s) failed: %m", uidlist->path);
@@ -715,7 +717,7 @@ int squat_uidlist_build_init(struct squat_uidlist *uidlist,
 	if (ctx->output->offset == 0) {
 		struct squat_uidlist_file_header hdr;
 
-		memset(&hdr, 0, sizeof(hdr));
+		i_zero(&hdr);
 		o_stream_nsend(ctx->output, &hdr, sizeof(hdr));
 	}
 	o_stream_cork(ctx->output);
@@ -862,7 +864,8 @@ int squat_uidlist_build_finish(struct squat_uidlist_build_context *ctx)
 	}
 
 	if (o_stream_nfinish(ctx->output) < 0) {
-		i_error("write() to %s failed: %m", ctx->uidlist->path);
+		i_error("write() to %s failed: %s", ctx->uidlist->path,
+			o_stream_get_error(ctx->output));
 		return -1;
 	}
 	return 0;
@@ -931,7 +934,7 @@ int squat_uidlist_rebuild_init(struct squat_uidlist_build_context *build_ctx,
 	ctx->next_uid_list_idx = 0x100;
 	o_stream_cork(ctx->output);
 
-	memset(&hdr, 0, sizeof(hdr));
+	i_zero(&hdr);
 	o_stream_nsend(ctx->output, &hdr, sizeof(hdr));
 
 	ctx->cur_block_start_offset = ctx->output->offset;
@@ -1065,7 +1068,8 @@ int squat_uidlist_rebuild_finish(struct squat_uidlist_rebuild_context *ctx,
 		if (ctx->uidlist->corrupted)
 			ret = -1;
 		else if (o_stream_nfinish(ctx->output) < 0) {
-			i_error("write() to %s failed: %m", temp_path);
+			i_error("write(%s) failed: %s", temp_path,
+				o_stream_get_error(ctx->output));
 			ret = -1;
 		} else if (rename(temp_path, ctx->uidlist->path) < 0) {
 			i_error("rename(%s, %s) failed: %m",
@@ -1084,10 +1088,8 @@ int squat_uidlist_rebuild_finish(struct squat_uidlist_rebuild_context *ctx,
 	if (close(ctx->fd) < 0)
 		i_error("close(%s) failed: %m", temp_path);
 
-	if (ret <= 0) {
-		if (unlink(temp_path) < 0)
-			i_error("unlink(%s) failed: %m", temp_path);
-	}
+	if (ret <= 0)
+		i_unlink(temp_path);
 	array_free(&ctx->new_block_offsets);
 	array_free(&ctx->new_block_end_indexes);
 	i_free(ctx);
@@ -1383,11 +1385,6 @@ squat_uidlist_get_at_offset(struct squat_uidlist *uidlist, uoff_t offset,
 		}
 	}
 	return 0;
-}
-
-static int uint32_cmp(const uint32_t *key, const uint32_t *data)
-{
-	return (int)*key - (int)*data;
 }
 
 static int

@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -82,8 +82,8 @@ mail_index_map_register_ext(struct mail_index_map *map,
 	ext = array_append_space(&map->extensions);
 	ext->name = p_strdup(map->extension_pool, name);
 	ext->ext_offset = ext_offset;
-	ext->hdr_offset = ext_offset +
-		mail_index_map_ext_hdr_offset(strlen(name));
+	ext->hdr_offset = ext_offset == (uint32_t)-1 ? (uint32_t)-1 :
+		ext_offset + mail_index_map_ext_hdr_offset(strlen(name));
 	ext->hdr_size = ext_hdr->hdr_size;
 	ext->record_offset = ext_hdr->record_offset;
 	ext->record_size = ext_hdr->record_size;
@@ -231,7 +231,7 @@ static void mail_index_header_init(struct mail_index *index,
 {
 	i_assert((sizeof(*hdr) % sizeof(uint64_t)) == 0);
 
-	memset(hdr, 0, sizeof(*hdr));
+	i_zero(hdr);
 
 	hdr->major_version = MAIL_INDEX_MAJOR_VERSION;
 	hdr->minor_version = MAIL_INDEX_MINOR_VERSION;
@@ -239,7 +239,7 @@ static void mail_index_header_init(struct mail_index *index,
 	hdr->header_size = sizeof(*hdr);
 	hdr->record_size = sizeof(struct mail_index_record);
 
-#if !WORDS_BIGENDIAN
+#ifndef WORDS_BIGENDIAN
 	hdr->compat_flags |= MAIL_INDEX_COMPAT_LITTLE_ENDIAN;
 #endif
 
@@ -253,7 +253,7 @@ struct mail_index_map *mail_index_map_alloc(struct mail_index *index)
 {
 	struct mail_index_map tmp_map;
 
-	memset(&tmp_map, 0, sizeof(tmp_map));
+	i_zero(&tmp_map);
 	mail_index_header_init(index, &tmp_map.hdr);
 	tmp_map.index = index;
 	tmp_map.hdr_base = &tmp_map.hdr;
@@ -327,7 +327,9 @@ static void mail_index_map_copy_records(struct mail_index_record_map *dest,
 	size_t size;
 
 	size = src->records_count * record_size;
-	dest->buffer = buffer_create_dynamic(default_pool, I_MIN(size, 1024));
+	/* +1% so we have a bit of space to grow. useful for huge mailboxes. */
+	dest->buffer = buffer_create_dynamic(default_pool,
+					     size + I_MAX(size/100, 1024));
 	buffer_append(dest->buffer, src->records, size);
 
 	dest->records = buffer_get_modifiable_data(dest->buffer, NULL);
@@ -444,7 +446,7 @@ void mail_index_record_map_move_to_private(struct mail_index_map *map)
 		if (new_map->records_count == 0)
 			new_map->last_appended_uid = 0;
 		else {
-			rec = MAIL_INDEX_MAP_IDX(map, new_map->records_count-1);
+			rec = MAIL_INDEX_REC_AT_SEQ(map, new_map->records_count);
 			new_map->last_appended_uid = rec->uid;
 		}
 		buffer_set_used_size(new_map->buffer, new_map->records_count *
@@ -554,7 +556,7 @@ void mail_index_map_lookup_seq_range(struct mail_index_map *map,
 
 	*first_seq_r = mail_index_bsearch_uid(map, first_uid, 0, 1);
 	if (*first_seq_r == 0 ||
-	    MAIL_INDEX_MAP_IDX(map, *first_seq_r-1)->uid > last_uid) {
+	    MAIL_INDEX_REC_AT_SEQ(map, *first_seq_r)->uid > last_uid) {
 		*first_seq_r = *last_seq_r = 0;
 		return;
 	}

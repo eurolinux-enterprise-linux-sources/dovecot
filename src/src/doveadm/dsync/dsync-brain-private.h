@@ -7,6 +7,8 @@
 #include "dsync-mailbox-state.h"
 
 #define DSYNC_LOCK_FILENAME ".dovecot-sync.lock"
+#define DSYNC_MAILBOX_LOCK_FILENAME ".dovecot-box-sync.lock"
+#define DSYNC_MAILBOX_DEFAULT_LOCK_TIMEOUT_SECS 30
 
 struct dsync_mailbox_tree_sync_change;
 
@@ -32,6 +34,7 @@ enum dsync_state {
 	   after the mails are synced, another mailbox is synced. */
 	DSYNC_STATE_SYNC_MAILS,
 
+	DSYNC_STATE_FINISH,
 	DSYNC_STATE_DONE
 };
 
@@ -49,11 +52,20 @@ struct dsync_brain {
 	pool_t pool;
 	struct mail_user *user;
 	struct dsync_ibc *ibc;
-	struct mail_namespace *sync_ns;
+	const char *process_title_prefix;
+	ARRAY(struct mail_namespace *) sync_namespaces;
 	const char *sync_box;
+	struct mailbox *virtual_all_box;
 	guid_128_t sync_box_guid;
 	const char *const *exclude_mailboxes;
 	enum dsync_brain_sync_type sync_type;
+	time_t sync_since_timestamp;
+	time_t sync_until_timestamp;
+	uoff_t sync_max_size;
+	const char *sync_flag;
+	char alt_char;
+	unsigned int import_commit_msgs_interval;
+	unsigned int hdr_hash_version;
 
 	unsigned int lock_timeout;
 	int lock_fd;
@@ -75,7 +87,10 @@ struct dsync_brain {
 	struct dsync_mailbox_exporter *box_exporter;
 
 	struct mailbox *box;
+	struct file_lock *box_lock;
+	unsigned int mailbox_lock_timeout_secs;
 	struct dsync_mailbox local_dsync_box, remote_dsync_box;
+	pool_t dsync_box_pool;
 	/* list of mailbox states
 	   for master brain: given to brain at init and
 	   for slave brain: received from DSYNC_STATE_SLAVE_RECV_LAST_COMMON */
@@ -88,6 +103,10 @@ struct dsync_brain {
 	/* new states for synced mailboxes */
 	ARRAY_TYPE(dsync_mailbox_state) remote_mailbox_states;
 
+	const char *changes_during_sync;
+	enum mail_error mail_error;
+	const char *const *hashed_headers;
+
 	unsigned int master_brain:1;
 	unsigned int mail_requests:1;
 	unsigned int backup_send:1;
@@ -97,9 +116,14 @@ struct dsync_brain {
 	unsigned int sync_visible_namespaces:1;
 	unsigned int no_mail_sync:1;
 	unsigned int no_backup_overwrite:1;
-	unsigned int changes_during_sync:1;
+	unsigned int no_mail_prefetch:1;
+	unsigned int no_mailbox_renames:1;
+	unsigned int changes_during_remote_sync:1;
+	unsigned int require_full_resync:1;
 	unsigned int verbose_proctitle:1;
+	unsigned int no_notify:1;
 	unsigned int failed:1;
+	unsigned int empty_hdr_workaround:1;
 };
 
 extern const char *dsync_box_state_names[DSYNC_BOX_STATE_DONE+1];
@@ -110,19 +134,24 @@ void dsync_brain_send_mailbox_tree_deletes(struct dsync_brain *brain);
 bool dsync_brain_recv_mailbox_tree(struct dsync_brain *brain);
 bool dsync_brain_recv_mailbox_tree_deletes(struct dsync_brain *brain);
 int dsync_brain_mailbox_tree_sync_change(struct dsync_brain *brain,
-			const struct dsync_mailbox_tree_sync_change *change);
+			const struct dsync_mailbox_tree_sync_change *change,
+			enum mail_error *error_r);
 
 void dsync_brain_sync_mailbox_deinit(struct dsync_brain *brain);
 int dsync_brain_mailbox_alloc(struct dsync_brain *brain, const guid_128_t guid,
-			      struct mailbox **box_r, const char **error_r);
-void dsync_brain_mailbox_update_pre(struct dsync_brain *brain,
+			      struct mailbox **box_r, const char **errstr_r,
+			      enum mail_error *error_r);
+bool dsync_brain_mailbox_update_pre(struct dsync_brain *brain,
 				    struct mailbox *box,
 				    const struct dsync_mailbox *local_box,
-				    const struct dsync_mailbox *remote_box);
+				    const struct dsync_mailbox *remote_box,
+				    const char **reason_r);
 bool dsync_boxes_need_sync(struct dsync_brain *brain,
 			   const struct dsync_mailbox *box1,
 			   const struct dsync_mailbox *box2);
 void dsync_brain_sync_init_box_states(struct dsync_brain *brain);
+void dsync_brain_set_changes_during_sync(struct dsync_brain *brain,
+					 const char *reason);
 
 void dsync_brain_master_send_mailbox(struct dsync_brain *brain);
 bool dsync_brain_slave_recv_mailbox(struct dsync_brain *brain);

@@ -22,7 +22,7 @@ There are three ways to fix this:
  2. Use namespaces to allow users to keep using the prefix. See "Backwards
     Compatibility" in <Namespaces.txt> for an example configuration.
  3. Configure Dovecot to use home directory ('mail_location =
-    mbox:~/:INBOX=/var/mail/%u' and set 'full_filesystem_access=yes'). The
+    mbox:~/:INBOX=/var/mail/%u' and set 'mail_full_filesystem_access=yes'). The
     latter is needed to make '~/mail' and '~user/mail' prefixes work.
 
 A typical mailbox location setting is:
@@ -58,7 +58,7 @@ mail/box
  * If you removed the prefix from the IMAP clients, you'll also have to remove
    these prefixes.
  * You can use <uw2dovecot.sh.txt> script to copy all the users' '.mailboxlist'
-   files to '.subscription' files (without any prefix removal).
+   files to '.subscriptions' files (without any prefix removal).
  * It's possible to keep using the '.mailboxlist' filename (as long as it's in
    the same directory) by modifying 'SUBSCRIPTION_FILE_NAME' define in
    'src/lib-storage/index/mbox/mbox-storage.h'
@@ -134,4 +134,4 @@ uidl
 quit
 ---%<-------------------------------------------------------------------------
 
-(This file was created from the wiki on 2013-12-19 04:42)
+(This file was created from the wiki on 2018-05-23 04:42)

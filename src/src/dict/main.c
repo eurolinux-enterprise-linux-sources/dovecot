@@ -1,8 +1,13 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "restrict-access.h"
+#include "ioloop.h"
 #include "randgen.h"
+#include "str.h"
+#include "hostpid.h"
+#include "timing.h"
+#include "process-title.h"
 #include "env-util.h"
 #include "module-dir.h"
 #include "master-service.h"
@@ -10,10 +15,54 @@
 #include "sql-api.h"
 #include "dict.h"
 #include "dict-client.h"
+#include "dict-commands.h"
 #include "dict-connection.h"
 #include "dict-settings.h"
+#include "main.h"
 
 static struct module *modules;
+static struct timeout *to_proctitle;
+static bool proctitle_updated;
+
+static void
+add_timing_string(string_t *str, struct timing *timing, const char *name)
+{
+	str_printfa(str, ", %u %s:%llu/%llu/%llu/%llu",
+		    timing_get_count(timing), name,
+		    (unsigned long long)timing_get_min(timing)/1000,
+		    (unsigned long long)timing_get_avg(timing)/1000,
+		    (unsigned long long)timing_get_95th(timing)/1000,
+		    (unsigned long long)timing_get_max(timing)/1000);
+	timing_reset(timing);
+}
+
+static void dict_proctitle_update(void *context ATTR_UNUSED)
+{
+	string_t *str = t_str_new(128);
+
+	if (!proctitle_updated)
+		timeout_remove(&to_proctitle);
+
+	str_printfa(str, "[%u clients", dict_connections_current_count());
+
+	add_timing_string(str, cmd_stats.lookups, "lookups");
+	add_timing_string(str, cmd_stats.iterations, "iters");
+	add_timing_string(str, cmd_stats.commits, "commits");
+	str_append_c(str, ']');
+
+	process_title_set(str_c(str));
+	proctitle_updated = FALSE;
+}
+
+void dict_proctitle_update_later(void)
+{
+	if (!dict_settings->verbose_proctitle)
+		return;
+
+	if (to_proctitle == NULL)
+		to_proctitle = timeout_add(1000, dict_proctitle_update, NULL);
+	proctitle_updated = TRUE;
+}
 
 static void dict_die(void)
 {
@@ -57,7 +106,7 @@ static void main_init(void)
 				    NULL));
 	}
 
-	memset(&mod_set, 0, sizeof(mod_set));
+	i_zero(&mod_set);
 	mod_set.abi_version = DOVECOT_ABI_VERSION;
 	mod_set.require_init_funcs = TRUE;
 
@@ -67,12 +116,17 @@ static void main_init(void)
 	/* Register only after loading modules. They may contain SQL drivers,
 	   which we'll need to register. */
 	dict_drivers_register_all();
+	dict_commands_init();
 }
 
 static void main_deinit(void)
 {
+	if (to_proctitle != NULL)
+		timeout_remove(&to_proctitle);
+
 	dict_connections_destroy_all();
 	dict_drivers_unregister_all();
+	dict_commands_deinit();
 
 	module_dir_unload(&modules);
 
@@ -82,13 +136,15 @@ static void main_deinit(void)
 
 int main(int argc, char *argv[])
 {
+	const enum master_service_flags service_flags = 0;
 	const struct setting_parser_info *set_roots[] = {
 		&dict_setting_parser_info,
 		NULL
 	};
 	const char *error;
 
-	master_service = master_service_init("dict", 0, &argc, &argv, "");
+	master_service = master_service_init("dict", service_flags,
+					     &argc, &argv, "");
 	if (master_getopt(master_service) > 0)
 		return FATAL_DEFAULT;
 
@@ -96,7 +152,7 @@ int main(int argc, char *argv[])
 						&error) < 0)
 		i_fatal("Error reading configuration: %s", error);
 
-	master_service_init_log(master_service, "dict: ");
+	master_service_init_log(master_service, t_strdup_printf("dict(%s): ", my_pid));
 	main_preinit();
 	master_service_set_die_callback(master_service, dict_die);
 

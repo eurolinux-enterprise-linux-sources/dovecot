@@ -3,26 +3,35 @@
 
 #include "net.h"
 
+#define DOVEADM_LOG_CHANNEL_ID 'L'
+
 struct client_connection {
 	pool_t pool;
 
 	int fd;
+	const char *name;
 	struct io *io;
 	struct istream *input;
 	struct ostream *output;
+	struct ostream *log_out;
 	struct ssl_iostream *ssl_iostream;
+	struct ioloop *ioloop;
 	struct ip_addr local_ip, remote_ip;
-	unsigned int local_port, remote_port;
+	in_port_t local_port, remote_port;
 	const struct doveadm_settings *set;
 
 	unsigned int handshaked:1;
+	unsigned int preauthenticated:1;
 	unsigned int authenticated:1;
+	unsigned int io_setup:1;
+	unsigned int use_multiplex:1;
+	unsigned int http:1;
 };
 
 struct client_connection *
 client_connection_create(int fd, int listen_fd, bool ssl);
+struct client_connection *
+client_connection_create_http(int fd, bool ssl);
 void client_connection_destroy(struct client_connection **conn);
-
-struct ostream *client_connection_get_output(struct client_connection *conn);
 
 #endif

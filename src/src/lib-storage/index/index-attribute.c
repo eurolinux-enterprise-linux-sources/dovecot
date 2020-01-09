@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -9,7 +9,7 @@ struct index_storage_attribute_iter {
 	struct mailbox_attribute_iter iter;
 	struct dict_iterate_context *diter;
 	char *prefix;
-	unsigned int prefix_len;
+	size_t prefix_len;
 	bool dict_disabled;
 };
 
@@ -82,6 +82,7 @@ index_storage_get_dict(struct mailbox *box, enum mail_attribute_type type,
 	struct mail_storage *storage = box->storage;
 	struct mail_namespace *ns;
 	struct mailbox_metadata metadata;
+	struct dict_settings set;
 	const char *error;
 
 	if (mailbox_get_metadata(box, MAILBOX_METADATA_GUID, &metadata) < 0)
@@ -118,11 +119,13 @@ index_storage_get_dict(struct mailbox *box, enum mail_attribute_type type,
 		return -1;
 	}
 
-	if (dict_init(storage->set->mail_attribute_dict,
-		      DICT_DATA_TYPE_STRING,
-		      storage->user->username,
-		      storage->user->set->base_dir,
-		      &storage->_shared_attr_dict, &error) < 0) {
+	i_zero(&set);
+	set.username = storage->user->username;
+	set.base_dir = storage->user->set->base_dir;
+	if (mail_user_get_home(storage->user, &set.home_dir) <= 0)
+		set.home_dir = NULL;
+	if (dict_init_full(storage->set->mail_attribute_dict, &set,
+			   &storage->_shared_attr_dict, &error) < 0) {
 		mail_storage_set_critical(storage,
 			"mail_attribute_dict: dict_init(%s) failed: %s",
 			storage->set->mail_attribute_dict, error);
@@ -156,6 +159,7 @@ index_storage_attribute_get_dict_trans(struct mailbox_transaction_context *t,
 {
 	struct dict_transaction_context **dtransp = NULL;
 	struct dict *dict;
+	struct mailbox_metadata metadata;
 
 	switch (type) {
 	case MAIL_ATTRIBUTE_TYPE_PRIVATE:
@@ -166,6 +170,16 @@ index_storage_attribute_get_dict_trans(struct mailbox_transaction_context *t,
 		break;
 	}
 	i_assert(dtransp != NULL);
+
+	if (*dtransp != NULL) {
+		/* transaction already created */
+		if (mailbox_get_metadata(t->box, MAILBOX_METADATA_GUID,
+					 &metadata) < 0)
+			return -1;
+		*mailbox_prefix_r = guid_128_to_string(metadata.guid);
+		*dtrans_r = *dtransp;
+		return 0;
+	}
 
 	if (index_storage_get_dict(t->box, type, &dict, mailbox_prefix_r) < 0)
 		return -1;
@@ -182,13 +196,6 @@ int index_storage_attribute_set(struct mailbox_transaction_context *t,
 	bool pvt = type == MAIL_ATTRIBUTE_TYPE_PRIVATE;
 	time_t ts = value->last_change != 0 ? value->last_change : ioloop_time;
 	int ret = 0;
-
-	if (strncmp(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT,
-		    strlen(MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT)) == 0) {
-		mail_storage_set_error(t->box->storage, MAIL_ERROR_PARAMS,
-			"Internal attributes cannot be changed directly");
-		return -1;
-	}
 
 	if (index_storage_attribute_get_dict_trans(t, type, &dtrans,
 						   &mailbox_prefix) < 0)
@@ -222,11 +229,7 @@ int index_storage_attribute_get(struct mailbox_transaction_context *t,
 	const char *mailbox_prefix;
 	int ret;
 
-	memset(value_r, 0, sizeof(*value_r));
-
-	if (strncmp(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT,
-		    strlen(MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT)) == 0)
-		return 0;
+	i_zero(value_r);
 
 	if (index_storage_get_dict(t->box, type, &dict, &mailbox_prefix) < 0)
 		return -1;

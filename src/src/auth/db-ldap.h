@@ -7,6 +7,8 @@
 
 /* Maximum number of pending requests before delaying new requests. */
 #define DB_LDAP_MAX_PENDING_REQUESTS 8
+/* connect() timeout to LDAP */
+#define DB_LDAP_CONNECT_TIMEOUT_SECS 5
 /* If LDAP connection is down, fail requests after waiting for this long. */
 #define DB_LDAP_REQUEST_DISCONNECT_TIMEOUT_SECS 4
 /* If request is still in queue after this many seconds and other requests
@@ -67,7 +69,7 @@ struct ldap_settings {
 	bool blocking;
 
 	/* ... */
-	int ldap_deref, ldap_scope;
+	int ldap_deref, ldap_scope, ldap_tls_require_cert_parsed;
 	uid_t uid;
 	gid_t gid;
 };
@@ -176,6 +178,7 @@ struct ldap_connection {
 	char **pass_attr_names, **user_attr_names, **iterate_attr_names;
 	ARRAY_TYPE(ldap_field) pass_attr_map, user_attr_map, iterate_attr_map;
 	bool userdb_used;
+	bool delayed_connect;
 };
 
 /* Send/queue request */
@@ -190,6 +193,7 @@ struct ldap_connection *db_ldap_init(const char *config_path, bool userdb);
 void db_ldap_unref(struct ldap_connection **conn);
 
 int db_ldap_connect(struct ldap_connection *conn);
+void db_ldap_connect_delayed(struct ldap_connection *conn);
 
 void db_ldap_enable_input(struct ldap_connection *conn, bool enable);
 

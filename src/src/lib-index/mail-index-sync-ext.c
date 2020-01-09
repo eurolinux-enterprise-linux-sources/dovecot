@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,7 +8,6 @@
 #include "mail-index-modseq.h"
 #include "mail-transaction-log.h"
 
-#include <stdlib.h>
 
 void mail_index_sync_init_expunge_handlers(struct mail_index_sync_map_ctx *ctx)
 {
@@ -24,7 +23,7 @@ void mail_index_sync_init_expunge_handlers(struct mail_index_sync_map_ctx *ctx)
 	if (!array_is_created(&ctx->view->map->extensions))
 		return;
 
-	memset(&eh, 0, sizeof(eh));
+	i_zero(&eh);
 	if (array_is_created(&ctx->expunge_handlers))
 		array_clear(&ctx->expunge_handlers);
 	else
@@ -95,26 +94,8 @@ void mail_index_sync_init_handlers(struct mail_index_sync_map_ctx *ctx)
 
 void mail_index_sync_deinit_handlers(struct mail_index_sync_map_ctx *ctx)
 {
-	const struct mail_index_registered_ext *rext;
-	void **extra_contexts;
-	unsigned int i, rext_count, context_count;
-
-	if (!array_is_created(&ctx->extra_contexts))
-		return;
-
-	rext = array_get(&ctx->view->index->extensions, &rext_count);
-	extra_contexts =
-		array_get_modifiable(&ctx->extra_contexts, &context_count);
-	i_assert(context_count <= rext_count);
-
-	for (i = 0; i < context_count; i++) {
-		if (extra_contexts[i] != NULL) {
-			rext[i].sync_handler.callback(ctx, 0, NULL, NULL,
-						      &extra_contexts[i]);
-		}
-	}
-
-	array_free(&ctx->extra_contexts);
+	if (array_is_created(&ctx->extra_contexts))
+		array_free(&ctx->extra_contexts);
 }
 
 static struct mail_index_ext_header *
@@ -177,7 +158,7 @@ static void sync_ext_reorder(struct mail_index_map *map, uint32_t ext_map_idx,
 	/* we simply try to use the extensions with largest alignment
 	   requirement first. FIXME: if the extension sizes don't match
 	   alignment, this may not give the minimal layout. */
-	offset = sizeof(struct mail_index_record);
+	offset = MAIL_INDEX_RECORD_MIN_SIZE;
 	max_align = sizeof(uint32_t);
 	for (;;) {
 		min_align = (uint16_t)-1;
@@ -214,6 +195,7 @@ static void sync_ext_reorder(struct mail_index_map *map, uint32_t ext_map_idx,
 		offset += max_align - (offset % max_align);
 	}
 	new_record_size = offset;
+	i_assert(new_record_size >= sizeof(struct mail_index_record));
 
 	/* copy the records to new buffer */
 	new_buffer_size = map->rec_map->records_count * new_record_size;
@@ -260,48 +242,60 @@ sync_ext_resize(const struct mail_transaction_ext_intro *u,
 		uint32_t ext_map_idx, struct mail_index_sync_map_ctx *ctx,
 		bool no_shrink)
 {
-	struct mail_index_map *map = ctx->view->map;
+	struct mail_index_map *map;
 	struct mail_index_ext *ext;
 	struct mail_index_ext_header *ext_hdr;
-	uint32_t old_size, new_size, old_record_size;
-	bool modified = FALSE, reorder = FALSE;
+	uint32_t old_padded_hdr_size, new_padded_hdr_size, old_record_size;
+	bool reorder = FALSE;
 
+	ext = array_idx_modifiable(&ctx->view->map->extensions, ext_map_idx);
+	old_padded_hdr_size = MAIL_INDEX_HEADER_SIZE_ALIGN(ext->hdr_size);
+	new_padded_hdr_size = MAIL_INDEX_HEADER_SIZE_ALIGN(u->hdr_size);
+
+	if (ext->record_align != u->record_align ||
+	    ext->record_size != u->record_size) {
+		/* record changed */
+	} else if (new_padded_hdr_size < old_padded_hdr_size) {
+		/* header is shrunk. do we allow? */
+		if (no_shrink)
+			return;
+	} else if (ext->hdr_size == u->hdr_size) {
+		/* no changes */
+		return;
+	}
+	/* something changed. get ourself a new map before we start changing
+	   anything in it. */
+	map = mail_index_sync_get_atomic_map(ctx);
+	/* ext was duplicated to the new map. */
 	ext = array_idx_modifiable(&map->extensions, ext_map_idx);
 
-	old_size = MAIL_INDEX_HEADER_SIZE_ALIGN(ext->hdr_size);
-	new_size = MAIL_INDEX_HEADER_SIZE_ALIGN(u->hdr_size);
-
-	if (new_size < old_size) {
+	if (new_padded_hdr_size < old_padded_hdr_size) {
 		/* header shrank */
 		if (no_shrink)
-			new_size = old_size;
+			new_padded_hdr_size = old_padded_hdr_size;
 		else {
 			buffer_delete(map->hdr_copy_buf,
-				      ext->hdr_offset + new_size,
-				      old_size - new_size);
+				      ext->hdr_offset + new_padded_hdr_size,
+				      old_padded_hdr_size - new_padded_hdr_size);
 			ext->hdr_size = u->hdr_size;
-			modified = TRUE;
 		}
-	} else if (new_size > old_size) {
+	} else if (new_padded_hdr_size > old_padded_hdr_size) {
 		/* header grown */
 		buffer_insert_zero(map->hdr_copy_buf,
-				   ext->hdr_offset + old_size,
-				   new_size - old_size);
+				   ext->hdr_offset + old_padded_hdr_size,
+				   new_padded_hdr_size - old_padded_hdr_size);
 		ext->hdr_size = u->hdr_size;
-		modified = TRUE;
 	} else {
 		if (ext->hdr_size != u->hdr_size) {
 			/* aligned sizes were the same, but the actual sizes
 			   had changed */
 			ext->hdr_size = u->hdr_size;
-			modified = TRUE;
 		}
 	}
 
 	if (ext->record_align < u->record_align ||
 	    (ext->record_align > u->record_align && !no_shrink)) {
 		ext->record_align = u->record_align;
-		modified = TRUE;
 		reorder = TRUE;
 	}
 
@@ -309,29 +303,25 @@ sync_ext_resize(const struct mail_transaction_ext_intro *u,
 	if (ext->record_size < u->record_size ||
 	    (ext->record_size > u->record_size && !no_shrink)) {
 		ext->record_size = u->record_size;
-		modified = TRUE;
 		reorder = TRUE;
 	}
 
-	if (modified) {
-		i_assert((map->hdr_copy_buf->used % sizeof(uint64_t)) == 0);
-		map->hdr_base = map->hdr_copy_buf->data;
-		map->hdr.header_size = map->hdr_copy_buf->used;
+	i_assert((map->hdr_copy_buf->used % sizeof(uint64_t)) == 0);
+	map->hdr_base = map->hdr_copy_buf->data;
+	map->hdr.header_size = map->hdr_copy_buf->used;
 
-		ext_hdr = get_ext_header(map, ext);
-		ext_hdr->reset_id = ext->reset_id;
-		ext_hdr->hdr_size = ext->hdr_size;
-		ext_hdr->record_offset = ext->record_offset;
-		ext_hdr->record_size = ext->record_size;
-		ext_hdr->record_align = ext->record_align;
-	} else {
-		i_assert(map->hdr_base == map->hdr_copy_buf->data);
-	}
+	ext_hdr = get_ext_header(map, ext);
+	ext_hdr->reset_id = ext->reset_id;
+	ext_hdr->hdr_size = ext->hdr_size;
+	ext_hdr->record_offset = ext->record_offset;
+	ext_hdr->record_size = ext->record_size;
+	ext_hdr->record_align = ext->record_align;
 
-	if (new_size != old_size) {
+	if (new_padded_hdr_size != old_padded_hdr_size) {
 		/* move all hdr_offset of all extensions after this one */
 		unsigned int i, count = array_count(&map->extensions);
-		ssize_t diff = (ssize_t)new_size - (ssize_t)old_size;
+		ssize_t diff = (ssize_t)new_padded_hdr_size -
+			(ssize_t)old_padded_hdr_size;
 
 		ext = array_idx_modifiable(&map->extensions, 0);
 		for (i = ext_map_idx + 1; i < count; i++) {
@@ -340,13 +330,8 @@ sync_ext_resize(const struct mail_transaction_ext_intro *u,
 		}
 	}
 
-	if (reorder) {
-		map = mail_index_sync_get_atomic_map(ctx);
+	if (reorder)
 		sync_ext_reorder(map, ext_map_idx, old_record_size);
-	} else if (modified) {
-		/* header size changed. recreate index file. */
-		(void)mail_index_sync_get_atomic_map(ctx);
-	}
 }
 
 static bool
@@ -446,13 +431,13 @@ void mail_index_sync_ext_init(struct mail_index_sync_map_ctx *ctx,
 			return;
 
 		/* make sure it's the expected size */
-		memset(&u, 0, sizeof(u));
+		i_zero(&u);
 		u.hdr_size = rext->hdr_size;
 		u.record_size = rext->record_size;
 		u.record_align = rext->record_align;
 		sync_ext_resize(&u, *ext_map_idx_r, ctx, FALSE);
 	} else {
-		memset(&ext_hdr, 0, sizeof(ext_hdr));
+		i_zero(&ext_hdr);
 		ext_hdr.name_size = strlen(name);
 		ext_hdr.hdr_size = rext->hdr_size;
 		ext_hdr.record_size = rext->record_size;
@@ -476,6 +461,7 @@ int mail_index_sync_ext_intro(struct mail_index_sync_map_ctx *ctx,
 	   intro is corrupted */
 	ctx->cur_ext_map_idx = (uint32_t)-2;
 	ctx->cur_ext_ignore = TRUE;
+	ctx->cur_ext_record_size = 0;
 
 	if (u->ext_id != (uint32_t)-1 &&
 	    (!array_is_created(&map->extensions) ||
@@ -519,7 +505,7 @@ int mail_index_sync_ext_intro(struct mail_index_sync_map_ctx *ctx,
 		return -1;
 	}
 
-	memset(&ext_hdr, 0, sizeof(ext_hdr));
+	i_zero(&ext_hdr);
 	ext_hdr.name_size = strlen(name);
 	ext_hdr.reset_id = u->reset_id;
 	ext_hdr.hdr_size = u->hdr_size;
@@ -535,6 +521,7 @@ int mail_index_sync_ext_intro(struct mail_index_sync_map_ctx *ctx,
 		return -1;
 	}
 
+	ctx->cur_ext_record_size = u->record_size;
 	if (ext != NULL) {
 		/* exists already */
 		if (u->reset_id == ext->reset_id) {
@@ -565,14 +552,15 @@ static void mail_index_sync_ext_clear(struct mail_index_view *view,
 				      struct mail_index_ext *ext)
 {
 	struct mail_index_record *rec;
-	uint32_t i;
+	uint32_t seq;
 
 	memset(buffer_get_space_unsafe(map->hdr_copy_buf, ext->hdr_offset,
 				       ext->hdr_size), 0, ext->hdr_size);
 	map->hdr_base = map->hdr_copy_buf->data;
+	i_assert(map->hdr_copy_buf->used == map->hdr.header_size);
 
-	for (i = 0; i < view->map->rec_map->records_count; i++) {
-		rec = MAIL_INDEX_MAP_IDX(view->map, i);
+	for (seq = 1; seq <= view->map->rec_map->records_count; seq++) {
+		rec = MAIL_INDEX_REC_AT_SEQ(view->map, seq);
 		memset(PTR_OFFSET(rec, ext->record_offset), 0,
 		       ext->record_size);
 	}
@@ -640,6 +628,7 @@ int mail_index_sync_ext_hdr_update(struct mail_index_sync_map_ctx *ctx,
 
 	buffer_write(map->hdr_copy_buf, ext->hdr_offset + offset, data, size);
 	map->hdr_base = map->hdr_copy_buf->data;
+	i_assert(map->hdr_copy_buf->used == map->hdr.header_size);
 
 	if (ext->index_idx == ctx->view->index->modseq_ext_id)
 		mail_index_modseq_hdr_update(ctx->modseq_ctx);
@@ -653,10 +642,8 @@ mail_index_sync_ext_rec_update(struct mail_index_sync_map_ctx *ctx,
 	struct mail_index_view *view = ctx->view;
 	struct mail_index_record *rec;
 	const struct mail_index_ext *ext;
-	const struct mail_index_registered_ext *rext;
 	void *old_data;
 	uint32_t seq;
-	int ret;
 
 	i_assert(ctx->cur_ext_map_idx != (uint32_t)-1);
 	i_assert(!ctx->cur_ext_ignore);
@@ -671,28 +658,18 @@ mail_index_sync_ext_rec_update(struct mail_index_sync_map_ctx *ctx,
 		return 1;
 
 	ext = array_idx(&view->map->extensions, ctx->cur_ext_map_idx);
-	i_assert(ext->record_offset + ext->record_size <=
+	i_assert(ext->record_offset + ctx->cur_ext_record_size <=
 		 view->map->hdr.record_size);
 
-	rec = MAIL_INDEX_MAP_IDX(view->map, seq-1);
+	rec = MAIL_INDEX_REC_AT_SEQ(view->map, seq);
 	old_data = PTR_OFFSET(rec, ext->record_offset);
 
-	rext = array_idx(&view->index->extensions, ext->index_idx);
-
-	/* call sync handlers only when its registered type matches with
-	   current synchronization type (index/view) */
-	if ((rext->sync_handler.type & ctx->type) != 0) {
-		void **extra_context =
-			array_idx_modifiable(&ctx->extra_contexts,
-					     ext->index_idx);
-		ret = rext->sync_handler.callback(ctx, seq, old_data, u + 1,
-						  extra_context);
-		if (ret <= 0)
-			return ret;
-	}
-
 	/* @UNSAFE */
-	memcpy(old_data, u + 1, ext->record_size);
+	memcpy(old_data, u + 1, ctx->cur_ext_record_size);
+	if (ctx->cur_ext_record_size < ext->record_size) {
+		memset(PTR_OFFSET(old_data, ctx->cur_ext_record_size), 0,
+		       ext->record_size - ctx->cur_ext_record_size);
+	}
 	return 1;
 }
 
@@ -720,16 +697,16 @@ mail_index_sync_ext_atomic_inc(struct mail_index_sync_map_ctx *ctx,
 		return 1;
 
 	ext = array_idx(&view->map->extensions, ctx->cur_ext_map_idx);
-	i_assert(ext->record_offset + ext->record_size <=
+	i_assert(ext->record_offset + ctx->cur_ext_record_size <=
 		 view->map->hdr.record_size);
 
-	rec = MAIL_INDEX_MAP_IDX(view->map, seq-1);
+	rec = MAIL_INDEX_REC_AT_SEQ(view->map, seq);
 	data = PTR_OFFSET(rec, ext->record_offset);
 
 	min_value = u->diff >= 0 ? 0 : (uint64_t)(-(int64_t)u->diff);
 
-	max_value = ext->record_size == 8 ? (uint64_t)-1 :
-		((uint64_t)1 << (ext->record_size*8)) - 1;
+	max_value = ctx->cur_ext_record_size == 8 ? (uint64_t)-1 :
+		((uint64_t)1 << (ctx->cur_ext_record_size*8)) - 1;
 	if (u->diff <= 0) {
 		/* skip */
 	} else if (max_value >= (uint32_t)u->diff) {
@@ -741,7 +718,7 @@ mail_index_sync_ext_atomic_inc(struct mail_index_sync_map_ctx *ctx,
 		return -1;
 	}
 
-	switch (ext->record_size) {
+	switch (ctx->cur_ext_record_size) {
 	case 1: {
 		uint8_t *num = data;
 
@@ -774,7 +751,7 @@ mail_index_sync_ext_atomic_inc(struct mail_index_sync_map_ctx *ctx,
 	default:
 		mail_index_sync_set_corrupted(ctx,
 			"Extension record inc with invalid size=%u",
-			ext->record_size);
+			ctx->cur_ext_record_size);
 		return -1;
 	}
 	if (orig_num < min_value) {

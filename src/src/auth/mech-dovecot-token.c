@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 /* Used internally by Dovecot processes to authenticate against each others
    (e.g. imap to imap-urlauth). See auth-token.c */
@@ -41,17 +41,18 @@ mech_dovecot_token_auth_continue(struct auth_request *request,
 
 	if (count != 4) {
 		/* invalid input */
-		auth_request_log_info(request, "dovecot-token", "invalid input");
+		auth_request_log_info(request, AUTH_SUBSYS_MECH, "invalid input");
 		auth_request_fail(request);
 	} else if (!auth_request_set_username(request, username, &error)) {
 		/* invalid username */
-		auth_request_log_info(request, "dovecot-token", "%s", error);
+		auth_request_log_info(request, AUTH_SUBSYS_MECH, "%s", error);
 		auth_request_fail(request);
 	} else {
 		const char *valid_token =
 			auth_token_get(service, pid, request->user, session_id);
 
-		if (strcmp(auth_token, valid_token) == 0) {
+		if (auth_token != NULL &&
+		    strcmp(auth_token, valid_token) == 0) {
 			request->passdb_success = TRUE;
 			auth_request_success(request, NULL, 0);
 		} else {
@@ -69,7 +70,7 @@ static struct auth_request *mech_dovecot_token_auth_new(void)
 	struct auth_request *request;
 	pool_t pool;
 
-	pool = pool_alloconly_create("dovecot_token_auth_request", 512);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"dovecot_token_auth_request", 512);
 	request = p_new(pool, struct auth_request, 1);
 	request->pool = pool;
 	return request;

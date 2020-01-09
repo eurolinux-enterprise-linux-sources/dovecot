@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -6,6 +6,7 @@
 #include "buffer.h"
 #include "str.h"
 #include "message-date.h"
+#include "message-part-data.h"
 #include "message-parser.h"
 #include "message-header-decode.h"
 #include "istream-tee.h"
@@ -71,6 +72,7 @@ static void index_mail_parse_header_finish(struct index_mail *mail)
 
 		if (match_idx < match_count) {
 			/* save index to first header line */
+			i_assert(match_idx == lines[i].field_idx);
 			j = i + 1;
 			array_idx_set(&mail->header_match_lines, match_idx, &j);
 			match_idx++;
@@ -78,8 +80,12 @@ static void index_mail_parse_header_finish(struct index_mail *mail)
 
 		if (!mail_cache_field_can_add(_mail->transaction->cache_trans,
 					      _mail->seq, lines[i].field_idx)) {
-			/* header is already cached */
-			j = i + 1;
+			/* header is already cached. skip over all the
+			   header lines. */
+			for (j = i+1; j < count; j++) {
+				if (lines[j].field_idx != lines[i].field_idx)
+					break;
+			}
 			continue;
 		}
 
@@ -130,6 +136,7 @@ static void index_mail_parse_header_finish(struct index_mail *mail)
 	}
 
 	mail->data.dont_cache_field_idx = UINT_MAX;
+	mail->data.header_parser_initialized = FALSE;
 }
 
 static unsigned int
@@ -138,7 +145,7 @@ get_header_field_idx(struct mailbox *box, const char *field,
 {
 	struct mail_cache_field header_field;
 
-	memset(&header_field, 0, sizeof(header_field));
+	i_zero(&header_field);
 	header_field.type = MAIL_CACHE_FIELD_HEADER;
 	header_field.decision = decision;
 	T_BEGIN {
@@ -187,6 +194,8 @@ void index_mail_parse_header_init(struct index_mail *mail,
 	struct index_mail_data *data = &mail->data;
 	const uint8_t *match;
 	unsigned int i, field_idx, match_count;
+
+	i_assert(!mail->data.header_parser_initialized);
 
 	mail->header_seq = data->seq;
 	if (mail->header_data == NULL) {
@@ -247,6 +256,9 @@ void index_mail_parse_header_init(struct index_mail *mail,
 		array_idx_set(&mail->header_match, field_idx,
 			      &mail->header_match_value);
 	}
+	mail->data.header_parser_initialized = TRUE;
+	mail->data.parse_line_num = 0;
+	i_zero(&mail->data.parse_line);
 }
 
 static void index_mail_parse_finish_imap_envelope(struct index_mail *mail)
@@ -257,7 +269,7 @@ static void index_mail_parse_finish_imap_envelope(struct index_mail *mail)
 	string_t *str;
 
 	str = str_new(mail->mail.data_pool, 256);
-	imap_envelope_write_part_data(mail->data.envelope_data, str);
+	imap_envelope_write(mail->data.envelope_data, str);
 	mail->data.envelope = str_c(str);
 
 	if (mail_cache_field_can_add(_mail->transaction->cache_trans,
@@ -276,15 +288,17 @@ void index_mail_parse_header(struct message_part *part,
 	unsigned int field_idx, count;
 	uint8_t *match;
 
+	i_assert(data->header_parser_initialized);
+
         data->parse_line_num++;
 
 	if (data->save_bodystructure_header) {
 		i_assert(part != NULL);
-		imap_bodystructure_parse_header(mail->mail.data_pool, part, hdr);
+		message_part_data_parse_from_header(mail->mail.data_pool, part, hdr);
 	}
 
 	if (data->save_envelope) {
-		imap_envelope_parse_header(mail->mail.data_pool,
+		message_part_envelope_parse_from_header(mail->mail.data_pool,
 					   &data->envelope_data, hdr);
 
 		if (hdr == NULL)
@@ -298,7 +312,11 @@ void index_mail_parse_header(struct message_part *part,
 		T_BEGIN {
 			index_mail_parse_header_finish(mail);
 		} T_END;
-                data->save_bodystructure_header = FALSE;
+		if (data->save_bodystructure_header) {
+			i_assert(!data->save_bodystructure_body ||
+				 data->parser_ctx != NULL);
+			data->save_bodystructure_header = FALSE;
+		}
 		return;
 	}
 
@@ -368,6 +386,10 @@ index_mail_cache_parse_init(struct mail *_mail, struct istream *input)
 	mail->data.save_sent_date = TRUE;
 	mail->data.save_bodystructure_header = TRUE;
 	mail->data.save_bodystructure_body = TRUE;
+	/* Don't unnecessarily waste time generating a snippet, since it's
+	   not as cheap as the others to generate. */
+	if (index_mail_want_cache(mail, MAIL_CACHE_BODY_SNIPPET))
+		mail->data.save_body_snippet = TRUE;
 
 	mail->data.tee_stream = tee_i_stream_create(input);
 	input = tee_i_stream_create_child(mail->data.tee_stream);
@@ -386,10 +408,14 @@ static void index_mail_init_parser(struct index_mail *mail)
 {
 	struct index_mail_data *data = &mail->data;
 	struct message_part *parts;
+	const char *error;
 
 	if (data->parser_ctx != NULL) {
 		data->parser_input = NULL;
-		(void)message_parser_deinit(&data->parser_ctx, &parts);
+		if (message_parser_deinit_from_parts(&data->parser_ctx, &parts, &error) < 0) {
+			index_mail_set_message_parts_corrupted(&mail->mail.mail, error);
+			data->parts = NULL;
+		}
 	}
 
 	if (data->parts == NULL) {
@@ -408,7 +434,8 @@ static void index_mail_init_parser(struct index_mail *mail)
 }
 
 int index_mail_parse_headers(struct index_mail *mail,
-			     struct mailbox_header_lookup_ctx *headers)
+			     struct mailbox_header_lookup_ctx *headers,
+			     const char *reason)
 {
 	struct index_mail_data *data = &mail->data;
 	struct istream *input;
@@ -416,8 +443,10 @@ int index_mail_parse_headers(struct index_mail *mail,
 
 	old_offset = data->stream == NULL ? 0 : data->stream->v_offset;
 
-	if (mail_get_hdr_stream(&mail->mail.mail, NULL, &input) < 0)
+	if (mail_get_hdr_stream_because(&mail->mail.mail, NULL, reason, &input) < 0)
 		return -1;
+
+	i_assert(data->stream != NULL);
 
 	index_mail_parse_header_init(mail, headers);
 
@@ -430,6 +459,8 @@ int index_mail_parse_headers(struct index_mail *mail,
 					    mail);
 	} else {
 		/* just read the header */
+		i_assert(!data->save_bodystructure_body ||
+			 data->parser_ctx != NULL);
 		message_parse_header(data->stream, &data->hdr_size,
 				     hdr_parser_flags,
 				     index_mail_parse_header_cb, mail);
@@ -447,7 +478,7 @@ static void
 imap_envelope_parse_callback(struct message_header_line *hdr,
 			     struct index_mail *mail)
 {
-	imap_envelope_parse_header(mail->mail.data_pool,
+	message_part_envelope_parse_from_header(mail->mail.data_pool,
 				   &mail->data.envelope_data, hdr);
 
 	if (hdr == NULL)
@@ -476,7 +507,7 @@ int index_mail_headers_get_envelope(struct index_mail *mail)
 
 	mail->data.save_envelope = TRUE;
 	header_ctx = mailbox_header_lookup_init(mail->mail.mail.box,
-						imap_envelope_headers);
+						message_part_envelope_headers);
 	if (mail_get_header_stream(&mail->mail.mail, header_ctx, &stream) < 0) {
 		mailbox_header_lookup_unref(&header_ctx);
 		return -1;
@@ -489,11 +520,7 @@ int index_mail_headers_get_envelope(struct index_mail *mail)
 		message_parse_header(stream, NULL, hdr_parser_flags,
 				     imap_envelope_parse_callback, mail);
 		if (stream->stream_errno != 0) {
-			errno = stream->stream_errno;
-			mail_storage_set_critical(mail->mail.mail.box->storage,
-				"read(%s) failed: %m (uid=%u)",
-				i_stream_get_name(mail->data.stream),
-				mail->mail.mail.uid);
+			index_mail_stream_log_failure_for(mail, stream);
 			return -1;
 		}
 		mail->data.save_envelope = FALSE;
@@ -617,14 +644,23 @@ index_mail_get_raw_headers(struct index_mail *mail, const char *field,
 				      _mail->seq, &field_idx, 1) <= 0) {
 		/* not in cache / error - first see if it's already parsed */
 		p_free(mail->mail.data_pool, dest);
-
+		if (mail->data.header_parser_initialized) {
+			/* don't try to parse headers recursively. we're here
+			   because message size was wrong and istream-mail
+			   wants to log some cached headers. */
+			i_assert(mail->mail.mail.lookup_abort == MAIL_LOOKUP_ABORT_NOT_IN_CACHE);
+			mail_set_aborted(&mail->mail.mail);
+			return -1;
+		}
 		if (mail->header_seq != mail->data.seq ||
 		    index_mail_header_is_parsed(mail, field_idx) < 0) {
 			/* parse */
+			const char *reason = index_mail_cache_reason(_mail,
+				t_strdup_printf("header %s", field));
 			headers[0] = field; headers[1] = NULL;
 			headers_ctx = mailbox_header_lookup_init(_mail->box,
 								 headers);
-			ret = index_mail_parse_headers(mail, headers_ctx);
+			ret = index_mail_parse_headers(mail, headers_ctx, reason);
 			mailbox_header_lookup_unref(&headers_ctx);
 			if (ret < 0)
 				return -1;
@@ -707,6 +743,17 @@ static int unfold_header(pool_t pool, const char **_str)
 	return 0;
 }
 
+static void str_replace_nuls(string_t *str)
+{
+	char *data = str_c_modifiable(str);
+	size_t i, len = str_len(str);
+
+	for (i = 0; i < len; i++) {
+		if (data[i] == '\0')
+			data[i] = ' ';
+	}
+}
+
 static int
 index_mail_headers_decode(struct index_mail *mail, const char *const **_list,
 			  unsigned int max_count)
@@ -731,9 +778,14 @@ index_mail_headers_decode(struct index_mail *mail, const char *const **_list,
 
 		/* decode MIME encoded-words. decoding may also add new LFs. */
 		message_header_decode_utf8((const unsigned char *)input,
-					   strlen(input), str, FALSE);
-		if (strcmp(str_c(str), input) != 0)
+					   strlen(input), str, NULL);
+		if (strcmp(str_c(str), input) != 0) {
+			if (strlen(str_c(str)) != str_len(str)) {
+				/* replace NULs with spaces */
+				str_replace_nuls(str);
+			}
 			input = p_strdup(mail->mail.data_pool, str_c(str));
+		}
 		decoded_list[i] = input;
 	}
 	*_list = decoded_list;
@@ -744,28 +796,34 @@ int index_mail_get_headers(struct mail *_mail, const char *field,
 			   bool decode_to_utf8, const char *const **value_r)
 {
 	struct index_mail *mail = (struct index_mail *)_mail;
-	int ret, i;
+	bool retry = TRUE;
+	int ret;
 
-	for (i = 0; i < 2; i++) {
+	for (;; retry = FALSE) {
 		if (index_mail_get_raw_headers(mail, field, value_r) < 0)
 			return -1;
-		if (!decode_to_utf8 || **value_r == NULL)
+		if (**value_r == NULL)
 			return 0;
+		if (!decode_to_utf8)
+			return 1;
 
 		T_BEGIN {
 			ret = index_mail_headers_decode(mail, value_r, UINT_MAX);
 		} T_END;
 
-		if (ret < 0) {
-			mail_cache_set_corrupted(_mail->box->cache,
-				"Broken header %s for mail UID %u",
-				field, _mail->uid);
-			/* retry by parsing the full header */
+		if (ret < 0 && retry) {
+			mail_set_mail_cache_corrupted(_mail, "Broken header %s",
+						      field);
 		} else {
 			break;
 		}
 	}
-	return ret;
+	if (ret < 0) {
+		i_panic("BUG: Broken header %s for mail UID %u "
+			"wasn't fixed by re-parsing the header",
+			field, _mail->uid);
+	}
+	return 1;
 }
 
 int index_mail_get_first_header(struct mail *_mail, const char *field,
@@ -773,9 +831,10 @@ int index_mail_get_first_header(struct mail *_mail, const char *field,
 {
 	struct index_mail *mail = (struct index_mail *)_mail;
 	const char *const *list;
-	int ret, i;
+	bool retry = TRUE;
+	int ret;
 
-	for (i = 0; i < 2; i++) {
+	for (;; retry = FALSE) {
 		if (index_mail_get_raw_headers(mail, field, &list) < 0)
 			return -1;
 		if (!decode_to_utf8 || list[0] == NULL) {
@@ -787,17 +846,21 @@ int index_mail_get_first_header(struct mail *_mail, const char *field,
 			ret = index_mail_headers_decode(mail, &list, 1);
 		} T_END;
 
-		if (ret < 0) {
-			mail_cache_set_corrupted(_mail->box->cache,
-				"Broken header %s for mail UID %u",
-				field, _mail->uid);
+		if (ret < 0 && retry) {
+			mail_set_mail_cache_corrupted(_mail, "Broken header %s",
+						      field);
 			/* retry by parsing the full header */
 		} else {
 			break;
 		}
 	}
+	if (ret < 0) {
+		i_panic("BUG: Broken header %s for mail UID %u "
+			"wasn't fixed by re-parsing the header",
+			field, _mail->uid);
+	}
 	*value_r = list[0];
-	return ret < 0 ? -1 : (list[0] != NULL ? 1 : 0);
+	return list[0] != NULL ? 1 : 0;
 }
 
 static void
@@ -816,11 +879,24 @@ int index_mail_get_header_stream(struct mail *_mail,
 	struct istream *input;
 	string_t *dest;
 
-	i_assert(headers->box == _mail->box);
+	if (mail->data.filter_stream != NULL) {
+		const unsigned char *data;
+		size_t size;
+
+		/* read through the previous filter_stream. this makes sure
+		   that the fields are added to cache, and most importantly it
+		   resets header_parser_initialized=FALSE so we don't assert
+		   on it. */
+		while (i_stream_read_more(mail->data.filter_stream, &data, &size) > 0)
+			i_stream_skip(mail->data.filter_stream, size);
+		i_stream_destroy(&mail->data.filter_stream);
+	}
 
 	if (mail->data.save_bodystructure_header) {
 		/* we have to parse the header. */
-		if (index_mail_parse_headers(mail, headers) < 0)
+		const char *reason =
+			index_mail_cache_reason(_mail, "bodystructure");
+		if (index_mail_parse_headers(mail, headers, reason) < 0)
 			return -1;
 	}
 
@@ -830,8 +906,6 @@ int index_mail_get_header_stream(struct mail *_mail,
 				      headers->count) > 0) {
 		str_append(dest, "\n");
 		_mail->transaction->stats.cache_hit_count++;
-		if (mail->data.filter_stream != NULL)
-			i_stream_destroy(&mail->data.filter_stream);
 		mail->data.filter_stream =
 			i_stream_create_from_data(str_data(dest),
 						  str_len(dest));
@@ -841,11 +915,26 @@ int index_mail_get_header_stream(struct mail *_mail,
 	/* not in cache / error */
 	p_free(mail->mail.data_pool, dest);
 
-	if (mail_get_hdr_stream(_mail, NULL, &input) < 0)
-		return -1;
+	unsigned int first_not_found = UINT_MAX, not_found_count = 0;
+	for (unsigned int i = 0; i < headers->count; i++) {
+		if (mail_cache_field_exists(_mail->transaction->cache_view,
+					    _mail->seq, headers->idx[i]) <= 0) {
+			if (not_found_count++ == 0)
+				first_not_found = i;
+		}
+	}
 
-	if (mail->data.filter_stream != NULL)
-		i_stream_destroy(&mail->data.filter_stream);
+	const char *reason;
+	if (not_found_count == 0)
+		reason = "BUG: all headers seem to exist in cache";
+	else {
+		i_assert(first_not_found != UINT_MAX);
+		reason = index_mail_cache_reason(_mail, t_strdup_printf(
+			"%u/%u headers not cached (first=%s)",
+			not_found_count, headers->count, headers->name[first_not_found]));
+	}
+	if (mail_get_hdr_stream_because(_mail, NULL, reason, &input) < 0)
+		return -1;
 
 	index_mail_parse_header_init(mail, headers);
 	mail->data.filter_stream =

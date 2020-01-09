@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "userdb.h"
@@ -8,13 +8,10 @@
 #include "istream.h"
 #include "str.h"
 #include "auth-cache.h"
-#include "var-expand.h"
 #include "db-passwd-file.h"
 
 #include <unistd.h>
 #include <fcntl.h>
-
-#define PASSWD_FILE_CACHE_KEY "%u"
 
 struct passwd_file_userdb_iterate_context {
 	struct userdb_iterate_context ctx;
@@ -41,10 +38,11 @@ static void passwd_file_lookup(struct auth_request *auth_request,
 	string_t *str;
 	const char *key, *value;
 	char **p;
+	int ret;
 
-	pu = db_passwd_file_lookup(module->pwf, auth_request,
-				   module->username_format);
-	if (pu == NULL || pu->uid == 0) {
+	ret = db_passwd_file_lookup(module->pwf, auth_request,
+				    module->username_format, &pu);
+	if (ret <= 0 || pu->uid == 0) {
 		callback(USERDB_RESULT_USER_UNKNOWN, auth_request);
 		return;
 	}
@@ -74,8 +72,11 @@ static void passwd_file_lookup(struct auth_request *auth_request,
 			if (value != NULL) {
 				key = t_strdup_until(key, value);
 				str_truncate(str, 0);
-				var_expand(str, value + 1, table);
+				auth_request_var_expand_with_table(str, value + 1,
+					auth_request, table, NULL);
 				value = str_c(str);
+			} else {
+				value = "";
 			}
 			auth_request_set_userdb_field(auth_request, key, value);
 		}
@@ -113,7 +114,7 @@ passwd_file_iterate_init(struct auth_request *auth_request,
 		i_error("open(%s) failed: %m", ctx->path);
 		ctx->ctx.failed = TRUE;
 	} else {
-		ctx->input = i_stream_create_fd(fd, (size_t)-1, TRUE);
+		ctx->input = i_stream_create_fd_autoclose(&fd, (size_t)-1);
 	}
 	return &ctx->ctx;
 }
@@ -139,7 +140,8 @@ static void passwd_file_iterate_next(struct userdb_iterate_context *_ctx)
 			break;
 		}
 		if (line == NULL && ctx->input->stream_errno != 0) {
-			i_error("read(%s) failed: %m", ctx->path);
+			i_error("read(%s) failed: %s", ctx->path,
+				i_stream_get_error(ctx->input));
 			_ctx->failed = TRUE;
 		}
 	}
@@ -189,16 +191,6 @@ passwd_file_preinit(pool_t pool, const char *args)
 	module->pwf = db_passwd_file_init(args, TRUE,
 					  global_auth_settings->debug);
 	module->username_format = format;
-
-	if (!module->pwf->vars)
-		module->module.cache_key = PASSWD_FILE_CACHE_KEY;
-	else {
-		module->module.cache_key =
-			auth_cache_parse_key(pool,
-					     t_strconcat(PASSWD_FILE_CACHE_KEY,
-						         module->pwf->path,
-							 NULL));
-	}
 	return &module->module;
 }
 

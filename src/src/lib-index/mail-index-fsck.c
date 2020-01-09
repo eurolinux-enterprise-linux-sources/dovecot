@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -34,13 +34,26 @@ mail_index_fsck_log_pos(struct mail_index *index, struct mail_index_map *map,
 
 	mail_transaction_log_get_head(index->log, &file_seq, &file_offset);
 	if (hdr->log_file_seq < file_seq) {
+		/* index's log_file_seq is too old. move it to log head. */
 		hdr->log_file_head_offset = hdr->log_file_tail_offset =
 			sizeof(struct mail_transaction_log_header);
-	} else {
+	} else if (hdr->log_file_seq == file_seq) {
+		/* index's log_file_seq matches the current log. make sure the
+		   offsets are valid. */
 		if (hdr->log_file_head_offset > file_offset)
 			hdr->log_file_head_offset = file_offset;
+		else if (hdr->log_file_head_offset < MAIL_TRANSACTION_LOG_HEADER_MIN_SIZE)
+			hdr->log_file_head_offset = MAIL_TRANSACTION_LOG_HEADER_MIN_SIZE;
+
 		if (hdr->log_file_tail_offset > hdr->log_file_head_offset)
 			hdr->log_file_tail_offset = hdr->log_file_head_offset;
+		else if (hdr->log_file_tail_offset < MAIL_TRANSACTION_LOG_HEADER_MIN_SIZE)
+			hdr->log_file_tail_offset = MAIL_TRANSACTION_LOG_HEADER_MIN_SIZE;
+	} else {
+		/* index's log_file_seq is newer than exists. move it to
+		   end of the current log head. */
+		hdr->log_file_head_offset = hdr->log_file_tail_offset =
+			file_offset;
 	}
 	hdr->log_file_seq = file_seq;
 
@@ -209,7 +222,7 @@ mail_index_fsck_keywords(struct mail_index *index, struct mail_index_map *map,
 
 	/* add keyword records so we can start appending names directly */
 	rec_pos = dest->used;
-	memset(&new_kw_rec, 0, sizeof(new_kw_rec));
+	i_zero(&new_kw_rec);
 	(void)buffer_append_space_unsafe(dest, keywords_count * sizeof(*kw_rec));
 
 	/* write the actual records and names */
@@ -277,6 +290,7 @@ mail_index_fsck_extensions(struct mail_index *index, struct mail_index_map *map,
 					      "with invalid header size",
 					      i, name);
 			hdr->header_size = offset;
+			buffer_set_used_size(map->hdr_copy_buf, hdr->header_size);
 			break;
 		}
 		if (mail_index_map_ext_hdr_check(hdr, ext_hdr, name,
@@ -419,7 +433,9 @@ mail_index_fsck_map(struct mail_index *index, struct mail_index_map *map)
 	mail_index_fsck_extensions(index, map, &hdr);
 	mail_index_fsck_records(index, map, &hdr);
 
+	hdr.flags |= MAIL_INDEX_HDR_FLAG_FSCKD;
 	map->hdr = hdr;
+	i_assert(map->hdr_copy_buf->used == map->hdr.header_size);
 }
 
 int mail_index_fsck(struct mail_index *index)
@@ -441,8 +457,8 @@ int mail_index_fsck(struct mail_index *index)
 	}
 
 	if (!orig_locked) {
-		if (mail_transaction_log_sync_lock(index->log, &file_seq,
-						   &file_offset) < 0)
+		if (mail_transaction_log_sync_lock(index->log, "fscking",
+						   &file_seq, &file_offset) < 0)
 			return -1;
 	}
 
@@ -457,7 +473,7 @@ int mail_index_fsck(struct mail_index *index)
 	mail_index_write(index, FALSE);
 
 	if (!orig_locked)
-		mail_transaction_log_sync_unlock(index->log);
+		mail_transaction_log_sync_unlock(index->log, "fscking");
 	return 0;
 }
 

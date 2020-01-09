@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -105,7 +105,7 @@ void mail_cache_register_fields(struct mail_cache *cache,
 	char *name;
 	void *value;
 	unsigned int new_idx;
-	unsigned int i, j;
+	unsigned int i, j, registered_count;
 
 	new_idx = cache->fields_count;
 	for (i = 0; i < fields_count; i++) {
@@ -133,18 +133,18 @@ void mail_cache_register_fields(struct mail_cache *cache,
 		return;
 
 	/* @UNSAFE */
-	cache->fields = i_realloc(cache->fields,
-				  cache->fields_count * sizeof(*cache->fields),
-				  new_idx * sizeof(*cache->fields));
+	cache->fields = i_realloc_type(cache->fields,
+				       struct mail_cache_field_private,
+				       cache->fields_count, new_idx);
 	cache->field_file_map =
-		i_realloc(cache->field_file_map,
-			  cache->fields_count * sizeof(*cache->field_file_map),
-			  new_idx * sizeof(*cache->field_file_map));
+		i_realloc_type(cache->field_file_map, uint32_t,
+			       cache->fields_count, new_idx);
 
+	registered_count = cache->fields_count;
 	for (i = 0; i < fields_count; i++) {
 		unsigned int idx = fields[i].idx;
 
-		if (idx < cache->fields_count)
+		if (idx < registered_count)
 			continue;
 
 		/* new index - save it */
@@ -159,7 +159,9 @@ void mail_cache_register_fields(struct mail_cache *cache,
 
 		hash_table_insert(cache->field_name_hash, name,
 				  POINTER_CAST(idx));
+		registered_count++;
 	}
+	i_assert(registered_count == new_idx);
 	cache->fields_count = new_idx;
 }
 
@@ -183,7 +185,7 @@ mail_cache_register_get_field(struct mail_cache *cache, unsigned int field_idx)
 	return &cache->fields[field_idx].field;
 }
 
-const struct mail_cache_field *
+struct mail_cache_field *
 mail_cache_register_get_list(struct mail_cache *cache, pool_t pool,
 			     unsigned int *count_r)
 {
@@ -234,6 +236,15 @@ mail_cache_header_fields_get_offset(struct mail_cache *cache,
 				"next_offset in field header loops");
 			return -1;
 		}
+		/* In Dovecot v2.2+ we don't try to use any holes,
+		   so next_offset must always be larger than current offset.
+		   also makes it easier to guarantee there aren't any loops
+		   (which we don't bother doing for old files) */
+		if (next_offset < offset && cache->hdr->minor_version != 0) {
+			mail_cache_set_corrupted(cache,
+				"next_offset in field header decreases");
+			return -1;
+		}
 		offset = next_offset;
 
 		if (cache->mmap_base != NULL || cache->map_with_read) {
@@ -276,7 +287,7 @@ mail_cache_header_fields_get_offset(struct mail_cache *cache,
 	}
 	cache->last_field_header_offset = offset;
 
-	if (next_count > MAIL_CACHE_HEADER_FIELD_CONTINUE_COUNT)
+	if (next_count > cache->index->optimization_set.cache.compress_header_continue_count)
 		cache->need_compress_file_seq = cache->hdr->file_seq;
 
 	if (field_hdr_r != NULL) {
@@ -328,8 +339,8 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 
 	/* check the fixed size of the header. name[] has to be checked
 	   separately */
-	if (field_hdr->size < sizeof(*field_hdr) +
-	    field_hdr->fields_count * (sizeof(uint32_t)*2 + 1 + 2)) {
+	if (field_hdr->fields_count > INT_MAX / MAIL_CACHE_FIELD_NAMES(1) ||
+	    field_hdr->size < MAIL_CACHE_FIELD_NAMES(field_hdr->fields_count)) {
 		mail_cache_set_corrupted(cache, "invalid field header size");
 		return -1;
 	}
@@ -337,10 +348,8 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 	new_fields_count = field_hdr->fields_count;
 	if (new_fields_count != 0) {
 		cache->file_field_map =
-			i_realloc(cache->file_field_map,
-				  cache->file_fields_count *
-				  sizeof(unsigned int),
-				  new_fields_count * sizeof(unsigned int));
+			i_realloc_type(cache->file_field_map, unsigned int,
+				       cache->file_fields_count, new_fields_count);
 	} else {
 		i_free_and_null(cache->file_field_map);
 	}
@@ -356,15 +365,17 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 	names = CONST_PTR_OFFSET(field_hdr,
 		MAIL_CACHE_FIELD_NAMES(field_hdr->fields_count));
 	end = CONST_PTR_OFFSET(field_hdr, field_hdr->size);
+	i_assert(names <= end);
 
 	/* clear the old mapping */
 	for (i = 0; i < cache->fields_count; i++)
 		cache->field_file_map[i] = (uint32_t)-1;
 
 	max_drop_time = cache->index->map->hdr.day_stamp == 0 ? 0 :
-		cache->index->map->hdr.day_stamp - MAIL_CACHE_FIELD_DROP_SECS;
+		cache->index->map->hdr.day_stamp -
+		cache->index->optimization_set.cache.unaccessed_field_drop_secs;
 
-	memset(&field, 0, sizeof(field));
+	i_zero(&field);
 	for (i = 0; i < field_hdr->fields_count; i++) {
 		for (p = names; p != end && *p != '\0'; p++) ;
 		if (p == end || *names == '\0') {
@@ -383,22 +394,38 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 			return -1;
 		}
 
+		/* ignore any forced-flags in the file */
+		enum mail_cache_decision_type file_dec =
+			decisions[i] & ~MAIL_CACHE_DECISION_FORCED;
+
 		if (hash_table_lookup_full(cache->field_name_hash, names,
 					   &orig_key, &orig_value)) {
 			/* already exists, see if decision can be updated */
 			fidx = POINTER_CAST_TO(orig_value, unsigned int);
-			if (!cache->fields[fidx].decision_dirty) {
-				cache->fields[fidx].field.decision =
-					decisions[i];
+			enum mail_cache_decision_type cur_dec =
+				cache->fields[fidx].field.decision;
+			if ((cur_dec & MAIL_CACHE_DECISION_FORCED) != 0) {
+				/* Forced decision. If the decision has
+				   changed, update the fields in the file. */
+				if ((cur_dec & ~MAIL_CACHE_DECISION_FORCED) != file_dec)
+					cache->field_header_write_pending = TRUE;
+			} else if (cache->fields[fidx].decision_dirty) {
+				/* Decisions have recently been updated
+				   internally. Don't change them. */
+			} else {
+				/* Use the decision from the cache file. */
+				cache->fields[fidx].field.decision = file_dec;
 			}
 			if (field_type_verify(cache, fidx,
 					      types[i], sizes[i]) < 0)
 				return -1;
 		} else {
+			/* field is currently unknown, so just use whatever
+			   exists in the file. */
 			field.name = names;
 			field.type = types[i];
 			field.field_size = sizes[i];
-			field.decision = decisions[i];
+			field.decision = file_dec;
 			mail_cache_register_fields(cache, &field, 1);
 			fidx = field.idx;
 		}
@@ -489,7 +516,7 @@ static int mail_cache_header_fields_update_locked(struct mail_cache *cache)
 	int ret = 0;
 
 	if (mail_cache_header_fields_read(cache) < 0 ||
-	    mail_cache_header_fields_get_offset(cache, &offset, FALSE) < 0)
+	    mail_cache_header_fields_get_offset(cache, &offset, NULL) < 0)
 		return -1;
 
 	buffer = buffer_create_dynamic(pool_datastack_create(), 256);
@@ -530,7 +557,7 @@ int mail_cache_header_fields_update(struct mail_cache *cache)
 		return ret;
 	}
 
-	if (mail_cache_lock(cache, FALSE) <= 0)
+	if (mail_cache_lock(cache) <= 0)
 		return -1;
 
 	T_BEGIN {
@@ -548,7 +575,7 @@ void mail_cache_header_fields_get(struct mail_cache *cache, buffer_t *dest)
 	const char *name;
 	uint32_t i;
 
-	memset(&hdr, 0, sizeof(hdr));
+	i_zero(&hdr);
 	hdr.fields_count = cache->file_fields_count;
 	for (i = 0; i < cache->fields_count; i++) {
 		if (CACHE_FIELD_IS_NEWLY_WANTED(cache, i))
@@ -595,7 +622,7 @@ void mail_cache_header_fields_get(struct mail_cache *cache, buffer_t *dest)
 int mail_cache_header_fields_get_next_offset(struct mail_cache *cache,
 					     uint32_t *offset_r)
 {
-	if (mail_cache_header_fields_get_offset(cache, offset_r, FALSE) < 0)
+	if (mail_cache_header_fields_get_offset(cache, offset_r, NULL) < 0)
 		return -1;
 
 	if (*offset_r == 0) {

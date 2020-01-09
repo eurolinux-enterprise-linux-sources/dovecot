@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -10,6 +10,7 @@
 #include "read-full.h"
 #include "write-full.h"
 #include "mail-cache-private.h"
+#include "ioloop.h"
 
 #include <unistd.h>
 
@@ -24,8 +25,8 @@ void mail_cache_set_syscall_error(struct mail_cache *cache,
 
 static void mail_cache_unlink(struct mail_cache *cache)
 {
-	if (!cache->index->readonly)
-		(void)unlink(cache->filepath);
+	if (!cache->index->readonly && !MAIL_INDEX_IS_IN_MEMORY(cache->index))
+		i_unlink_if_exists(cache->filepath);
 }
 
 void mail_cache_reset(struct mail_cache *cache)
@@ -51,6 +52,28 @@ void mail_cache_set_corrupted(struct mail_cache *cache, const char *fmt, ...)
 	va_end(va);
 }
 
+void mail_cache_set_seq_corrupted_reason(struct mail_cache_view *cache_view,
+					 uint32_t seq, const char *reason)
+{
+	uint32_t empty = 0;
+	struct mail_cache *cache = cache_view->cache;
+	struct mail_index_view *view = cache_view->view;
+
+	mail_index_set_error(cache->index,
+			     "Corrupted record in index cache file %s: %s",
+					     cache->filepath, reason);
+
+	/* drop cache pointer */
+	struct mail_index_transaction *t =
+		mail_index_transaction_begin(view, MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
+	mail_index_update_ext(t, seq, cache->ext_id, &empty, NULL);
+
+	if (mail_index_transaction_commit(&t) < 0)
+		mail_cache_reset(cache);
+	else
+		mail_cache_expunge_count(cache, 1);
+}
+
 void mail_cache_file_close(struct mail_cache *cache)
 {
 	if (cache->mmap_base != NULL) {
@@ -60,6 +83,8 @@ void mail_cache_file_close(struct mail_cache *cache)
 
 	if (cache->file_cache != NULL)
 		file_cache_set_fd(cache->file_cache, -1);
+	if (cache->read_buf != NULL)
+		buffer_set_used_size(cache->read_buf, 0);
 
 	cache->mmap_base = NULL;
 	cache->hdr = NULL;
@@ -75,24 +100,58 @@ void mail_cache_file_close(struct mail_cache *cache)
 			mail_cache_set_syscall_error(cache, "close()");
 		cache->fd = -1;
 	}
+	cache->opened = FALSE;
 }
 
 static void mail_cache_init_file_cache(struct mail_cache *cache)
 {
 	struct stat st;
 
-	if (cache->file_cache == NULL)
-		return;
+	if (cache->file_cache != NULL)
+		file_cache_set_fd(cache->file_cache, cache->fd);
 
-	file_cache_set_fd(cache->file_cache, cache->fd);
-
-	if (fstat(cache->fd, &st) == 0)
-		(void)file_cache_set_size(cache->file_cache, st.st_size);
-	else if (!ESTALE_FSTAT(errno))
+	if (fstat(cache->fd, &st) == 0) {
+		if (cache->file_cache != NULL)
+			(void)file_cache_set_size(cache->file_cache, st.st_size);
+	} else if (!ESTALE_FSTAT(errno)) {
 		mail_cache_set_syscall_error(cache, "fstat()");
+	}
 
 	cache->st_ino = st.st_ino;
 	cache->st_dev = st.st_dev;
+}
+
+static int mail_cache_try_open(struct mail_cache *cache)
+{
+	const void *data;
+
+	i_assert(!cache->opened);
+	cache->opened = TRUE;
+
+	if (MAIL_INDEX_IS_IN_MEMORY(cache->index))
+		return 0;
+
+	i_assert(cache->fd == -1);
+	cache->fd = nfs_safe_open(cache->filepath,
+				  cache->index->readonly ? O_RDONLY : O_RDWR);
+	if (cache->fd == -1) {
+		mail_cache_file_close(cache);
+		if (errno == ENOENT) {
+			cache->need_compress_file_seq = 0;
+			return 0;
+		}
+
+		mail_cache_set_syscall_error(cache, "open()");
+		return -1;
+	}
+
+	mail_cache_init_file_cache(cache);
+
+	if (mail_cache_map(cache, 0, 0, &data) < 0) {
+		mail_cache_file_close(cache);
+		return -1;
+	}
+	return 1;
 }
 
 static bool mail_cache_need_reopen(struct mail_cache *cache)
@@ -143,34 +202,14 @@ static bool mail_cache_need_reopen(struct mail_cache *cache)
 	return FALSE;
 }
 
-int mail_cache_reopen(struct mail_cache *cache)
+static int mail_cache_reopen_now(struct mail_cache *cache)
 {
 	struct mail_index_view *view;
 	const struct mail_index_ext *ext;
-	const void *data;
-
-	i_assert(!cache->locked);
-
-	if (!mail_cache_need_reopen(cache)) {
-		/* reopening does no good */
-		return 0;
-	}
 
 	mail_cache_file_close(cache);
 
-	cache->fd = nfs_safe_open(cache->filepath,
-				  cache->index->readonly ? O_RDONLY : O_RDWR);
-	if (cache->fd == -1) {
-		if (errno == ENOENT)
-			cache->need_compress_file_seq = 0;
-		else
-			mail_cache_set_syscall_error(cache, "open()");
-		return -1;
-	}
-
-	mail_cache_init_file_cache(cache);
-
-	if (mail_cache_map(cache, 0, 0, &data) < 0)
+	if (mail_cache_try_open(cache) <= 0)
 		return -1;
 
 	if (mail_cache_header_fields_read(cache) < 0)
@@ -193,8 +232,21 @@ int mail_cache_reopen(struct mail_cache *cache)
 	return 1;
 }
 
+int mail_cache_reopen(struct mail_cache *cache)
+{
+	i_assert(!cache->locked);
+
+	if (!mail_cache_need_reopen(cache)) {
+		/* reopening does no good */
+		return 0;
+	}
+	return mail_cache_reopen_now(cache);
+}
+
 static void mail_cache_update_need_compress(struct mail_cache *cache)
 {
+	const struct mail_index_cache_optimization_settings *set =
+		&cache->index->optimization_set.cache;
 	const struct mail_cache_header *hdr = cache->hdr;
 	struct stat st;
 	unsigned int msg_count;
@@ -224,14 +276,14 @@ static void mail_cache_update_need_compress(struct mail_cache *cache)
 	}
 
 	cont_percentage = hdr->continued_record_count * 100 / records_count;
-	if (cont_percentage >= MAIL_CACHE_COMPRESS_CONTINUED_PERCENTAGE) {
+	if (cont_percentage >= set->compress_continued_percentage) {
 		/* too many continued rows, compress */
 		want_compress = TRUE;
 	}
 
 	delete_percentage = hdr->deleted_record_count * 100 /
 		(records_count + hdr->deleted_record_count);
-	if (delete_percentage >= MAIL_CACHE_COMPRESS_DELETE_PERCENTAGE) {
+	if (delete_percentage >= set->compress_delete_percentage) {
 		/* too many deleted records, compress */
 		want_compress = TRUE;
 	}
@@ -242,7 +294,7 @@ static void mail_cache_update_need_compress(struct mail_cache *cache)
 				mail_cache_set_syscall_error(cache, "fstat()");
 			return;
 		}
-		if (st.st_size >= MAIL_CACHE_COMPRESS_MIN_SIZE)
+		if ((uoff_t)st.st_size >= set->compress_min_size)
 			cache->need_compress_file_seq = hdr->file_seq;
 	}
 
@@ -446,12 +498,18 @@ int mail_cache_map(struct mail_cache *cache, size_t offset, size_t size,
 	/* map the whole file */
 	cache->hdr = NULL;
 	cache->mmap_length = 0;
+	if (cache->read_buf != NULL)
+		buffer_set_used_size(cache->read_buf, 0);
 
 	cache->mmap_base = mmap_ro_file(cache->fd, &cache->mmap_length);
 	if (cache->mmap_base == MAP_FAILED) {
 		cache->mmap_base = NULL;
+		if (ioloop_time != cache->last_mmap_error_time) {
+			cache->last_mmap_error_time = ioloop_time;
+			mail_cache_set_syscall_error(cache, t_strdup_printf(
+				"mmap(size=%"PRIuSIZE_T")", cache->mmap_length));
+		}
 		cache->mmap_length = 0;
-		mail_cache_set_syscall_error(cache, "mmap()");
 		return -1;
 	}
 	*data_r = offset > cache->mmap_length ? NULL :
@@ -460,38 +518,12 @@ int mail_cache_map(struct mail_cache *cache, size_t offset, size_t size,
 				     cache->mmap_base, FALSE);
 }
 
-static int mail_cache_try_open(struct mail_cache *cache)
-{
-	const void *data;
-
-	cache->opened = TRUE;
-
-	if (MAIL_INDEX_IS_IN_MEMORY(cache->index))
-		return 0;
-
-	cache->fd = nfs_safe_open(cache->filepath,
-				  cache->index->readonly ? O_RDONLY : O_RDWR);
-	if (cache->fd == -1) {
-		if (errno == ENOENT) {
-			cache->need_compress_file_seq = 0;
-			return 0;
-		}
-
-		mail_cache_set_syscall_error(cache, "open()");
-		return -1;
-	}
-
-	mail_cache_init_file_cache(cache);
-
-	if (mail_cache_map(cache, 0, 0, &data) < 0)
-		return -1;
-	return 1;
-}
-
 int mail_cache_open_and_verify(struct mail_cache *cache)
 {
 	int ret;
 
+	if (cache->opened)
+		return 0;
 	ret = mail_cache_try_open(cache);
 	if (ret > 0)
 		ret = mail_cache_header_fields_read(cache);
@@ -526,7 +558,7 @@ static struct mail_cache *mail_cache_alloc(struct mail_index *index)
 
 	if (!MAIL_INDEX_IS_IN_MEMORY(index) &&
 	    (index->flags & MAIL_INDEX_OPEN_FLAG_MMAP_DISABLE) != 0)
-		cache->file_cache = file_cache_new(-1);
+		cache->file_cache = file_cache_new_path(-1, cache->filepath);
 	cache->map_with_read =
 		(cache->index->flags & MAIL_INDEX_OPEN_FLAG_SAVEONLY) != 0;
 
@@ -543,18 +575,6 @@ struct mail_cache *mail_cache_open_or_create(struct mail_index *index)
 	struct mail_cache *cache;
 
 	cache = mail_cache_alloc(index);
-	return cache;
-}
-
-struct mail_cache *mail_cache_create(struct mail_index *index)
-{
-	struct mail_cache *cache;
-
-	cache = mail_cache_alloc(index);
-	if (!MAIL_INDEX_IS_IN_MEMORY(index)) {
-		if (unlink(cache->filepath) < 0 && errno != ENOENT)
-			mail_cache_set_syscall_error(cache, "unlink()");
-	}
 	return cache;
 }
 
@@ -591,8 +611,8 @@ static int mail_cache_lock_file(struct mail_cache *cache, bool nonblock)
 		nonblock = TRUE;
 	}
 
+	i_assert(cache->file_lock == NULL);
 	if (cache->index->lock_method != FILE_LOCK_METHOD_DOTLOCK) {
-		i_assert(cache->file_lock == NULL);
 		timeout_secs = I_MIN(MAIL_CACHE_LOCK_TIMEOUT,
 				     cache->index->max_lock_timeout_secs);
 
@@ -601,14 +621,15 @@ static int mail_cache_lock_file(struct mail_cache *cache, bool nonblock)
 					 nonblock ? 0 : timeout_secs,
 					 &cache->file_lock);
 	} else {
+		struct dotlock *dotlock;
 		enum dotlock_create_flags flags =
 			nonblock ? DOTLOCK_CREATE_FLAG_NONBLOCK : 0;
 
-		i_assert(cache->dotlock == NULL);
 		ret = file_dotlock_create(&cache->dotlock_settings,
-					  cache->filepath, flags,
-					  &cache->dotlock);
-		if (ret < 0) {
+					  cache->filepath, flags, &dotlock);
+		if (ret > 0)
+			cache->file_lock = file_lock_from_dotlock(&dotlock);
+		else if (ret < 0) {
 			mail_cache_set_syscall_error(cache,
 						     "file_dotlock_create()");
 		}
@@ -628,21 +649,17 @@ static int mail_cache_lock_file(struct mail_cache *cache, bool nonblock)
 
 static void mail_cache_unlock_file(struct mail_cache *cache)
 {
-	if (cache->index->lock_method != FILE_LOCK_METHOD_DOTLOCK)
-		file_unlock(&cache->file_lock);
-	else
-		file_dotlock_delete(&cache->dotlock);
+	file_unlock(&cache->file_lock);
 }
 
 static int
-mail_cache_lock_full(struct mail_cache *cache, bool require_same_reset_id,
-		     bool nonblock)
+mail_cache_lock_full(struct mail_cache *cache, bool nonblock)
 {
 	const struct mail_index_ext *ext;
 	const void *data;
 	struct mail_index_view *iview;
 	uint32_t reset_id;
-	int i, ret;
+	int i;
 
 	i_assert(!cache->locked);
 
@@ -654,77 +671,69 @@ mail_cache_lock_full(struct mail_cache *cache, bool require_same_reset_id,
 	    cache->index->readonly)
 		return 0;
 
-	iview = mail_index_view_open(cache->index);
-	ext = mail_index_view_get_ext(iview, cache->ext_id);
-	reset_id = ext == NULL ? 0 : ext->reset_id;
-	mail_index_view_close(&iview);
-
-	if (ext == NULL && require_same_reset_id) {
-		/* cache not used */
-		return 0;
-	}
-
-	for (i = 0; i < 3; i++) {
-		if (cache->hdr->file_seq != reset_id &&
-		    (require_same_reset_id || i == 0)) {
-			/* we want the latest cache file */
-			if (reset_id < cache->hdr->file_seq) {
-				/* either we're still waiting for index to
-				   catch up with a cache compression, or
-				   that catching up is never going to happen */
-				ret = 0;
-				break;
-			}
-			ret = mail_cache_reopen(cache);
-			if (ret < 0 || (ret == 0 && require_same_reset_id))
-				break;
-		}
-
-		if ((ret = mail_cache_lock_file(cache, nonblock)) <= 0) {
-			ret = -1;
+	for (;;) {
+		if (mail_cache_lock_file(cache, nonblock) <= 0)
+			return -1;
+		i_assert(!MAIL_CACHE_IS_UNUSABLE(cache));
+		if (!mail_cache_need_reopen(cache)) {
+			/* locked the latest file */
 			break;
 		}
-		cache->locked = TRUE;
-
-		if (cache->hdr->file_seq == reset_id ||
-		    !require_same_reset_id) {
-			/* got it */
-			break;
+		if (mail_cache_reopen_now(cache) <= 0) {
+			i_assert(cache->file_lock == NULL);
+			return -1;
 		}
-
+		i_assert(cache->file_lock == NULL);
 		/* okay, so it was just compressed. try again. */
+	}
+
+	/* now verify that the index reset_id matches the cache's file_seq */
+	for (i = 0; ; i++) {
+		iview = mail_index_view_open(cache->index);
+		ext = mail_index_view_get_ext(iview, cache->ext_id);
+		reset_id = ext == NULL ? 0 : ext->reset_id;
+		mail_index_view_close(&iview);
+
+		if (cache->hdr->file_seq == reset_id)
+			break;
+		/* mismatch. try refreshing index once. if that doesn't help,
+		   we can't use the cache. */
+		if (i > 0 || cache->index->mapping) {
+			mail_cache_unlock_file(cache);
+			return 0;
+		}
+		if (mail_index_refresh(cache->index) < 0) {
+			mail_cache_unlock_file(cache);
+			return -1;
+		}
+	}
+
+	/* successfully locked - make sure our header is up to date */
+	cache->locked = TRUE;
+	cache->hdr_modified = FALSE;
+
+	if (cache->file_cache != NULL) {
+		file_cache_invalidate(cache->file_cache, 0,
+				      sizeof(struct mail_cache_header));
+	}
+	if (cache->read_buf != NULL)
+		buffer_set_used_size(cache->read_buf, 0);
+	if (mail_cache_map(cache, 0, 0, &data) <= 0) {
 		(void)mail_cache_unlock(cache);
-		ret = 0;
+		return -1;
 	}
-
-	if (ret > 0) {
-		/* make sure our header is up to date */
-		if (cache->file_cache != NULL) {
-			file_cache_invalidate(cache->file_cache, 0,
-					      sizeof(struct mail_cache_header));
-		}
-		if (cache->read_buf != NULL)
-			buffer_set_used_size(cache->read_buf, 0);
-		if (mail_cache_map(cache, 0, 0, &data) > 0)
-			cache->hdr_copy = *cache->hdr;
-		else {
-			(void)mail_cache_unlock(cache);
-			ret = -1;
-		}
-	}
-
-	i_assert((ret <= 0 && !cache->locked) || (ret > 0 && cache->locked));
-	return ret;
+	cache->hdr_copy = *cache->hdr;
+	return 1;
 }
 
-int mail_cache_lock(struct mail_cache *cache, bool require_same_reset_id)
+int mail_cache_lock(struct mail_cache *cache)
 {
-	return mail_cache_lock_full(cache, require_same_reset_id, FALSE);
+	return mail_cache_lock_full(cache, FALSE);
 }
 
 int mail_cache_try_lock(struct mail_cache *cache)
 {
-	return mail_cache_lock_full(cache, FALSE, TRUE);
+	return mail_cache_lock_full(cache, TRUE);
 }
 
 int mail_cache_unlock(struct mail_cache *cache)
@@ -790,9 +799,13 @@ int mail_cache_append(struct mail_cache *cache, const void *data, size_t size,
 				mail_cache_set_syscall_error(cache, "fstat()");
 			return -1;
 		}
+		if (st.st_size > (uint32_t)-1) {
+			mail_cache_set_corrupted(cache, "Cache file too large");
+			return -1;
+		}
 		*offset = st.st_size;
 	}
-	if (*offset > (uint32_t)-1 || (uint32_t)-1 - *offset < size) {
+	if ((uint32_t)-1 - *offset < size) {
 		mail_cache_set_corrupted(cache, "Cache file too large");
 		return -1;
 	}

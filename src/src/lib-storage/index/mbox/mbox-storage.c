@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -53,7 +53,7 @@ unsigned int mbox_hide_headers_count = N_ELEMENTS(mbox_hide_headers);
 const char *mbox_save_drop_headers[] = {
 	"Content-Length",
 	"Status",
-	"X-Delivery-ID"
+	"X-Delivery-ID",
 	"X-IMAP",
 	"X-IMAPbase",
 	"X-Keywords",
@@ -72,9 +72,9 @@ void mbox_set_syscall_error(struct mbox_mailbox *mbox, const char *function)
 {
 	i_assert(function != NULL);
 
-	if (ENOSPACE(errno)) {
+	if (ENOQUOTA(errno)) {
 		mail_storage_set_error(&mbox->storage->storage,
-			MAIL_ERROR_NOSPACE, MAIL_ERRSTR_NO_SPACE);
+			MAIL_ERROR_NOQUOTA, MAIL_ERRSTR_NO_QUOTA);
 	} else {
 		const char *toobig_error = errno != EFBIG ? "" :
 			" (process was started with ulimit -f limit)";
@@ -98,8 +98,10 @@ mbox_list_get_path(struct mailbox_list *list, const char *name,
 	if (ret <= 0)
 		return ret;
 
-	if (type == MAILBOX_LIST_PATH_TYPE_CONTROL ||
-	    type == MAILBOX_LIST_PATH_TYPE_INDEX) {
+	switch (type) {
+	case MAILBOX_LIST_PATH_TYPE_CONTROL:
+	case MAILBOX_LIST_PATH_TYPE_INDEX:
+	case MAILBOX_LIST_PATH_TYPE_LIST_INDEX:
 		if (name == NULL && type == MAILBOX_LIST_PATH_TYPE_CONTROL &&
 		    list->set.control_dir != NULL) {
 			/* kind of a kludge for backwards compatibility:
@@ -119,8 +121,14 @@ mbox_list_get_path(struct mailbox_list *list, const char *name,
 
 		*path_r = t_strconcat(t_strdup_until(path, p),
 				      "/"MBOX_INDEX_DIR_NAME"/", p+1, NULL);
-	} else {
+		break;
+	case MAILBOX_LIST_PATH_TYPE_DIR:
+	case MAILBOX_LIST_PATH_TYPE_ALT_DIR:
+	case MAILBOX_LIST_PATH_TYPE_MAILBOX:
+	case MAILBOX_LIST_PATH_TYPE_ALT_MAILBOX:
+	case MAILBOX_LIST_PATH_TYPE_INDEX_PRIVATE:
 		*path_r = path;
+		break;
 	}
 	return 1;
 }
@@ -151,7 +159,7 @@ mbox_storage_create(struct mail_storage *_storage, struct mail_namespace *ns,
 		return -1;
 	}
 
-	storage->set = mail_storage_get_driver_settings(_storage);
+	storage->set = mail_namespace_get_driver_settings(ns, _storage);
 
 	if (mailbox_list_get_root_path(ns->list, MAILBOX_LIST_PATH_TYPE_INDEX, &dir)) {
 		_storage->temp_path_prefix = p_strconcat(_storage->pool, dir,
@@ -618,9 +626,16 @@ static void mbox_mailbox_close(struct mailbox *box)
 static int
 mbox_mailbox_get_guid(struct mbox_mailbox *mbox, guid_128_t guid_r)
 {
+	const char *errstr;
+
 	if (mail_index_is_in_memory(mbox->box.index)) {
-		mail_storage_set_error(mbox->box.storage, MAIL_ERROR_NOTPOSSIBLE,
-			"Mailbox GUIDs are not permanent without index files");
+		errstr = "Mailbox GUIDs are not permanent without index files";
+		if (mbox->storage->set->mbox_min_index_size != 0) {
+			errstr = t_strconcat(errstr,
+				" (mbox_min_index_size is non-zero)", NULL);
+		}
+		mail_storage_set_error(mbox->box.storage,
+				       MAIL_ERROR_NOTPOSSIBLE, errstr);
 		return -1;
 	}
 	if (mbox_sync_header_refresh(mbox) < 0)
@@ -673,16 +688,16 @@ static void mbox_notify_changes(struct mailbox *box)
 	struct mbox_mailbox *mbox = (struct mbox_mailbox *)box;
 
 	if (box->notify_callback == NULL)
-		index_mailbox_check_remove_all(box);
+		mailbox_watch_remove_all(box);
 	else if (!mbox->no_mbox_file)
-		index_mailbox_check_add(box, mailbox_get_path(box));
+		mailbox_watch_add(box, mailbox_get_path(box));
 }
 
 static bool
 mbox_is_internal_name(struct mailbox_list *list ATTR_UNUSED,
 		      const char *name)
 {
-	unsigned int len;
+	size_t len;
 
 	/* don't allow *.lock files/dirs */
 	len = strlen(name);
@@ -699,7 +714,7 @@ static void mbox_storage_add_list(struct mail_storage *storage,
 
 	mlist = p_new(list->pool, struct mbox_mailbox_list, 1);
 	mlist->module_ctx.super = list->v;
-	mlist->set = mail_storage_get_driver_settings(storage);
+	mlist->set = mail_namespace_get_driver_settings(list->ns, storage);
 
 	if (strcmp(list->name, MAILBOX_LIST_NAME_FS) == 0 &&
 	    *list->set.maildir_name == '\0') {
@@ -814,7 +829,8 @@ struct mail_storage mbox_storage = {
 		mbox_storage_get_list_settings,
 		mbox_storage_autodetect,
 		mbox_mailbox_alloc,
-		NULL
+		NULL,
+		NULL,
 	}
 };
 

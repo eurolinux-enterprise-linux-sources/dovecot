@@ -1,11 +1,14 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "array.h"
 #include "buffer.h"
+#include "ioloop.h"
+#include "istream.h"
+#include "ostream.h"
+#include "time-util.h"
 #include "imap-commands.h"
 
-#include <stdlib.h>
 
 struct command_hook {
 	command_hook_callback_t *pre;
@@ -17,7 +20,11 @@ static const struct command imap4rev1_commands[] = {
 	{ "LOGOUT",		cmd_logout,      COMMAND_FLAG_BREAKS_MAILBOX },
 	{ "NOOP",		cmd_noop,        COMMAND_FLAG_BREAKS_SEQS },
 
-	{ "APPEND",		cmd_append,      COMMAND_FLAG_BREAKS_SEQS },
+	{ "APPEND",		cmd_append,      COMMAND_FLAG_BREAKS_SEQS |
+						 /* finish syncing and sending
+						    all tagged commands before
+						    we wait for APPEND input */
+						 COMMAND_FLAG_BREAKS_MAILBOX },
 	{ "EXAMINE",		cmd_examine,     COMMAND_FLAG_BREAKS_MAILBOX },
 	{ "CREATE",		cmd_create,      0 },
 	{ "DELETE",		cmd_delete,      COMMAND_FLAG_BREAKS_MAILBOX |
@@ -51,7 +58,11 @@ static const struct command imap_ext_commands[] = {
 	{ "ENABLE",		cmd_enable,      0 },
 	{ "ID",			cmd_id,          0 },
 	{ "IDLE",		cmd_idle,        COMMAND_FLAG_BREAKS_SEQS |
-						 COMMAND_FLAG_REQUIRES_SYNC },
+						 COMMAND_FLAG_REQUIRES_SYNC |
+						 /* finish syncing and sending
+						    all tagged commands before
+						    IDLE is started */
+						 COMMAND_FLAG_BREAKS_MAILBOX },
 	{ "GETMETADATA",	cmd_getmetadata, 0 },
 	{ "SETMETADATA",	cmd_setmetadata, 0 },
 	{ "NAMESPACE",		cmd_namespace,   0 },
@@ -66,6 +77,7 @@ static const struct command imap_ext_commands[] = {
 	{ "UID THREAD",		cmd_thread,      COMMAND_FLAG_BREAKS_SEQS },
 	{ "UNSELECT",		cmd_unselect,    COMMAND_FLAG_BREAKS_MAILBOX },
 	{ "X-CANCEL",		cmd_x_cancel,    0 },
+	{ "X-STATE",		cmd_x_state,     COMMAND_FLAG_REQUIRES_SYNC },
 	{ "XLIST",		cmd_list,        0 },
 	/* IMAP URLAUTH (RFC4467): */
 	{ "GENURLAUTH",		cmd_genurlauth,  0 },
@@ -83,7 +95,7 @@ void command_register(const char *name, command_func_t *func,
 {
 	struct command cmd;
 
-	memset(&cmd, 0, sizeof(cmd));
+	i_zero(&cmd);
 	cmd.name = name;
 	cmd.func = func;
 	cmd.flags = flags;
@@ -148,17 +160,52 @@ void command_hook_unregister(command_hook_callback_t *pre,
 	i_panic("command_hook_unregister(): hook not registered");
 }
 
+static void command_stats_start(struct client_command_context *cmd)
+{
+	cmd->stats_start.timeval = ioloop_timeval;
+	cmd->stats_start.lock_wait_usecs = file_lock_wait_get_total_usecs();
+	cmd->stats_start.bytes_in = i_stream_get_absolute_offset(cmd->client->input);
+	cmd->stats_start.bytes_out = cmd->client->output->offset;
+}
+
+void command_stats_flush(struct client_command_context *cmd)
+{
+	io_loop_time_refresh();
+	cmd->stats.running_usecs +=
+		timeval_diff_usecs(&ioloop_timeval, &cmd->stats_start.timeval);
+	cmd->stats.lock_wait_usecs +=
+		file_lock_wait_get_total_usecs() -
+		cmd->stats_start.lock_wait_usecs;
+	cmd->stats.bytes_in += i_stream_get_absolute_offset(cmd->client->input) -
+		cmd->stats_start.bytes_in;
+	cmd->stats.bytes_out += cmd->client->output->offset -
+		cmd->stats_start.bytes_out;
+	/* allow flushing multiple times */
+	command_stats_start(cmd);
+}
+
 bool command_exec(struct client_command_context *cmd)
 {
 	const struct command_hook *hook;
-	bool ret;
+	bool finished;
 
+	i_assert(!cmd->executing);
+
+	io_loop_time_refresh();
+	command_stats_start(cmd);
+
+	cmd->executing = TRUE;
 	array_foreach(&command_hooks, hook)
 		hook->pre(cmd);
-	ret = cmd->func(cmd);
+	finished = cmd->func(cmd);
 	array_foreach(&command_hooks, hook)
 		hook->post(cmd);
-	return ret;
+	cmd->executing = FALSE;
+	if (cmd->state == CLIENT_COMMAND_STATE_DONE)
+		finished = TRUE;
+
+	command_stats_flush(cmd);
+	return finished;
 }
 
 static int command_cmp(const struct command *c1, const struct command *c2)
@@ -193,8 +240,6 @@ void commands_init(void)
 
 void commands_deinit(void)
 {
-        command_unregister_array(imap4rev1_commands, IMAP4REV1_COMMANDS_COUNT);
-        command_unregister_array(imap_ext_commands, IMAP_EXT_COMMANDS_COUNT);
 	array_free(&imap_commands);
 	array_free(&command_hooks);
 }

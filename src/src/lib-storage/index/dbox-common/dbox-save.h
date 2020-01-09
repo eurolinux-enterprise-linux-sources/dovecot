@@ -10,10 +10,10 @@ struct dbox_save_context {
 	/* updated for each appended mail: */
 	uint32_t seq;
 	struct istream *input;
-	struct mail *mail;
 
 	struct ostream *dbox_output;
 
+	uint32_t highest_pop3_uidl_seq;
 	unsigned int failed:1;
 	unsigned int finished:1;
 	unsigned int have_pop3_uidls:1;

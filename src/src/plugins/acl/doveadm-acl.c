@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -41,7 +41,7 @@ cmd_acl_mailbox_open(struct doveadm_mail_cmd_context *ctx,
 			    MAILBOX_FLAG_READONLY | MAILBOX_FLAG_IGNORE_ACLS);
 	if (mailbox_open(box) < 0) {
 		i_error("Can't open mailbox %s: %s", mailbox,
-			mailbox_get_last_error(box, NULL));
+			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_mailbox(ctx, box);
 		mailbox_free(&box);
 		return -1;
@@ -230,14 +230,14 @@ cmd_acl_set_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	if (cmd_acl_mailbox_open(_ctx, user, mailbox, &box) < 0)
 		return -1;
 
-	memset(&update, 0, sizeof(update));
+	i_zero(&update);
 	update.modify_mode = ctx->modify_mode;
 	update.neg_modify_mode = ctx->modify_mode;
 	if (acl_rights_update_import(&update, id, rights, &error) < 0)
 		i_fatal_status(EX_USAGE, "%s", error);
 	if ((ret = cmd_acl_mailbox_update(box, &update)) < 0) {
 		i_error("Failed to set ACL: %s",
-			mailbox_get_last_error(box, NULL));
+			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_error(_ctx, MAIL_ERROR_TEMP);
 	}
 	mailbox_free(&box);
@@ -290,12 +290,12 @@ cmd_acl_delete_run(struct doveadm_mail_cmd_context *ctx, struct mail_user *user)
 	if (cmd_acl_mailbox_open(ctx, user, mailbox, &box) < 0)
 		return -1;
 
-	memset(&update, 0, sizeof(update));
+	i_zero(&update);
 	if (acl_rights_update_import(&update, id, NULL, &error) < 0)
 		i_fatal_status(EX_USAGE, "%s", error);
 	if ((ret = cmd_acl_mailbox_update(box, &update)) < 0) {
 		i_error("Failed to delete ACL: %s",
-			mailbox_get_last_error(box, NULL));
+			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_error(ctx, MAIL_ERROR_TEMP);
 	}
 	mailbox_free(&box);
@@ -363,7 +363,7 @@ cmd_acl_debug_mailbox_open(struct doveadm_mail_cmd_context *ctx,
 	box = mailbox_alloc(ns->list, mailbox,
 			    MAILBOX_FLAG_READONLY | MAILBOX_FLAG_IGNORE_ACLS);
 	if (mailbox_open(box) < 0) {
-		errstr = mail_storage_get_last_error(box->storage, &error);
+		errstr = mail_storage_get_last_internal_error(box->storage, &error);
 		errstr = t_strdup(errstr);
 		doveadm_mail_failed_error(ctx, error);
 
@@ -426,7 +426,7 @@ static bool cmd_acl_debug_mailbox(struct mailbox *box, bool *retry_r)
 				     &rights) < 0)
 		i_fatal("Failed to get rights");
 
-	if (rights == NULL || rights[0] == NULL)
+	if (rights[0] == NULL)
 		i_info("User %s has no rights for mailbox", ns->user->username);
 	else {
 		i_info("User %s has rights: %s",
@@ -535,15 +535,86 @@ cmd_acl_debug_alloc(void)
 	return ctx;
 }
 
-static struct doveadm_mail_cmd acl_commands[] = {
-	{ cmd_acl_get_alloc, "acl get", "[-m] <mailbox>" },
-	{ cmd_acl_rights_alloc, "acl rights", "<mailbox>" },
-	{ cmd_acl_set_alloc, "acl set", "<mailbox> <id> <right> [<right> ...]" },
-	{ cmd_acl_add_alloc, "acl add", "<mailbox> <id> <right> [<right> ...]" },
-	{ cmd_acl_remove_alloc, "acl remove", "<mailbox> <id> <right> [<right> ...]" },
-	{ cmd_acl_delete_alloc, "acl delete", "<mailbox> <id>" },
-	{ cmd_acl_recalc_alloc, "acl recalc", "" },
-	{ cmd_acl_debug_alloc, "acl debug", "<mailbox>" }
+static struct doveadm_cmd_ver2 acl_commands[] = {
+{
+	.name = "acl get",
+	.mail_cmd = cmd_acl_get_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "[-m] <mailbox>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('m', "match-me", CMD_PARAM_BOOL, 0)
+DOVEADM_CMD_PARAM('\0', "mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+},
+{
+	.name = "acl rights",
+	.mail_cmd = cmd_acl_rights_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<mailbox>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+},
+{
+	.name = "acl set",
+	.mail_cmd = cmd_acl_set_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<mailbox> <id> <right> [<right> ...]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "id", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "right", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+},
+{
+	.name = "acl add",
+	.mail_cmd = cmd_acl_add_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<mailbox> <id> <right> [<right> ...]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "id", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "right", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+},
+{
+	.name = "acl remove",
+	.mail_cmd = cmd_acl_remove_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<mailbox> <id> <right> [<right> ...]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "id", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "right", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+},
+{
+	.name = "acl delete",
+	.mail_cmd = cmd_acl_delete_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<mailbox> <id>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "id", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+},
+{
+	.name = "acl recalc",
+	.mail_cmd = cmd_acl_recalc_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX,
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAMS_END
+},
+{
+	.name = "acl debug",
+	.mail_cmd = cmd_acl_debug_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<mailbox>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
+}
 };
 
 void doveadm_acl_plugin_init(struct module *module ATTR_UNUSED)
@@ -551,7 +622,7 @@ void doveadm_acl_plugin_init(struct module *module ATTR_UNUSED)
 	unsigned int i;
 
 	for (i = 0; i < N_ELEMENTS(acl_commands); i++)
-		doveadm_mail_register_cmd(&acl_commands[i]);
+		doveadm_cmd_register_ver2(&acl_commands[i]);
 }
 
 void doveadm_acl_plugin_deinit(void)

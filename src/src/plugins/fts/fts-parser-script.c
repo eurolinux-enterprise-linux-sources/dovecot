@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -15,7 +15,7 @@
 #define SCRIPT_USER_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, fts_parser_script_user_module)
 
-#define SCRIPT_HANDSHAKE "VERSION\tscript\t3\t0\nalarm=10\nnoreply\n"
+#define SCRIPT_HANDSHAKE "VERSION\tscript\t4\t0\nalarm=10\nnoreply\n"
 
 struct content {
 	const char *content_type;
@@ -82,7 +82,7 @@ static int script_contents_read(struct mail_user *user)
 		i_close_fd(&fd);
 		return -1;
 	}
-	input = i_stream_create_fd(fd, 1024, TRUE);
+	input = i_stream_create_fd_autoclose(&fd, 1024);
 	while ((line = i_stream_read_next_line(input)) != NULL) {
 		/* <content-type> <extension> [<extension> ...] */
 		args = p_strsplit_spaces(user->pool, line, " ");
@@ -100,7 +100,8 @@ static int script_contents_read(struct mail_user *user)
 		content->extensions = (const void *)(args+1);
 	}
 	if (input->stream_errno != 0) {
-		i_error("parser script read() failed: %m");
+		i_error("parser script read(%s) failed: %s", path,
+			i_stream_get_error(input));
 		ret = -1;
 	} else if (!eof_seen) {
 		if (input->v_offset == 0)
@@ -172,8 +173,10 @@ static void parse_content_disposition(const char *content_disposition,
 
 	/* type; param; param; .. */
 	str = t_str_new(32);
-	if (rfc822_parse_mime_token(&parser, str) < 0)
+	if (rfc822_parse_mime_token(&parser, str) < 0) {
+		rfc822_parser_deinit(&parser);
 		return;
+	}
 
 	rfc2231_parse(&parser, &results);
 	filename2 = NULL;
@@ -190,6 +193,7 @@ static void parse_content_disposition(const char *content_disposition,
 		   much about the filename actually, just about its extension */
 		*filename_r = filename2;
 	}
+	rfc822_parser_deinit(&parser);
 }
 
 static struct fts_parser *
@@ -253,18 +257,21 @@ static void fts_parser_script_more(struct fts_parser *_parser,
 	}
 }
 
-static void fts_parser_script_deinit(struct fts_parser *_parser)
+static int fts_parser_script_deinit(struct fts_parser *_parser)
 {
 	struct script_fts_parser *parser = (struct script_fts_parser *)_parser;
+	int ret = parser->failed ? -1 : 0;
 
 	if (close(parser->fd) < 0)
 		i_error("close(%s) failed: %m", parser->path);
 	i_free(parser->path);
 	i_free(parser);
+	return ret;
 }
 
 struct fts_parser_vfuncs fts_parser_script = {
 	fts_parser_script_try_init,
 	fts_parser_script_more,
-	fts_parser_script_deinit
+	fts_parser_script_deinit,
+	NULL
 };

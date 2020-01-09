@@ -61,10 +61,13 @@ headers = \
         mailbox-log.h
 
 test_programs = \
+	test-mail-index-map \
+	test-mail-index-modseq \
 	test-mail-index-sync-ext \
 	test-mail-index-transaction-finish \
 	test-mail-index-transaction-update \
 	test-mail-transaction-log-append \
+	test-mail-transaction-log-file \
 	test-mail-transaction-log-view
 
 noinst_PROGRAMS = $(test_programs)
@@ -75,6 +78,14 @@ test_libs = \
 	../lib/liblib.la
 
 test_deps = $(noinst_LTLIBRARIES) $(test_libs)
+
+test_mail_index_map_SOURCES = test-mail-index-map.c
+test_mail_index_map_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
+test_mail_index_map_DEPENDENCIES = $(test_deps)
+
+test_mail_index_modseq_SOURCES = test-mail-index-modseq.c
+test_mail_index_modseq_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
+test_mail_index_modseq_DEPENDENCIES = $(test_deps)
 
 test_mail_index_sync_ext_SOURCES = test-mail-index-sync-ext.c
 test_mail_index_sync_ext_LDADD = mail-index-sync-ext.lo $(test_libs)
@@ -91,6 +102,10 @@ test_mail_index_transaction_update_DEPENDENCIES = $(test_deps)
 test_mail_transaction_log_append_SOURCES = test-mail-transaction-log-append.c
 test_mail_transaction_log_append_LDADD = mail-transaction-log-append.lo $(test_libs)
 test_mail_transaction_log_append_DEPENDENCIES = $(test_deps)
+
+test_mail_transaction_log_file_SOURCES = test-mail-transaction-log-file.c
+test_mail_transaction_log_file_LDADD = $(noinst_LTLIBRARIES) $(test_libs)
+test_mail_transaction_log_file_DEPENDENCIES = $(test_deps)
 
 test_mail_transaction_log_view_SOURCES = test-mail-transaction-log-view.c
 test_mail_transaction_log_view_LDADD = mail-transaction-log-view.lo $(test_libs)

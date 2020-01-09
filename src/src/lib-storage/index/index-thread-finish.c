@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,7 +7,6 @@
 #include "mail-storage-private.h"
 #include "index-thread-private.h"
 
-#include <stdlib.h>
 
 struct mail_thread_shadow_node {
 	uint32_t first_child_idx, next_sibling_idx;
@@ -175,7 +174,7 @@ thread_sort_children(struct thread_finish_context *ctx, uint32_t parent_idx,
 	struct mail_thread_child_node child;
 	unsigned int count;
 
-	memset(&child, 0, sizeof(child));
+	i_zero(&child);
 	array_clear(sorted_children);
 
 	/* add all child indexes to the array */
@@ -210,7 +209,7 @@ static void gather_base_subjects(struct thread_finish_context *ctx)
 	const struct mail_thread_child_node *children;
 	uint32_t idx, uid;
 
-	memset(&gather_ctx, 0, sizeof(gather_ctx));
+	i_zero(&gather_ctx);
 	gather_ctx.ctx = ctx;
 
 	roots = array_get_modifiable(&ctx->roots, &count);
@@ -322,7 +321,7 @@ static void mail_thread_root_thread_merge(struct thread_finish_context *ctx,
 		   the current message and the message in the subject
 		   table children of the dummy.  Then replace the message
                    in the subject table with the dummy message. */
-		memset(&new_root, 0, sizeof(new_root));
+		i_zero(&new_root);
 		new_root.root_idx1 = array_count(&ctx->roots) + 1;
 		new_root.node.idx = ctx->next_new_root_idx++;
 		new_root.dummy = TRUE;
@@ -467,8 +466,8 @@ static void mail_thread_create_shadows(struct thread_finish_context *ctx,
 
 	ctx->use_sent_date = FALSE;
 
-	memset(&root, 0, sizeof(root));
-	memset(&child, 0, sizeof(child));
+	i_zero(&root);
+	i_zero(&child);
 
 	/* We may see dummy messages without parents or children. We can't
 	   free them since the nodes are in an array, but they may get reused

@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -11,7 +11,6 @@
 #include "mdbox-map.h"
 #include "mdbox-file.h"
 
-#include <stdlib.h>
 #include <sys/stat.h>
 
 int mdbox_mail_lookup(struct mdbox_mailbox *mbox, struct mail_index_view *view,
@@ -107,6 +106,7 @@ int mdbox_mail_open(struct dbox_mail *mail, uoff_t *offset_r,
 		mail_set_aborted(_mail);
 		return -1;
 	}
+	_mail->mail_stream_opened = TRUE;
 
 	do {
 		if (mail->open_file != NULL) {
@@ -262,5 +262,6 @@ struct mail_vfuncs mdbox_mail_vfuncs = {
 	NULL,
 	index_mail_expunge,
 	index_mail_set_cache_corrupted,
-	index_mail_opened
+	index_mail_opened,
+	index_mail_set_cache_corrupted_reason
 };

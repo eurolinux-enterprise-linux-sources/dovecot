@@ -1,30 +1,37 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "istream.h"
 #include "hex-binary.h"
 #include "mail-index-private.h"
-#include "mail-transaction-log.h"
+#include "mail-transaction-log-private.h"
 #include "doveadm-dump.h"
 
 #include <stdio.h>
 
 static struct mail_transaction_ext_intro prev_intro;
 
-static void dump_hdr(int fd, uint64_t *modseq_r)
+static void dump_hdr(struct istream *input, uint64_t *modseq_r,
+		     unsigned int *version_r)
 {
 	struct mail_transaction_log_header hdr;
-	ssize_t ret;
+	const unsigned char *data;
+	size_t size;
+	int ret;
 
-	ret = read(fd, &hdr, sizeof(hdr));
-	if (ret != sizeof(hdr)) {
+	ret = i_stream_read_bytes(input, &data, &size, sizeof(hdr));
+	if (ret < 0 && input->stream_errno != 0)
+		i_fatal("read() failed: %s", i_stream_get_error(input));
+	if (ret <= 0) {
 		i_fatal("file hdr read() %"PRIuSIZE_T" != %"PRIuSIZE_T,
-			ret, sizeof(hdr));
+			size, sizeof(hdr));
 	}
+	memcpy(&hdr, data, sizeof(hdr));
 	if (hdr.hdr_size < sizeof(hdr)) {
 		memset(PTR_OFFSET(&hdr, hdr.hdr_size), 0,
 		       sizeof(hdr) - hdr.hdr_size);
 	}
-	lseek(fd, hdr.hdr_size, SEEK_SET);
+	i_stream_skip(input, hdr.hdr_size);
 
 	printf("version = %u.%u\n", hdr.major_version, hdr.minor_version);
 	printf("hdr size = %u\n", hdr.hdr_size);
@@ -36,27 +43,7 @@ static void dump_hdr(int fd, uint64_t *modseq_r)
 	       (unsigned long long)hdr.initial_modseq);
 	printf("compat flags = %x\n", hdr.compat_flags);
 	*modseq_r = hdr.initial_modseq;
-}
-
-static bool
-mail_transaction_header_has_modseq(const struct mail_transaction_header *hdr)
-{
-	switch (hdr->type & MAIL_TRANSACTION_TYPE_MASK) {
-	case MAIL_TRANSACTION_EXPUNGE | MAIL_TRANSACTION_EXPUNGE_PROT:
-	case MAIL_TRANSACTION_EXPUNGE_GUID | MAIL_TRANSACTION_EXPUNGE_PROT:
-		if ((hdr->type & MAIL_TRANSACTION_EXTERNAL) == 0) {
-			/* ignore expunge requests */
-			break;
-		}
-	case MAIL_TRANSACTION_APPEND:
-	case MAIL_TRANSACTION_FLAG_UPDATE:
-	case MAIL_TRANSACTION_KEYWORD_UPDATE:
-	case MAIL_TRANSACTION_KEYWORD_RESET:
-	case MAIL_TRANSACTION_ATTRIBUTE_UPDATE:
-		/* these changes increase modseq */
-		return TRUE;
-	}
-	return FALSE;
+	*version_r = MAIL_TRANSACTION_LOG_HDR_VERSION(&hdr);
 }
 
 static const char *log_record_type(unsigned int type)
@@ -213,11 +200,17 @@ static struct {
 	HDRF(day_stamp)
 };
 
-static void log_header_update(const struct mail_transaction_header_update *u)
+static void log_header_update(const struct mail_transaction_header_update *u,
+			      size_t data_size)
 {
 	const void *data = u + 1;
 	unsigned int offset = u->offset, size = u->size;
 	unsigned int i;
+
+	if (sizeof(*u) + size > data_size) {
+		printf(" - offset = %u, size = %u (too large)\n", offset, size);
+		return;
+	}
 
 	while (size > 0) {
 		/* don't bother trying to handle header updates that include
@@ -246,9 +239,10 @@ static void log_header_update(const struct mail_transaction_header_update *u)
 }
 
 static void log_record_print(const struct mail_transaction_header *hdr,
-			     const void *data, uint64_t *modseq)
+			     const void *data, size_t data_size,
+			     uint64_t *modseq)
 {
-	unsigned int size = hdr->size - sizeof(*hdr);
+	unsigned int size = mail_index_offset_to_uint32(hdr->size) - sizeof(*hdr);
 
 	switch (hdr->type & MAIL_TRANSACTION_TYPE_MASK) {
 	case MAIL_TRANSACTION_EXPUNGE|MAIL_TRANSACTION_EXPUNGE_PROT: {
@@ -296,7 +290,7 @@ static void log_record_print(const struct mail_transaction_header *hdr,
 	case MAIL_TRANSACTION_HEADER_UPDATE: {
 		const struct mail_transaction_header_update *u = data;
 
-		log_header_update(u);
+		log_header_update(u, data_size);
 		break;
 	}
 	case MAIL_TRANSACTION_EXT_INTRO: {
@@ -330,16 +324,26 @@ static void log_record_print(const struct mail_transaction_header *hdr,
 	case MAIL_TRANSACTION_EXT_HDR_UPDATE: {
 		const struct mail_transaction_ext_hdr_update *u = data;
 
-		printf(" - offset = %u, size = %u: ", u->offset, u->size);
-		print_data(u + 1, u->size);
+		printf(" - offset = %u, size = %u", u->offset, u->size);
+		if (sizeof(*u) + u->size <= data_size) {
+			printf(": ");
+			print_data(u + 1, u->size);
+		} else {
+			printf(" (too large)");
+		}
 		printf("\n");
 		break;
 	}
 	case MAIL_TRANSACTION_EXT_HDR_UPDATE32: {
 		const struct mail_transaction_ext_hdr_update32 *u = data;
 
-		printf(" - offset = %u, size = %u: ", u->offset, u->size);
-		print_data(u + 1, u->size);
+		printf(" - offset = %u, size = %u", u->offset, u->size);
+		if (sizeof(*u) + u->size <= data_size) {
+			printf(": ");
+			print_data(u + 1, u->size);
+		} else {
+			printf(" (too large)");
+		}
 		printf("\n");
 		break;
 	}
@@ -351,7 +355,10 @@ static void log_record_print(const struct mail_transaction_header *hdr,
 		record_size = (sizeof(*rec) + prev_intro.record_size + 3) & ~3;
 		while (rec < end) {
 			printf(" - uid=%u: ", rec->uid);
-			print_data(rec + 1, prev_intro.record_size);
+			if (prev_intro.record_size <= (char*)end - (char *)(rec+1))
+				print_data(rec + 1, prev_intro.record_size);
+			else
+				printf("(record_size too large)");
 			printf("\n");
 			rec = CONST_PTR_OFFSET(rec, record_size);
 		}
@@ -459,72 +466,73 @@ static void log_record_print(const struct mail_transaction_header *hdr,
 	}
 }
 
-static int dump_record(int fd, uint64_t *modseq)
+static int dump_record(struct istream *input, uint64_t *modseq,
+		       unsigned int version)
 {
-	off_t offset;
-	ssize_t ret;
 	struct mail_transaction_header hdr;
-	unsigned int orig_size;
+	unsigned int hdr_size;
+	const unsigned char *data;
+	size_t size;
+	int ret;
 
-	offset = lseek(fd, 0, SEEK_CUR);
-
-	ret = read(fd, &hdr, sizeof(hdr));
-	if (ret == 0)
-		return 0;
-
-	if (ret != sizeof(hdr)) {
+	ret = i_stream_read_bytes(input, &data, &size, sizeof(hdr));
+	if (ret < 0 && input->stream_errno != 0)
+		i_fatal("read() failed: %s", i_stream_get_error(input));
+	if (ret <= 0) {
+		if (size == 0)
+			return 0;
 		i_fatal("rec hdr read() %"PRIuSIZE_T" != %"PRIuSIZE_T,
-			ret, sizeof(hdr));
+			size, sizeof(hdr));
 	}
+	memcpy(&hdr, data, sizeof(hdr));
 
-	orig_size = hdr.size;
-	hdr.size = mail_index_offset_to_uint32(hdr.size);
-	if (hdr.size == 0) {
+	hdr_size = mail_index_offset_to_uint32(hdr.size);
+	if (hdr_size < sizeof(hdr)) {
 		printf("record: offset=%"PRIuUOFF_T", "
 		       "type=%s, size=broken (%x)\n",
-		       offset, log_record_type(hdr.type), orig_size);
+		       input->v_offset, log_record_type(hdr.type), hdr.size);
 		return 0;
 	}
 
 	printf("record: offset=%"PRIuUOFF_T", type=%s, size=%u",
-	       offset, log_record_type(hdr.type), hdr.size);
-	if (*modseq > 0 && mail_transaction_header_has_modseq(&hdr)) {
-		*modseq += 1;
-		printf(", modseq=%llu", (unsigned long long)*modseq);
+	       input->v_offset, log_record_type(hdr.type), hdr_size);
+
+	i_stream_skip(input, sizeof(hdr));
+	size_t data_size = hdr_size - sizeof(hdr);
+	ret = i_stream_read_bytes(input, &data, &size, data_size);
+	if (ret < 0 && input->stream_errno != 0)
+		i_fatal("read() failed: %s", i_stream_get_error(input));
+	if (ret <= 0) {
+		i_fatal("rec data read() %"PRIuSIZE_T" != %"PRIuSIZE_T,
+			size, data_size);
 	}
+
+	uint64_t prev_modseq = *modseq;
+	mail_transaction_update_modseq(&hdr, data, modseq, version);
+	if (*modseq > prev_modseq)
+		printf(", modseq=%llu", (unsigned long long)*modseq);
 	printf("\n");
 
-	if (hdr.size < 1024*1024) {
-		unsigned char *buf = t_malloc(hdr.size);
-
-		ret = read(fd, buf, hdr.size - sizeof(hdr));
-		if (ret != (ssize_t)(hdr.size - sizeof(hdr))) {
-			i_fatal("rec data read() %"PRIuSIZE_T" != %"PRIuSIZE_T,
-				ret, hdr.size - sizeof(hdr));
-		}
-		log_record_print(&hdr, buf, modseq);
-	} else {
-		lseek(fd, hdr.size - sizeof(hdr), SEEK_CUR);
-	}
+	log_record_print(&hdr, data, data_size, modseq);
+	i_stream_skip(input, data_size);
 	return 1;
 }
 
 static void cmd_dump_log(int argc ATTR_UNUSED, char *argv[])
 {
+	struct istream *input;
 	uint64_t modseq;
-	int fd, ret;
+	unsigned int version;
+	int ret;
 
-	fd = open(argv[1], O_RDONLY);
-	if (fd < 0)
-		i_fatal("open(%s) failed: %m", argv[1]);
-
-	dump_hdr(fd, &modseq);
+	input = i_stream_create_file(argv[1], (size_t)-1);
+	dump_hdr(input, &modseq, &version);
 	do {
 		T_BEGIN {
-			ret = dump_record(fd, &modseq);
+			ret = dump_record(input, &modseq, version);
 		} T_END;
 	} while (ret > 0);
-	i_close_fd(&fd);
+	i_stream_unref(&input);
 }
 
 static bool test_dump_log(const char *path)

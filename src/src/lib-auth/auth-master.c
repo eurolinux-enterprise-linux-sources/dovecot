@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
@@ -13,7 +13,6 @@
 #include "master-interface.h"
 #include "auth-master.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 #define AUTH_PROTOCOL_MAJOR 1
@@ -121,7 +120,7 @@ static int auth_input_handshake(struct auth_master_connection *conn)
 	const char *line, *const *tmp;
 
 	while ((line = i_stream_next_line(conn->input)) != NULL) {
-		tmp = t_strsplit_tab(line);
+		tmp = t_strsplit_tabescaped(line);
 		if (strcmp(tmp[0], "VERSION") == 0 &&
 		    tmp[1] != NULL && tmp[2] != NULL) {
 			if (strcmp(tmp[1], dec2str(AUTH_PROTOCOL_MAJOR)) != 0) {
@@ -155,7 +154,7 @@ static int parse_reply(const char *cmd, const char *const *args,
 			i_debug("user %s: Auth %s lookup returned temporary failure: %s",
 				user, expected_reply, *args);
 		}
-		return -1;
+		return -2;
 	}
 	i_error("Unknown reply: %s", cmd);
 	return -1;
@@ -210,7 +209,7 @@ static bool auth_lookup_reply_callback(const char *cmd, const char *const *args,
 	if (ctx->return_value >= 0) {
 		ctx->fields = p_new(ctx->pool, const char *, len + 1);
 		for (i = 0; i < len; i++)
-			ctx->fields[i] = p_strdup(ctx->pool, args[i]);
+			ctx->fields[i] = str_tabunescape(p_strdup(ctx->pool, args[i]));
 	} else {
 		/* put the reason string into first field */
 		ctx->fields = p_new(ctx->pool, const char *, 2);
@@ -224,7 +223,8 @@ static bool auth_lookup_reply_callback(const char *cmd, const char *const *args,
 	}
 	if (debug) {
 		args = args_hide_passwords(args);
-		i_debug("auth input: %s", t_strarray_join(args, " "));
+		i_debug("auth %s input: %s", ctx->expected_reply,
+			t_strarray_join(args, " "));
 	}
 	return TRUE;
 }
@@ -399,6 +399,7 @@ static int auth_master_run_cmd_pre(struct auth_master_connection *conn,
 	if (conn->fd == -1) {
 		if (auth_master_connect(conn) < 0)
 			return -1;
+		i_assert(conn->fd != -1);
 	}
 	auth_master_set_io(conn);
 
@@ -414,7 +415,8 @@ static int auth_master_run_cmd_pre(struct auth_master_connection *conn,
 	o_stream_uncork(conn->output);
 
 	if (o_stream_nfinish(conn->output) < 0) {
-		i_error("write(auth socket) failed: %m");
+		i_error("write(auth socket) failed: %s",
+			o_stream_get_error(conn->output));
 		auth_master_unset_io(conn);
 		auth_connection_close(conn);
 		return -1;
@@ -468,6 +470,8 @@ auth_user_info_export(string_t *str, const struct auth_user_info *info)
 		str_printfa(str, "\trip=%s", net_ip2addr(&info->remote_ip));
 	if (info->remote_port != 0)
 		str_printfa(str, "\trport=%d", info->remote_port);
+	if (info->debug)
+		str_append(str, "\tdebug");
 }
 
 int auth_master_user_lookup(struct auth_master_connection *conn,
@@ -485,7 +489,7 @@ int auth_master_user_lookup(struct auth_master_connection *conn,
 		return 0;
 	}
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.conn = conn;
 	ctx.return_value = -1;
 	ctx.pool = pool;
@@ -511,7 +515,7 @@ int auth_master_user_lookup(struct auth_master_connection *conn,
 			p_new(pool, const char *, 1);
 		if (ctx.return_value > 0) {
 			i_error("Userdb lookup didn't return username");
-			ctx.return_value = -1;
+			ctx.return_value = -2;
 		}
 	} else {
 		*username_r = ctx.fields[0];
@@ -524,7 +528,7 @@ int auth_master_user_lookup(struct auth_master_connection *conn,
 void auth_user_fields_parse(const char *const *fields, pool_t pool,
 			    struct auth_user_reply *reply_r)
 {
-	memset(reply_r, 0, sizeof(*reply_r));
+	i_zero(reply_r);
 	reply_r->uid = (uid_t)-1;
 	reply_r->gid = (gid_t)-1;
 	p_array_init(&reply_r->extra_fields, pool, 64);
@@ -562,7 +566,7 @@ int auth_master_pass_lookup(struct auth_master_connection *conn,
 		return 0;
 	}
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.conn = conn;
 	ctx.return_value = -1;
 	ctx.pool = pool;
@@ -615,7 +619,7 @@ int auth_master_cache_flush(struct auth_master_connection *conn,
 	struct auth_master_cache_ctx ctx;
 	string_t *str;
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.conn = conn;
 
 	conn->reply_callback = auth_cache_flush_reply_callback;
@@ -697,7 +701,8 @@ auth_master_user_list_init(struct auth_master_connection *conn,
 
 	if (auth_master_run_cmd_pre(conn, str_c(str)) < 0)
 		ctx->failed = TRUE;
-	io_loop_set_current(conn->prev_ioloop);
+	if (conn->prev_ioloop != NULL)
+		io_loop_set_current(conn->prev_ioloop);
 	conn->prefix = DEFAULT_USERDB_LOOKUP_PREFIX;
 	return ctx;
 }

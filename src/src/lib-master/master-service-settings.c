@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,6 +6,8 @@
 #include "istream.h"
 #include "write-full.h"
 #include "str.h"
+#include "strescape.h"
+#include "syslog-util.h"
 #include "eacces-error.h"
 #include "env-util.h"
 #include "execv-const.h"
@@ -15,7 +17,6 @@
 #include "master-service-settings.h"
 
 #include <stddef.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -41,13 +42,30 @@ static const struct setting_define master_service_setting_defines[] = {
 	DEF(SET_STR, debug_log_path),
 	DEF(SET_STR, log_timestamp),
 	DEF(SET_STR, syslog_facility),
+	DEF(SET_STR, import_environment),
 	DEF(SET_SIZE, config_cache_size),
 	DEF(SET_BOOL, version_ignore),
 	DEF(SET_BOOL, shutdown_clients),
 	DEF(SET_BOOL, verbose_proctitle),
 
+	DEF(SET_STR, haproxy_trusted_networks),
+	DEF(SET_TIME, haproxy_timeout),
+
 	SETTING_DEFINE_LIST_END
 };
+
+/* <settings checks> */
+#ifdef HAVE_SYSTEMD
+#  define ENV_SYSTEMD " LISTEN_PID LISTEN_FDS"
+#else
+#  define ENV_SYSTEMD ""
+#endif
+#ifdef DEBUG
+#  define ENV_GDB " GDB DEBUG_SILENT"
+#else
+#  define ENV_GDB ""
+#endif
+/* </settings checks> */
 
 static const struct master_service_settings master_service_default_settings = {
 	.base_dir = PKG_RUNDIR,
@@ -57,10 +75,14 @@ static const struct master_service_settings master_service_default_settings = {
 	.debug_log_path = "",
 	.log_timestamp = DEFAULT_FAILURE_STAMP_FORMAT,
 	.syslog_facility = "mail",
+	.import_environment = "TZ CORE_OUTOFMEM CORE_ERROR" ENV_SYSTEMD ENV_GDB,
 	.config_cache_size = 1024*1024,
 	.version_ignore = FALSE,
 	.shutdown_clients = TRUE,
-	.verbose_proctitle = FALSE
+	.verbose_proctitle = FALSE,
+
+	.haproxy_trusted_networks = "",
+	.haproxy_timeout = 3
 };
 
 const struct setting_parser_info master_service_setting_parser_info = {
@@ -78,13 +100,19 @@ const struct setting_parser_info master_service_setting_parser_info = {
 /* <settings checks> */
 static bool
 master_service_settings_check(void *_set, pool_t pool ATTR_UNUSED,
-			      const char **error_r ATTR_UNUSED)
+			      const char **error_r)
 {
 	struct master_service_settings *set = _set;
+	int facility;
 
 	if (*set->log_path == '\0') {
 		/* default to syslog logging */
 		set->log_path = "syslog";
+	}
+	if (!syslog_facility_find(set->syslog_facility, &facility)) {
+		*error_r = t_strdup_printf("Unknown syslog_facility: %s",
+					   set->syslog_facility);
+		return FALSE;
 	}
 	return TRUE;
 }
@@ -95,21 +123,25 @@ master_service_exec_config(struct master_service *service,
 			   const struct master_service_settings_input *input)
 {
 	const char **conf_argv, *binary_path = service->argv[0];
-	const char *home = NULL, *user = NULL;
 	unsigned int i, argv_max_count;
 
 	(void)t_binary_abspath(&binary_path);
 
 	if (!service->keep_environment && !input->preserve_environment) {
 		if (input->preserve_home)
-			home = getenv("HOME");
+			master_service_import_environment("HOME");
 		if (input->preserve_user)
-			user = getenv("USER");
-		master_service_env_clean();
-		if (home != NULL)
-			env_put(t_strconcat("HOME=", home, NULL));
-		if (user != NULL)
-			env_put(t_strconcat("USER=", user, NULL));
+			master_service_import_environment("USER");
+		if ((service->flags & MASTER_SERVICE_FLAG_STANDALONE) != 0)
+			master_service_import_environment("LOG_STDERR_TIMESTAMP");
+
+		/* doveconf empties the environment before exec()ing us back
+		   if DOVECOT_PRESERVE_ENVS is set, so make sure it is. */
+		if (getenv(DOVECOT_PRESERVE_ENVS_ENV) == NULL)
+			env_put(DOVECOT_PRESERVE_ENVS_ENV"=");
+	} else {
+		/* make sure doveconf doesn't remove any environment */
+		env_remove(DOVECOT_PRESERVE_ENVS_ENV);
 	}
 	if (input->use_sysexits)
 		env_put("USE_SYSEXITS=1");
@@ -119,8 +151,10 @@ master_service_exec_config(struct master_service *service,
 	argv_max_count = 11 + (service->argc + 1) + 1;
 	conf_argv = t_new(const char *, argv_max_count);
 	conf_argv[i++] = DOVECOT_CONFIG_BIN_PATH;
-	conf_argv[i++] = "-f";
-	conf_argv[i++] = t_strconcat("service=", service->name, NULL);
+	if (input->service != NULL) {
+		conf_argv[i++] = "-f";
+		conf_argv[i++] = t_strconcat("service=", input->service, NULL);
+	}
 	conf_argv[i++] = "-c";
 	conf_argv[i++] = service->config_path;
 	if (input->module != NULL) {
@@ -177,14 +211,17 @@ master_service_open_config(struct master_service *service,
 	*path_r = path = input->config_path != NULL ? input->config_path :
 		master_service_get_config_path(service);
 
-	if (service->config_fd != -1 && input->config_path == NULL) {
+	if (service->config_fd != -1 && input->config_path == NULL &&
+	    !service->config_path_changed_with_param) {
 		/* use the already opened config socket */
 		fd = service->config_fd;
 		service->config_fd = -1;
 		return fd;
 	}
 
-	if (service->config_path_is_default && input->config_path == NULL) {
+	if (!service->config_path_from_master &&
+	    !service->config_path_changed_with_param &&
+	    input->config_path == NULL) {
 		/* first try to connect to the default config socket.
 		   configuration may contain secrets, so in default config
 		   this fails because the socket is 0600. it's useful for
@@ -267,6 +304,18 @@ config_send_request(struct master_service *service,
 }
 
 static int
+config_send_filters_request(int fd, const char *path, const char **error_r)
+{
+	int ret;
+	ret = write_full(fd, CONFIG_HANDSHAKE"FILTERS\n", strlen(CONFIG_HANDSHAKE"FILTERS\n"));
+	if (ret < 0) {
+		*error_r = t_strdup_printf("write_full(%s) failed: %m", path);
+		return -1;
+	}
+	return 0;
+}
+
+static int
 master_service_apply_config_overrides(struct master_service *service,
 				      struct setting_parser_context *parser,
 				      const char **error_r)
@@ -306,13 +355,14 @@ config_read_reply_header(struct istream *istream, const char *path, pool_t pool,
 		if (ret == 0)
 			return 1;
 		*error_r = istream->stream_errno != 0 ?
-			t_strdup_printf("read(%s) failed: %m", path) :
+			t_strdup_printf("read(%s) failed: %s", path,
+					i_stream_get_error(istream)) :
 			t_strdup_printf("read(%s) failed: EOF", path);
 		return -1;
 	}
 
 	T_BEGIN {
-		const char *const *arg = t_strsplit_tab(line);
+		const char *const *arg = t_strsplit_tabescaped(line);
 		ARRAY_TYPE(const_string) services;
 
 		p_array_init(&services, pool, 8);
@@ -344,15 +394,69 @@ void master_service_config_socket_try_open(struct master_service *service)
 	const char *path, *error;
 	int fd;
 
+	/* we'll get here before command line parameters have been parsed,
+	   so -O, -c and -i parameters haven't been handled yet at this point.
+	   this means we could end up opening config socket connection
+	   unnecessarily, but this isn't a problem. we'll just have to
+	   ignore it later on. (unfortunately there isn't a master_service_*()
+	   call where this function would be better called.) */
 	if (getenv("DOVECONF_ENV") != NULL ||
 	    (service->flags & MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS) != 0)
 		return;
 
-	memset(&input, 0, sizeof(input));
+	i_zero(&input);
 	input.never_exec = TRUE;
 	fd = master_service_open_config(service, &input, &path, &error);
 	if (fd != -1)
 		service->config_fd = fd;
+}
+
+int master_service_settings_get_filters(struct master_service *service,
+					const char *const **filters,
+					const char **error_r)
+{
+	struct master_service_settings_input input;
+	int fd;
+	bool retry = TRUE;
+	const char *path = NULL;
+	ARRAY_TYPE(const_string) filters_tmp;
+	t_array_init(&filters_tmp, 8);
+	i_zero(&input);
+
+	if (getenv("DOVECONF_ENV") == NULL &&
+	    (service->flags & MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS) == 0) {
+		retry = service->config_fd != -1;
+		for (;;) {
+			fd = master_service_open_config(service, &input, &path, error_r);
+			if (fd == -1) {
+				return -1;
+			}
+			if (config_send_filters_request(fd, path, error_r) == 0)
+				break;
+
+			i_close_fd(&fd);
+			if (!retry)
+				return -1;
+			retry = FALSE;
+		}
+		service->config_fd = fd;
+		struct istream *is = i_stream_create_fd(fd, (size_t)-1, FALSE);
+		const char *line;
+		/* try read response */
+		while((line = i_stream_read_next_line(is)) != NULL) {
+			if (*line == '\0')
+				break;
+			if (strncmp(line, "FILTER\t", 7) == 0) {
+				line = t_strdup(line+7);
+				array_append(&filters_tmp, &line, 1);
+			}
+		}
+		i_stream_unref(&is);
+	}
+
+	array_append_zero(&filters_tmp);
+	*filters = array_idx(&filters_tmp, 0);
+	return 0;
 }
 
 int master_service_settings_read(struct master_service *service,
@@ -371,7 +475,7 @@ int master_service_settings_read(struct master_service *service,
 	time_t now, timeout;
 	bool use_environment, retry;
 
-	memset(output_r, 0, sizeof(*output_r));
+	i_zero(output_r);
 
 	if (getenv("DOVECONF_ENV") == NULL &&
 	    (service->flags & MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS) == 0) {
@@ -404,7 +508,7 @@ int master_service_settings_read(struct master_service *service,
 		p_clear(service->set_pool);
 	} else {
 		service->set_pool =
-			pool_alloconly_create("master service settings", 8192);
+			pool_alloconly_create("master service settings", 16384);
 	}
 
 	p_array_init(&all_roots, service->set_pool, 8);
@@ -456,6 +560,7 @@ int master_service_settings_read(struct master_service *service,
 			}
 			i_close_fd(&fd);
 			config_exec_fallback(service, input);
+			settings_parser_deinit(&parser);
 			return -1;
 		}
 
@@ -471,19 +576,23 @@ int master_service_settings_read(struct master_service *service,
 
 	if (use_environment || service->keep_environment) {
 		if (settings_parse_environ(parser) < 0) {
-			*error_r = settings_parser_get_error(parser);
+			*error_r = t_strdup(settings_parser_get_error(parser));
+			settings_parser_deinit(&parser);
 			return -1;
 		}
 	}
 
 	if (array_is_created(&service->config_overrides)) {
 		if (master_service_apply_config_overrides(service, parser,
-							  error_r) < 0)
+							  error_r) < 0) {
+			settings_parser_deinit(&parser);
 			return -1;
+		}
 	}
 
 	if (!settings_parser_check(parser, service->set_pool, &error)) {
 		*error_r = t_strdup_printf("Invalid settings: %s", error);
+		settings_parser_deinit(&parser);
 		return -1;
 	}
 
@@ -513,7 +622,7 @@ int master_service_settings_read_simple(struct master_service *service,
 	struct master_service_settings_input input;
 	struct master_service_settings_output output;
 
-	memset(&input, 0, sizeof(input));
+	i_zero(&input);
 	input.roots = roots;
 	input.module = service->name;
 	return master_service_settings_read(service, &input, &output, error_r);

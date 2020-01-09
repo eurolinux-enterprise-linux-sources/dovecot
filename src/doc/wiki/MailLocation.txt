@@ -14,12 +14,47 @@ There are three different places where the mail location is looked up from:
  3. 'location' setting inside namespaces overrides everything. Usually this
     should be used only for public and shared namespaces.
 
+Autodetection
+-------------
+
 By default the 'mail_location' setting is empty, which means that Dovecot
-attempts to locate automatically where your mails are. This is done by looking
-at '~/Maildir', '/var/mail/username', '~/mail' and '~/Mail' in that order. It's
-usually a good idea to explicitly specify where the mails are, even if the
-autodetection happens to work. Autodetection commonly fails for new users who
-don't have the mail directory created yet.
+attempts to locate automatically where your mails are. This is done by looking,
+in order, at:
+
+ * '~/mdbox/'
+ * '~/sdbox/'
+ * '~/Maildir/'
+ * '~/mail/.imap/'
+ * '~/mail/inbox'
+ * '~/mail/mbox'
+ * '~/Mail/.imap/'
+ * '~/Mail/inbox'
+ * '~/Mail/mbox'
+
+For autodetection to work, one of the above locations has to be populated; when
+autodetection is active, Dovecot will not attempt to create a mail folder. Note
+that '.imap' is a directory, and 'inbox' and 'mbox' are files.
+
+It's usually a good idea to explicitly specify where the mails are, even if the
+autodetection happens to work, in particular to benefit from auto-creation of
+the folder for new users.
+
+Mailbox autocreation
+--------------------
+
+Dovecot in the 1.x era created mailboxes automatically regardless of whether
+mail_location was set. In 2.x autocreation only gets triggered if mail_location
+is correctly set. You'll see something like this if you enable debug logging:
+
+---%<-------------------------------------------------------------------------
+Debug: Namespace : /home/user/Mail doesn't exist yet, using default permissions
+Debug: Namespace : Using permissions from /home/user/Mail: mode=0700
+gid=default
+---%<-------------------------------------------------------------------------
+
+and a 'Mail/.imap' directory will be present once that process has concluded.
+This is the easiest way to ensure a freshly created user is correctly set up
+for access via Dovecot.
 
 Format
 ------
@@ -34,15 +69,40 @@ where:
    <Mailbox Formats> [MailboxFormat.txt].
  * /path/ is the path to a directory where the mail is stored. This must be an
    absolute path, not a relative path. Even if relative paths appear to work,
-   this usage is deprecated and will likely stop working at some point.
+   this usage is deprecated and will likely stop working at some point. Do not
+   use the home directory, for reasons see <Home vs. mail directory>
+   [VirtualUsers.Home.txt]
  * /key/ = /value/ can appear zero or more times to set various optional
    parameters. Possible values for /key/ are:
     * 'INDEX' : specifies the location of <index files> [MailLocation.txt].
+       * 'ITERINDEX' : Perform mailbox listing using the INDEX directories
+         instead of the mail root directories. Mainly useful when the INDEX
+         storage is on a faster storage. It takes no value. (v2.2.32+)
     * 'INBOX' : specifies the location of the <INBOX> [MailLocation.txt].
-    * 'LAYOUT' : specifies the directory layout under the <mbox>
+    * 'LAYOUT' : specifies the directory layout to use:
+       * Maildir++: The default used by Maildir format
+       * fs: The default used by mbox and dbox formats
+       * index: Uses mailbox GUIDs as the directory names. The mapping between
+         mailbox names and GUIDs exists in dovecot.list.index* files.
+    * 'NO-NOSELECT' : Automatically delete any \ <NoSelect.txt> mailboxes that
+      have no children. These mailboxes are sometimes confusing to users. Also
+      if a \ <NoSelect.txt> mailbox is attempted to be created with "CREATE
+      box/", it's created as selectable mailbox instead. (LAYOUT=Maildir++
+      always behaves this same way.) (v2.2.32+)
+    * 'UTF-8' : Store mailbox names on disk using UTF-8 instead of modified
+      UTF-7.
+    * 'BROKENCHAR' : Specifies an escape character that is used for broken
+      mailbox names. If mailbox name can't be changed reversibly to UTF-8 and
+      back, encode the problematic parts using<broken_char><hex> in the
+      user-visible UTF-8 name. The broken_char itself also has to be encoded
+      the same way. This can be useful with imapc to access mailbox names that
+      aren't valid mUTF-7 charset from remote servers. (v2.2.32+)
+    * 'CONTROL' : Specifies the location of control files under the <mbox>
       [MailLocation.mbox.txt] or <Maildir> [MailLocation.Maildir.txt] formats.
-    * 'CONTROL' : specifies the location of control files under the <mbox>
-      [MailLocation.mbox.txt] or <Maildir> [MailLocation.Maildir.txt] formats.
+    * 'VOLATILEDIR' : Specifies the location of volatile files. This includes
+      lock files and potentially other files that don't need to exist
+      permanently. This is especially useful to avoid creating lock files to
+      NFS or other remote filesystems. (v2.2.32+)
     * 'SUBSCRIPTIONS' : specifies the file used for storing subscriptions.  The
       default is "subscriptions".  If you're trying to avoid name collisions
       with a mailbox named "subscriptions", then also consider setting
@@ -189,11 +249,16 @@ Per-user mail locations
 It's possible to override the default 'mail_location' for specific users by
 making the <user database> [UserDatabase.txt] return 'mail' <extra field>
 [UserDatabase.ExtraFields.txt]. See the <user database> [UserDatabase.txt] page
-for the specific userdb you're using for more information how to do this. Below
-are however a couple of examples.
+for the specific userdb you're using for more information how to do this. 
+Below are however a couple of examples.
 
 Note that %h doesn't work in the userdb queries or templates. ~/ gets expanded
 later, so use it instead.
+
+Note also that since 'location' specified within a <namespace> [Namespaces.txt]
+overrides mail_location setting, in case you specified that parameter, you'll
+have to override in in the user database, specifying 'namespace/inbox/location'
+extra field instead of 'mail'.
 
 SQL
 ---
@@ -254,11 +319,11 @@ exec "$@"
 Custom namespace location
 -------------------------
 
-If you need to override namespace's location, first give it a name ("user"
+If you need to override namespace's location, first give it a name ("inbox"
 below):
 
 ---%<-------------------------------------------------------------------------
-namespace user {
+namespace inbox {
   ..
 }
 ---%<-------------------------------------------------------------------------
@@ -271,8 +336,8 @@ Then in the script use:
 # do the lookup here
 location=mbox:$HOME/mail
 
-export USERDB_KEYS="$USERDB_KEYS namespace/user/location"
-exec env "NAMESPACE/USER/LOCATION=$location" "$@"
+export USERDB_KEYS="$USERDB_KEYS namespace/inbox/location"
+exec env "NAMESPACE/INBOX/LOCATION=$location" "$@"
 ---%<-------------------------------------------------------------------------
 
-(This file was created from the wiki on 2013-12-19 04:42)
+(This file was created from the wiki on 2018-05-23 04:42)

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,16 +7,17 @@
 #include "abspath.h"
 #include "restrict-access.h"
 #include "fd-close-on-exec.h"
+#include "anvil-client.h"
 #include "master-service.h"
 #include "master-service-settings.h"
 #include "master-interface.h"
+#include "mail-deliver.h"
 #include "mail-storage-service.h"
 #include "lda-settings.h"
 #include "lmtp-settings.h"
 #include "client.h"
 #include "main.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 #define DNS_CLIENT_SOCKET_PATH "dns-client"
@@ -27,6 +28,7 @@
 
 const char *dns_client_socket_path, *base_dir;
 struct mail_storage_service_ctx *storage_service;
+struct anvil_client *anvil;
 
 static void client_connected(struct master_service_connection *conn)
 {
@@ -41,17 +43,16 @@ static void drop_privileges(void)
 
 	/* by default we don't drop any privileges, but keep running as root. */
 	restrict_access_get_env(&set);
-	if (set.uid != 0) {
-		/* open config connection before dropping privileges */
-		struct master_service_settings_input input;
-		struct master_service_settings_output output;
+	/* open config connection before dropping privileges */
+	struct master_service_settings_input input;
+	struct master_service_settings_output output;
 
-		memset(&input, 0, sizeof(input));
-		input.module = "lmtp";
-		input.service = "lmtp";
-		(void)master_service_settings_read(master_service,
-						   &input, &output, &error);
-	}
+	i_zero(&input);
+	input.module = "lmtp";
+	input.service = "lmtp";
+	if (master_service_settings_read(master_service,
+					 &input, &output, &error) < 0)
+		i_fatal("Error reading configuration: %s", error);
 	restrict_access_by_env(NULL, FALSE);
 }
 
@@ -60,15 +61,18 @@ static void main_init(void)
 	struct master_service_connection conn;
 
 	if (IS_STANDALONE()) {
-		memset(&conn, 0, sizeof(conn));
+		i_zero(&conn);
 		(void)client_create(STDIN_FILENO, STDOUT_FILENO, &conn);
 	}
 	dns_client_socket_path = t_abspath(DNS_CLIENT_SOCKET_PATH);
+	mail_deliver_hooks_init();
 }
 
 static void main_deinit(void)
 {
 	clients_destroy();
+	if (anvil != NULL)
+		anvil_client_deinit(&anvil);
 }
 
 int main(int argc, char *argv[])
@@ -78,7 +82,8 @@ int main(int argc, char *argv[])
 		&lmtp_setting_parser_info,
 		NULL
 	};
-	enum master_service_flags service_flags = 0;
+	enum master_service_flags service_flags =
+		MASTER_SERVICE_FLAG_USE_SSL_SETTINGS;
 	enum mail_storage_service_flags storage_service_flags =
 		MAIL_STORAGE_SERVICE_FLAG_DISALLOW_ROOT |
 		MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP |
@@ -91,7 +96,7 @@ int main(int argc, char *argv[])
 		service_flags |= MASTER_SERVICE_FLAG_STANDALONE |
 			MASTER_SERVICE_FLAG_STD_CLIENT;
 	} else {
-		service_flags |= MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN;
+		service_flags |= MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN  ;
 	}
 
 	master_service = master_service_init("lmtp", service_flags,

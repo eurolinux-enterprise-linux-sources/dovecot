@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -11,6 +11,7 @@
 #include "ostream.h"
 #include "write-full.h"
 #include "index-mail.h"
+#include "index-pop3-uidl.h"
 #include "mail-copy.h"
 #include "dbox-save.h"
 #include "mdbox-storage.h"
@@ -18,12 +19,12 @@
 #include "mdbox-file.h"
 #include "mdbox-sync.h"
 
-#include <stdlib.h>
 
 struct dbox_save_mail {
 	struct dbox_file_append_context *file_append;
 	uint32_t seq;
 	uint32_t append_offset;
+	bool written_to_disk;
 };
 
 struct mdbox_save_context {
@@ -85,6 +86,7 @@ mdbox_save_file_get_file(struct mailbox_transaction_context *t,
 	}
 
 	/* saved mail */
+	i_assert(mail->written_to_disk);
 	if (dbox_file_append_flush(mail->file_append) < 0)
 		ctx->ctx.failed = TRUE;
 
@@ -183,6 +185,7 @@ static int mdbox_save_mail_write_metadata(struct mdbox_save_context *ctx,
 		dbox_file_set_syscall_error(file, "pwrite()");
 		return -1;
 	}
+	mail->written_to_disk = TRUE;
 	return 0;
 }
 
@@ -213,7 +216,7 @@ static int mdbox_save_finish_write(struct mail_save_context *_ctx)
 	i_stream_unref(&ctx->ctx.input);
 
 	if (ctx->ctx.failed) {
-		mail_index_expunge(ctx->ctx.trans, ctx->ctx.seq);
+		index_storage_save_abort_last(&ctx->ctx.ctx, ctx->ctx.seq);
 		mdbox_map_append_abort(ctx->append_ctx);
 		array_delete(&ctx->mails, array_count(&ctx->mails) - 1, 1);
 		return -1;
@@ -253,7 +256,7 @@ mdbox_save_set_map_uids(struct mdbox_save_context *ctx,
 
 	mdbox_update_header(mbox, ctx->ctx.trans, NULL);
 
-	memset(&rec, 0, sizeof(rec));
+	i_zero(&rec);
 	rec.save_date = ioloop_time;
 	mails = array_get(&ctx->mails, &count);
 	for (i = 0; i < count; i++) {
@@ -288,7 +291,7 @@ int mdbox_transaction_save_commit_pre(struct mail_save_context *_ctx)
 	}
 
 	/* make sure the map gets locked */
-	if (mdbox_map_atomic_lock(ctx->atomic) < 0) {
+	if (mdbox_map_atomic_lock(ctx->atomic, "saving") < 0) {
 		mdbox_transaction_save_rollback(_ctx);
 		return -1;
 	}
@@ -323,6 +326,23 @@ int mdbox_transaction_save_commit_pre(struct mail_save_context *_ctx)
 	mail_index_append_finish_uids(ctx->ctx.trans, hdr->next_uid,
 				      &_t->changes->saved_uids);
 
+	if (ctx->ctx.highest_pop3_uidl_seq != 0) {
+		const struct dbox_save_mail *mails;
+		struct seq_range_iter iter;
+		unsigned int highest_pop3_uidl_idx;
+		uint32_t uid;
+
+		mails = array_idx(&ctx->mails, 0);
+		highest_pop3_uidl_idx =
+			ctx->ctx.highest_pop3_uidl_seq - mails[0].seq;
+		i_assert(mails[highest_pop3_uidl_idx].seq == ctx->ctx.highest_pop3_uidl_seq);
+
+		seq_range_array_iter_init(&iter, &_t->changes->saved_uids);
+		if (!seq_range_array_iter_nth(&iter, highest_pop3_uidl_idx, &uid))
+			i_unreached();
+		index_pop3_uidl_set_max_uid(&ctx->mbox->box, ctx->ctx.trans, uid);
+	}
+
 	/* save map UIDs to mailbox index */
 	if (first_map_uid != 0)
 		mdbox_save_set_map_uids(ctx, first_map_uid, last_map_uid);
@@ -335,10 +355,10 @@ int mdbox_transaction_save_commit_pre(struct mail_save_context *_ctx)
 			mdbox_transaction_save_rollback(_ctx);
 			return -1;
 		}
+		mail_index_sync_set_reason(ctx->sync_ctx->index_sync_ctx, "copying");
+	} else {
+		mail_index_sync_set_reason(ctx->sync_ctx->index_sync_ctx, "saving");
 	}
-
-	if (ctx->ctx.mail != NULL)
-		mail_free(&ctx->ctx.mail);
 
 	_t->changes->uid_validity = hdr->uid_validity;
 	return 0;
@@ -359,7 +379,7 @@ void mdbox_transaction_save_commit_post(struct mail_save_context *_ctx,
 	if (mdbox_sync_finish(&ctx->sync_ctx, TRUE) == 0) {
 		/* commit refcount increases for copied mails */
 		if (ctx->map_trans != NULL) {
-			if (mdbox_map_transaction_commit(ctx->map_trans) < 0)
+			if (mdbox_map_transaction_commit(ctx->map_trans, "copy refcount updates") < 0)
 				mdbox_map_atomic_set_failed(ctx->atomic);
 		}
 		/* flush file append writes */
@@ -400,8 +420,6 @@ void mdbox_transaction_save_rollback(struct mail_save_context *_ctx)
 	if (ctx->sync_ctx != NULL)
 		(void)mdbox_sync_finish(&ctx->sync_ctx, FALSE);
 
-	if (ctx->ctx.mail != NULL)
-		mail_free(&ctx->ctx.mail);
 	array_free(&ctx->mails);
 	i_free(ctx);
 }
@@ -422,7 +440,7 @@ int mdbox_copy(struct mail_save_context *_ctx, struct mail *mail)
 		return mail_storage_copy(_ctx, mail);
 	src_mbox = (struct mdbox_mailbox *)mail->box;
 
-	memset(&rec, 0, sizeof(rec));
+	i_zero(&rec);
 	rec.save_date = ioloop_time;
 	if (mdbox_mail_lookup(src_mbox, mail->transaction->view, mail->seq,
 			      &rec.map_uid) < 0) {
@@ -461,8 +479,7 @@ int mdbox_copy(struct mail_save_context *_ctx, struct mail *mail)
 	save_mail = array_append_space(&ctx->mails);
 	save_mail->seq = ctx->ctx.seq;
 
-	if (_ctx->dest_mail != NULL)
-		mail_set_seq_saving(_ctx->dest_mail, ctx->ctx.seq);
+	mail_set_seq_saving(_ctx->dest_mail, ctx->ctx.seq);
 	index_save_context_free(_ctx);
 	return 0;
 }

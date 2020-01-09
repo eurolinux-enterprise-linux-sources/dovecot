@@ -34,7 +34,6 @@ HOWTOs / Examples / Tutorials
     * <Dovecot, Postfix with Dovecot LDA transport and Dovecot SASL Auth,
       Postfix Admin, MySQL and SquirrelMail>
       [HowTo.DovecotLDAPostfixAdminMySQL.txt]
-    * MySQL, Postfix and CCC [http://postfix.pentachron.net/]
     * MySQL, Exim, SpamAssassin and ClamAV
       [http://struction.de/projects/HOWTO_VirtualMail_Exim-MySQL-Spamassassin-ClamAV-Dovecot/]
     * Postfix and Dovecot with MySQL and TLS/SSL, Postgrey and DSPAM
@@ -57,6 +56,7 @@ Others:
  * SMTP AUTH
     * <With Postfix> [HowTo.PostfixAndDovecotSASL.txt]
     * <With Exim> [HowTo.EximAndDovecotSASL.txt]
+    * With HALON [http://wiki.halon.se/SASL]
  * <Default Debian stable setup with Exim, modified to use Maildir>
    [HowTo.DebianStable.txt]
  * <IMAPC: Configuring Dovecot as an IMAP Proxy in front of Exchange (Dovecot
@@ -80,5 +80,7 @@ Others:
    [HowTo.Virtual+Postfix+Dspam+Dovecot.txt]
  * Postfix + Dovecot2.0.13 + MySQL virtual_users as proxy to DBMail
    [http://content.fens.org/index.php?q=admin-howto/mail/dovecot2dbmail-proxy]
+ * <Configuration files> [HowTo.WriteConfiguration.txt]
+ * <Replacing antispam plugin with sieve> [HowTo.AntispamWithSieve.txt]
 
-(This file was created from the wiki on 2013-12-19 04:42)
+(This file was created from the wiki on 2018-05-23 04:42)

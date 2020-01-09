@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,32 +6,28 @@
 #include "md5.h"
 #include "istream.h"
 #include "istream-crlf.h"
+#include "message-header-hash.h"
 #include "message-size.h"
 #include "mail-storage.h"
 #include "dsync-mail.h"
 
-/* These should be good enough to identify all normal mails. Received: header
-   would make it even better, but those can be somewhat large. Also these
-   fields can be looked up using IMAP ENVELOPE, which is more efficient in
-   some IMAP servers. */
-static const char *hashed_headers[] = {
-	"Date", "Message-ID", NULL
-};
-
 struct mailbox_header_lookup_ctx *
-dsync_mail_get_hash_headers(struct mailbox *box)
+dsync_mail_get_hash_headers(struct mailbox *box, const char *const *hashed_headers)
 {
 	return mailbox_header_lookup_init(box, hashed_headers);
 }
 
-int dsync_mail_get_hdr_hash(struct mail *mail, const char **hdr_hash_r)
+int dsync_mail_get_hdr_hash(struct mail *mail, unsigned int version,
+			    const char *const *hashed_headers, const char **hdr_hash_r)
 {
 	struct istream *hdr_input, *input;
 	struct mailbox_header_lookup_ctx *hdr_ctx;
+	struct message_header_hash_context hash_ctx;
 	struct md5_context md5_ctx;
 	unsigned char md5_result[MD5_RESULTLEN];
 	const unsigned char *data;
 	size_t size;
+	ssize_t sret;
 	int ret = 0;
 
 	hdr_ctx = mailbox_header_lookup_init(mail->box, hashed_headers);
@@ -43,14 +39,13 @@ int dsync_mail_get_hdr_hash(struct mail *mail, const char **hdr_hash_r)
 	input = i_stream_create_lf(hdr_input);
 
 	md5_init(&md5_ctx);
-	while (!i_stream_is_eof(input)) {
-		if (i_stream_read_data(input, &data, &size, 0) == -1)
-			break;
-		if (size == 0)
-			break;
-		md5_update(&md5_ctx, data, size);
+	i_zero(&hash_ctx);
+	while ((sret = i_stream_read_more(input, &data, &size)) > 0) {
+		message_header_hash_more(&hash_ctx, &hash_method_md5, &md5_ctx,
+					 version, data, size);
 		i_stream_skip(input, size);
 	}
+	i_assert(sret == -1);
 	if (input->stream_errno != 0)
 		ret = -1;
 	i_stream_unref(&input);
@@ -60,12 +55,12 @@ int dsync_mail_get_hdr_hash(struct mail *mail, const char **hdr_hash_r)
 	return ret;
 }
 
-int dsync_mail_fill(struct mail *mail, struct dsync_mail *dmail_r,
-		    const char **error_field_r)
+int dsync_mail_fill(struct mail *mail, bool minimal_fill,
+		    struct dsync_mail *dmail_r, const char **error_field_r)
 {
-	const char *guid, *str;
+	const char *guid;
 
-	memset(dmail_r, 0, sizeof(*dmail_r));
+	i_zero(dmail_r);
 
 	if (mail_get_special(mail, MAIL_FETCH_GUID, &guid) < 0) {
 		*error_field_r = "GUID";
@@ -76,6 +71,22 @@ int dsync_mail_fill(struct mail *mail, struct dsync_mail *dmail_r,
 
 	dmail_r->input_mail = mail;
 	dmail_r->input_mail_uid = mail->uid;
+
+	if (mail_get_save_date(mail, &dmail_r->saved_date) < 0) {
+		*error_field_r = "saved-date";
+		return -1;
+	}
+	if (!minimal_fill)
+		return dsync_mail_fill_nonminimal(mail, dmail_r, error_field_r);
+	dmail_r->minimal_fields = TRUE;
+	return 0;
+}
+
+int dsync_mail_fill_nonminimal(struct mail *mail, struct dsync_mail *dmail_r,
+			       const char **error_field_r)
+{
+	const char *str;
+
 	if (mail_get_stream(mail, NULL, NULL, &dmail_r->input) < 0) {
 		*error_field_r = "body";
 		return -1;
@@ -133,7 +144,6 @@ void dsync_mail_change_dup(pool_t pool, const struct dsync_mail_change *src,
 	dest_r->hdr_hash = p_strdup(pool, src->hdr_hash);
 	dest_r->modseq = src->modseq;
 	dest_r->pvt_modseq = src->pvt_modseq;
-	dest_r->save_timestamp = src->save_timestamp;
 
 	dest_r->add_flags = src->add_flags;
 	dest_r->remove_flags = src->remove_flags;
@@ -141,4 +151,6 @@ void dsync_mail_change_dup(pool_t pool, const struct dsync_mail_change *src,
 	dest_r->keywords_reset = src->keywords_reset;
 	const_string_array_dup(pool, &src->keyword_changes,
 			       &dest_r->keyword_changes);
+	dest_r->received_timestamp = src->received_timestamp;
+	dest_r->virtual_size = src->virtual_size;
 }

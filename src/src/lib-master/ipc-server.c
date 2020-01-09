@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -154,6 +154,8 @@ void ipc_server_deinit(struct ipc_server **_server)
 	i_assert(server->ipc_cmd_refcount == 0);
 
 	ipc_server_disconnect(server);
+	if (server->to != NULL)
+		timeout_remove(&server->to);
 	i_free(server->name);
 	i_free(server->path);
 	i_free(server);
@@ -173,6 +175,7 @@ static void ipc_cmd_finish(struct ipc_cmd *cmd, const char *line)
 
 	i_assert(cmd->server->ipc_cmd_refcount > 0);
 	cmd->server->ipc_cmd_refcount--;
+	i_free(cmd);
 }
 
 void ipc_cmd_success(struct ipc_cmd **_cmd)

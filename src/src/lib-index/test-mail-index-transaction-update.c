@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,7 +6,7 @@
 #include "mail-index-private.h"
 #include "mail-index-transaction-private.h"
 
-#include <stdlib.h>
+#include <time.h>
 
 static struct mail_index_header hdr;
 static struct mail_index_record rec;
@@ -70,6 +70,17 @@ mail_index_transaction_new(void)
 	t->first_new_seq = hdr.messages_count + 1;
 	return t;
 }
+static void mail_index_transaction_cleanup(struct mail_index_transaction *t)
+{
+	if (array_is_created(&t->appends))
+		array_free(&t->appends);
+	if (array_is_created(&t->updates))
+		array_free(&t->updates);
+	if (array_is_created(&t->modseq_updates))
+		array_free(&t->modseq_updates);
+	if (array_is_created(&t->expunges))
+		array_free(&t->expunges);
+}
 
 static void test_mail_index_append(void)
 {
@@ -103,6 +114,7 @@ static void test_mail_index_append(void)
 	test_assert(appends[1].uid == 124);
 	test_assert(appends[1].flags == 0);
 	test_end();
+	mail_index_transaction_cleanup(t);
 
 	/* test with some uids */
 	t = mail_index_transaction_new();
@@ -138,6 +150,8 @@ static void test_mail_index_append(void)
 	test_assert(appends[3].uid == 131);
 	test_assert(appends[4].uid == 128);
 	test_end();
+
+	mail_index_transaction_cleanup(t);
 }
 
 static void test_mail_index_flag_update_fastpath(void)
@@ -178,6 +192,8 @@ static void test_mail_index_flag_update_fastpath(void)
 	test_assert(updates[1].remove_flags == 0);
 	test_assert(!t->log_updates);
 	test_end();
+
+	mail_index_transaction_cleanup(t);
 }
 
 static void test_mail_index_flag_update_simple_merges(void)
@@ -221,6 +237,8 @@ static void test_mail_index_flag_update_simple_merges(void)
 	test_assert(updates[0].uid1 == 4);
 	test_assert(updates[0].uid2 == 12);
 	test_end();
+
+	mail_index_transaction_cleanup(t);
 }
 
 static void test_mail_index_flag_update_complex_merges(void)
@@ -279,6 +297,8 @@ static void test_mail_index_flag_update_complex_merges(void)
 	test_assert(updates[6].remove_flags == 0);
 
 	test_end();
+
+	mail_index_transaction_cleanup(t);
 }
 
 static void
@@ -353,6 +373,8 @@ static void test_mail_index_flag_update_random(void)
 		flags_array_check(t, flags, hdr.messages_count);
 	}
 	test_end();
+
+	mail_index_transaction_cleanup(t);
 }
 
 static void test_mail_index_cancel_flag_updates(void)
@@ -385,6 +407,8 @@ static void test_mail_index_cancel_flag_updates(void)
 	test_assert(updates[1].uid1 == 7 && updates[1].uid2 == 7);
 
 	test_end();
+
+	mail_index_transaction_cleanup(t);
 }
 
 static void test_mail_index_flag_update_appends(void)
@@ -430,6 +454,8 @@ static void test_mail_index_flag_update_appends(void)
 	test_assert(updates[0].uid2 == 4);
 	test_assert(updates[0].add_flags == MAIL_ANSWERED);
 	test_end();
+
+	mail_index_transaction_cleanup(t);
 }
 
 static bool test_flag_update_pos(struct mail_index_transaction *t,
@@ -440,7 +466,7 @@ static bool test_flag_update_pos(struct mail_index_transaction *t,
 	count = array_count(&t->updates);
 	for (i = 0; i < idx; i++) {
 		for (j = idx + 1; j <= count; j++) {
-			if (!mail_index_transaction_get_flag_update_pos(t, i, j, seq) == idx) {
+			if (mail_index_transaction_get_flag_update_pos(t, i, j, seq) != idx) {
 				test_assert(FALSE);
 				return FALSE;
 			}
@@ -475,6 +501,8 @@ static void test_mail_index_transaction_get_flag_update_pos(void)
 	test_assert(test_flag_update_pos(t, 11, 4));
 	test_assert(test_flag_update_pos(t, 12, 4));
 	test_end();
+
+	mail_index_transaction_cleanup(t);
 }
 
 static void test_mail_index_modseq_update(void)
@@ -511,6 +539,8 @@ static void test_mail_index_modseq_update(void)
 		    ups[3].modseq_high32 == 0 &&
 		    ups[3].modseq_low32 == 2);
 	test_end();
+
+	mail_index_transaction_cleanup(t);
 }
 
 static void test_mail_index_expunge(void)
@@ -553,6 +583,80 @@ static void test_mail_index_expunge(void)
 	test_assert(memcmp(expunges[4].guid_128, empty_guid, sizeof(empty_guid)) == 0);
 
 	test_end();
+
+	mail_index_transaction_cleanup(t);
+}
+
+static void test_mail_index_update_day_first_uid(void)
+{
+	struct {
+		uint32_t now;
+		uint32_t old_day_stamp;
+		uint32_t new_day_stamp;
+		uint32_t new_day_first_uid[8];
+	} tests[] = {
+		/* 1487116800 = 2017-02-15 00:00:00 UTC */
+		{ 1487116800, 1487116800, 1487116800, { 8, 7, 6, 5, 4, 3, 2, 1 } },
+		/* still same day */
+		{ 1487116800+3600*24-1, 1487116800, 1487116800, { 8, 7, 6, 5, 4, 3, 2, 1 } },
+		/* one day earlier */
+		{ 1487116800-1, 1487116800, 1487116800, { 8, 7, 6, 5, 4, 3, 2, 1 } },
+		/* next day */
+		{ 1487116800+3600*24, 1487116800, 1487116800+3600*24, { 9, 8, 7, 6, 5, 4, 3, 2 } },
+		{ 1487116800+3600*24*2-1, 1487116800, 1487116800+3600*24, { 9, 8, 7, 6, 5, 4, 3, 2 } },
+		/* 2 days */
+		{ 1487116800+3600*24*2, 1487116800, 1487116800+3600*24*2, { 9, 8, 8, 7, 6, 5, 4, 3 } },
+		/* 3 days */
+		{ 1487116800+3600*24*3, 1487116800, 1487116800+3600*24*3, { 9, 8, 8, 8, 7, 6, 5, 4 } },
+		/* 4 days */
+		{ 1487116800+3600*24*4, 1487116800, 1487116800+3600*24*4, { 9, 8, 8, 8, 8, 7, 6, 5 } },
+		/* 5 days */
+		{ 1487116800+3600*24*5, 1487116800, 1487116800+3600*24*5, { 9, 8, 8, 8, 8, 8, 7, 6 } },
+		/* 6 days */
+		{ 1487116800+3600*24*6, 1487116800, 1487116800+3600*24*6, { 9, 8, 8, 8, 8, 8, 8, 7 } },
+		/* 7 days */
+		{ 1487116800+3600*24*7, 1487116800, 1487116800+3600*24*7, { 9, 8, 8, 8, 8, 8, 8, 8 } },
+		/* 8 days */
+		{ 1487116800+3600*24*8, 1487116800, 1487116800+3600*24*8, { 9, 8, 8, 8, 8, 8, 8, 8 } },
+		/* 366 days */
+		{ 1487116800+3600*24*366, 1487116800, 1487116800+3600*24*366, { 9, 8, 8, 8, 8, 8, 8, 8 } },
+	};
+	struct mail_index_transaction *t;
+	struct mail_index_record *rec;
+	unsigned int i, j;
+
+	test_begin("mail index update day first uid");
+
+	/* daylight savings times were confusing these tests, so we'll now
+	   just assume that TZ=UTC */
+	test_assert(timezone == 0);
+
+	hdr.messages_count = 10;
+	t = mail_index_transaction_new();
+	t->view = t_new(struct mail_index_view, 1);
+	t->view->map = t_new(struct mail_index_map, 1);
+
+	t_array_init(&t->appends, 1);
+	rec = array_append_space(&t->appends);
+	rec->uid = 9;
+
+	for (i = 0; i < N_ELEMENTS(tests); i++) {
+		i_zero(&hdr);
+		for (j = 0; j < N_ELEMENTS(hdr.day_first_uid); j++)
+			hdr.day_first_uid[j] = 8-j;
+		hdr.day_stamp = tests[i].old_day_stamp + timezone;
+		memcpy(t->post_hdr_change, &hdr, sizeof(hdr));
+		mail_index_update_day_headers(t, tests[i].now + timezone);
+
+		struct mail_index_header new_hdr;
+		memcpy(&new_hdr, t->post_hdr_change, sizeof(new_hdr));
+		test_assert_idx(new_hdr.day_stamp == tests[i].new_day_stamp + timezone, i);
+		test_assert_idx(memcmp(new_hdr.day_first_uid,
+				       tests[i].new_day_first_uid,
+				       sizeof(uint32_t) * 8) == 0, i);
+	}
+
+	test_end();
 }
 
 int main(void)
@@ -568,7 +672,11 @@ int main(void)
 		test_mail_index_transaction_get_flag_update_pos,
 		test_mail_index_modseq_update,
 		test_mail_index_expunge,
+		test_mail_index_update_day_first_uid,
 		NULL
 	};
+	/* daylight saving time confuses things */
+	putenv("TZ=UTC");
+	tzset();
 	return test_run(test_functions);
 }

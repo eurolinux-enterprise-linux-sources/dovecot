@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -6,9 +6,18 @@
 #include "message-parser.h"
 #include "fts-parser.h"
 
-const struct fts_parser_vfuncs *parsers[] = {
+static const struct fts_parser_vfuncs *parsers[] = {
 	&fts_parser_html,
-	&fts_parser_script
+	&fts_parser_script,
+	&fts_parser_tika
+};
+
+static const char *plaintext_content_types[] = {
+	"text/plain",
+	"message/delivery-status",
+	"message/disposition-notification",
+	"application/pgp-signature",
+	NULL
 };
 
 bool fts_parser_init(struct mail_user *user,
@@ -16,6 +25,12 @@ bool fts_parser_init(struct mail_user *user,
 		     struct fts_parser **parser_r)
 {
 	unsigned int i;
+
+	if (str_array_find(plaintext_content_types, content_type)) {
+		/* we probably don't want/need to allow parsers to handle
+		   plaintext? */
+		return FALSE;
+	}
 
 	for (i = 0; i < N_ELEMENTS(parsers); i++) {
 		*parser_r = parsers[i]->try_init(user, content_type,
@@ -68,24 +83,40 @@ void fts_parser_more(struct fts_parser *parser, struct message_block *block)
 		} else {
 			buffer_set_used_size(parser->utf8_output, 0);
 		}
-		(void)uni_utf8_get_valid_data(block->data, block->size,
-					      parser->utf8_output);
+		if (uni_utf8_get_valid_data(block->data, block->size,
+					    parser->utf8_output)) {
+			/* valid UTF-8, but there were NULs */
+			buffer_append(parser->utf8_output, block->data,
+				      block->size);
+		}
 		replace_nul_bytes(parser->utf8_output);
 		block->data = parser->utf8_output->data;
 		block->size = parser->utf8_output->used;
 	}
 }
 
-void fts_parser_deinit(struct fts_parser **_parser)
+int fts_parser_deinit(struct fts_parser **_parser)
 {
 	struct fts_parser *parser = *_parser;
+	int ret = 0;
 
 	*_parser = NULL;
 
 	if (parser->utf8_output != NULL)
 		buffer_free(&parser->utf8_output);
 	if (parser->v.deinit != NULL)
-		parser->v.deinit(parser);
+		ret = parser->v.deinit(parser);
 	else
 		i_free(parser);
+	return ret;
+}
+
+void fts_parsers_unload(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < N_ELEMENTS(parsers); i++) {
+		if (parsers[i]->unload != NULL)
+			parsers[i]->unload();
+	}
 }

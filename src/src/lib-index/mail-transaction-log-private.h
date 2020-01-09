@@ -10,17 +10,6 @@ struct dotlock_settings;
    mails. */
 #define MAIL_TRANSACTION_LOG_LOCK_TIMEOUT (3*60)
 #define MAIL_TRANSACTION_LOG_LOCK_CHANGE_TIMEOUT (3*60)
-#define MAIL_TRANSACTION_LOG_LOCK_WARN_SECS 30
-
-/* Rotate when log is older than ROTATE_TIME and larger than MIN_SIZE */
-#define MAIL_TRANSACTION_LOG_ROTATE_MIN_SIZE (1024*32)
-/* If log is larger than MAX_SIZE, rotate regardless of the time */
-#define MAIL_TRANSACTION_LOG_ROTATE_MAX_SIZE (1024*1024)
-#define MAIL_TRANSACTION_LOG_ROTATE_TIME (60*5)
-
-/* Delete .log.2 files older than this many seconds. Don't be too eager,
-   older files are useful for QRESYNC and dsync. */
-#define MAIL_TRANSACTION_LOG2_STALE_SECS (60*60*24*2)
 
 #define MAIL_TRANSACTION_LOG_FILE_IN_MEMORY(file) ((file)->fd == -1)
 
@@ -46,6 +35,8 @@ struct mail_transaction_log_file {
 	dev_t st_dev;
 	time_t last_mtime;
 	uoff_t last_size;
+
+	time_t last_mmap_error_time;
 
 	struct mail_transaction_log_header hdr;
 	buffer_t mmap_buffer;
@@ -80,6 +71,7 @@ struct mail_transaction_log_file {
 	unsigned int locked:1;
 	unsigned int locked_sync_offset_updated:1;
 	unsigned int corrupted:1;
+	unsigned int need_rotate:1;
 };
 
 struct mail_transaction_log {
@@ -117,19 +109,24 @@ mail_transaction_log_file_alloc(struct mail_transaction_log *log,
 				const char *path);
 void mail_transaction_log_file_free(struct mail_transaction_log_file **file);
 
-int mail_transaction_log_file_open(struct mail_transaction_log_file *file);
+/* Returns 1 if log was opened, 0 if it didn't exist or was already open,
+   -1 if error. */
+int mail_transaction_log_file_open(struct mail_transaction_log_file *file,
+				   const char **reason_r);
 int mail_transaction_log_file_create(struct mail_transaction_log_file *file,
 				     bool reset);
 int mail_transaction_log_file_lock(struct mail_transaction_log_file *file);
 
 int mail_transaction_log_find_file(struct mail_transaction_log *log,
 				   uint32_t file_seq, bool nfs_flush,
-				   struct mail_transaction_log_file **file_r);
+				   struct mail_transaction_log_file **file_r,
+				   const char **reason_r);
 
 /* Returns 1 if ok, 0 if file is corrupted or offset range is invalid,
    -1 if I/O error */
 int mail_transaction_log_file_map(struct mail_transaction_log_file *file,
-				  uoff_t start_offset, uoff_t end_offset);
+				  uoff_t start_offset, uoff_t end_offset,
+				  const char **reason_r);
 void mail_transaction_log_file_move_to_memory(struct mail_transaction_log_file
 					      *file);
 
@@ -137,14 +134,18 @@ void mail_transaction_logs_clean(struct mail_transaction_log *log);
 
 bool mail_transaction_log_want_rotate(struct mail_transaction_log *log);
 int mail_transaction_log_rotate(struct mail_transaction_log *log, bool reset);
-int mail_transaction_log_lock_head(struct mail_transaction_log *log);
-void mail_transaction_log_file_unlock(struct mail_transaction_log_file *file);
+int mail_transaction_log_lock_head(struct mail_transaction_log *log,
+				   const char *lock_reason);
+void mail_transaction_log_file_unlock(struct mail_transaction_log_file *file,
+				      const char *lock_reason);
 
 void mail_transaction_update_modseq(const struct mail_transaction_header *hdr,
-				    const void *data, uint64_t *cur_modseq);
+				    const void *data, uint64_t *cur_modseq,
+				    unsigned int version);
 int mail_transaction_log_file_get_highest_modseq_at(
 		struct mail_transaction_log_file *file,
-		uoff_t offset, uint64_t *highest_modseq_r);
+		uoff_t offset, uint64_t *highest_modseq_r,
+		const char **error_r);
 int mail_transaction_log_file_get_modseq_next_offset(
 		struct mail_transaction_log_file *file,
 		uint64_t modseq, uoff_t *next_offset_r);

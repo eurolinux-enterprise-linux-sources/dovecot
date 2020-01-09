@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,7 +6,6 @@
 #include "rfc822-parser.h"
 #include "rfc2231-parser.h"
 
-#include <stdlib.h>
 
 struct rfc2231_parameter {
 	const char *key, *value;
@@ -53,14 +52,14 @@ int rfc2231_parse(struct rfc822_parser_context *ctx,
 	/* Get a list of all parameters. RFC 2231 uses key*<n>[*]=value pairs,
 	   which we want to merge to a key[*]=value pair. Save them to a
 	   separate array. */
-	memset(&rfc2231_param, 0, sizeof(rfc2231_param));
+	i_zero(&rfc2231_param);
 	t_array_init(&result, 8);
 	t_array_init(&rfc2231_params_arr, 8);
 	while ((ret = rfc822_parse_content_param(ctx, &key, &value)) != 0) {
 		if (ret < 0) {
 			/* try to continue anyway.. */
 			broken = TRUE;
-			if (ctx->data == ctx->end)
+			if (ctx->data >= ctx->end)
 				break;
 			ctx->data++;
 			continue;

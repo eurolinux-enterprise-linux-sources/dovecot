@@ -49,6 +49,7 @@ struct imap_notify_context {
 	struct imap_fetch_context *fetch_ctx;
 	struct timeout *to_watch;
 
+	unsigned int have_subscriptions:1;
 	unsigned int selected_set:1;
 	unsigned int selected_immediate_expunges:1;
 	unsigned int send_immediate_status:1;
@@ -63,9 +64,12 @@ bool imap_notify_match_mailbox(struct imap_notify_namespace *notify_ns,
 int imap_client_notify_newmails(struct client *client);
 void imap_client_notify_finished(struct client *client);
 
+void imap_client_notify_command_allocated(struct client *client);
 void imap_client_notify_command_freed(struct client *client);
 
 int imap_notify_begin(struct imap_notify_context *ctx);
 void imap_notify_deinit(struct imap_notify_context **ctx);
+
+void imap_notify_flush(struct imap_notify_context *ctx);
 
 #endif

@@ -73,14 +73,14 @@ static uint32_t SHA1_K[] = { 0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6 };
 
 static void sha1_step(struct sha1_ctxt *);
 
-static void
+static void ATTR_UNSIGNED_WRAPS
 sha1_step(struct sha1_ctxt *ctxt)
 {
 	uint32_t	a, b, c, d, e;
 	size_t t, s;
 	uint32_t	tmp;
 
-#if !WORDS_BIGENDIAN
+#ifndef WORDS_BIGENDIAN
 	struct sha1_ctxt tctxt;
 	memmove(&tctxt.m.b8[0], &ctxt->m.b8[0], 64);
 	ctxt->m.b8[0] = tctxt.m.b8[3]; ctxt->m.b8[1] = tctxt.m.b8[2];
@@ -189,7 +189,7 @@ sha1_pad(struct sha1_ctxt *ctxt)
 	memset(&ctxt->m.b8[padstart], 0, padlen - 8);
 	COUNT += (padlen - 8);
 	COUNT %= 64;
-#if WORDS_BIGENDIAN
+#ifdef WORDS_BIGENDIAN
 	PUTPAD(ctxt->c.b8[0]); PUTPAD(ctxt->c.b8[1]);
 	PUTPAD(ctxt->c.b8[2]); PUTPAD(ctxt->c.b8[3]);
 	PUTPAD(ctxt->c.b8[4]); PUTPAD(ctxt->c.b8[5]);
@@ -235,7 +235,7 @@ sha1_result(struct sha1_ctxt *ctxt, void *digest0)
 
 	digest = (uint8_t *)digest0;
 	sha1_pad(ctxt);
-#if WORDS_BIGENDIAN
+#ifdef WORDS_BIGENDIAN
 	memmove(digest, &ctxt->h.b8[0], 20);
 #else
 	digest[0] = ctxt->h.b8[3]; digest[1] = ctxt->h.b8[2];
@@ -253,7 +253,7 @@ sha1_result(struct sha1_ctxt *ctxt, void *digest0)
 }
 
 void sha1_get_digest(const void *data, size_t size,
-		     unsigned char result[SHA1_RESULTLEN])
+		     unsigned char result[STATIC_ARRAY SHA1_RESULTLEN])
 {
 	struct sha1_ctxt ctx;
 

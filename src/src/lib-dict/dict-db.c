@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 /* FIXME: BDB isn't being used correctly/safely. */
 
@@ -6,7 +6,6 @@
 #include "dict-private.h"
 
 #ifdef BUILD_DB
-#include <stdlib.h>
 #include <db.h>
 
 struct db_dict {
@@ -26,7 +25,7 @@ struct db_dict_iterate_context {
 
 	DBC *cursor;
 	char *path;
-	unsigned int path_len;
+	size_t path_len;
 
 	DBT pkey, pdata;
 
@@ -49,7 +48,7 @@ static int associate_key(DB *pdb ATTR_UNUSED,
 			 const DBT *pkey ATTR_UNUSED,
 			 const DBT *pdata, DBT *skey)
 {
-	memset(skey, 0, sizeof(*skey));
+	i_zero(skey);
 	skey->data = pdata->data;
 	skey->size = pdata->size;
 	return 0;
@@ -268,9 +267,9 @@ static int db_dict_iterate_next(struct db_dict_iterate_context *ctx,
 	DBT pkey, pdata, skey;
 	int ret;
 
-	memset(&pkey, 0, sizeof(pkey));
-	memset(&pdata, 0, sizeof(pdata));
-	memset(&skey, 0, sizeof(skey));
+	i_zero(&pkey);
+	i_zero(&pdata);
+	i_zero(&skey);
 
 	if ((ctx->flags & DICT_ITERATE_FLAG_SORT_BY_VALUE) != 0) {
 		while ((ret = ctx->cursor->c_pget(ctx->cursor, &skey,
@@ -418,8 +417,8 @@ static void db_dict_set(struct dict_transaction_context *_ctx,
 	struct db_dict *dict = (struct db_dict *)_ctx->dict;
 	DBT dkey, ddata;
 
-	memset(&dkey, 0, sizeof(dkey));
-	memset(&ddata, 0, sizeof(ddata));
+	i_zero(&dkey);
+	i_zero(&ddata);
 
 	dkey.data = (char *)key;
 	dkey.size = strlen(key);
@@ -449,7 +448,7 @@ static void db_dict_unset(struct dict_transaction_context *_ctx,
 	struct db_dict *dict = (struct db_dict *)_ctx->dict;
 	DBT dkey;
 
-	memset(&dkey, 0, sizeof(dkey));
+	i_zero(&dkey);
 	dkey.data = (char *)key;
 	dkey.size = strlen(key);
 	
@@ -466,19 +465,18 @@ db_dict_atomic_inc(struct dict_transaction_context *_ctx ATTR_UNUSED,
 struct dict dict_driver_db = {
 	.name = "db",
 	{
-		db_dict_init,
-		db_dict_deinit,
-		NULL,
-		db_dict_lookup,
-		db_dict_iterate_init,
-		db_dict_iterate,
-		db_dict_iterate_deinit,
-		db_dict_transaction_init,
-		db_dict_transaction_commit,
-		db_dict_transaction_rollback,
-		db_dict_set,
-		db_dict_unset,
-		db_dict_atomic_inc
+		.init = db_dict_init,
+		.deinit = db_dict_deinit,
+		.lookup = db_dict_lookup,
+		.iterate_init = db_dict_iterate_init,
+		.iterate = db_dict_iterate,
+		.iterate_deinit = db_dict_iterate_deinit,
+		.transaction_init = db_dict_transaction_init,
+		.transaction_commit = db_dict_transaction_commit,
+		.transaction_rollback = db_dict_transaction_rollback,
+		.set = db_dict_set,
+		.unset = db_dict_unset,
+		.atomic_inc = db_dict_atomic_inc,
 	}
 };
 #endif

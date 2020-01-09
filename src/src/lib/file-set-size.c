@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #ifdef HAVE_CONFIG_H
 #  include "config.h"
@@ -14,7 +14,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#ifdef HAVE_LINUX_FALLOC_H
+#if defined(HAVE_LINUX_FALLOC_H) && !defined(FALLOC_FL_KEEP_SIZE)
+/* Legacy Linux does not have the FALLOC_FL_* flags under fcntl.h */
 #  include <linux/falloc.h>
 #endif
 
@@ -92,7 +93,7 @@ int file_preallocate(int fd ATTR_UNUSED, off_t size ATTR_UNUSED)
 	/* OSX */
 	fstore_t fs;
 
-	memset(&fs, 0, sizeof(fs));
+	i_zero(&fs);
 	fs.fst_flags = F_ALLOCATECONTIG;
 	fs.fst_posmode = F_PEOFPOSMODE;
 	fs.fst_offset = 0;

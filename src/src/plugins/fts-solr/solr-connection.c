@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -28,7 +28,8 @@ enum solr_xml_content_state {
 	SOLR_XML_CONTENT_STATE_SCORE,
 	SOLR_XML_CONTENT_STATE_MAILBOX,
 	SOLR_XML_CONTENT_STATE_NAMESPACE,
-	SOLR_XML_CONTENT_STATE_UIDVALIDITY
+	SOLR_XML_CONTENT_STATE_UIDVALIDITY,
+	SOLR_XML_CONTENT_STATE_ERROR
 };
 
 struct solr_lookup_xml_context {
@@ -61,6 +62,8 @@ struct solr_connection {
 	in_port_t http_port;
 	char *http_base_url;
 	char *http_failure;
+	char *http_user;
+	char *http_password;
 
 	int request_status;
 
@@ -106,7 +109,7 @@ int solr_connection_init(const char *url, bool debug,
 	struct http_url *http_url;
 	const char *error;
 
-	if (http_url_parse(url, NULL, 0, pool_datastack_create(),
+	if (http_url_parse(url, NULL, HTTP_URL_ALLOW_USERINFO_PART, pool_datastack_create(),
 			   &http_url, &error) < 0) {
 		*error_r = t_strdup_printf(
 			"fts_solr: Failed to parse HTTP url: %s", error);
@@ -118,16 +121,24 @@ int solr_connection_init(const char *url, bool debug,
 	conn->http_port = http_url->port;
 	conn->http_base_url = i_strconcat(http_url->path, http_url->enc_query, NULL);
 	conn->http_ssl = http_url->have_ssl;
+	if (http_url->user != NULL) {
+		conn->http_user = i_strdup(http_url->user);
+		/* allow empty password */
+		conn->http_password = i_strdup(http_url->password != NULL ? http_url->password : "");
+	}
+
 	conn->debug = debug;
 
 	if (solr_http_client == NULL) {
-		memset(&http_set, 0, sizeof(http_set));
+		i_zero(&http_set);
 		http_set.max_idle_time_msecs = 5*1000;
 		http_set.max_parallel_connections = 1;
 		http_set.max_pipelined_requests = 1;
 		http_set.max_redirects = 1;
 		http_set.max_attempts = 3;
 		http_set.debug = debug;
+		http_set.connect_timeout_msecs = 5*1000;
+		http_set.request_timeout_msecs = 60*1000;
 		solr_http_client = http_client_init(&http_set);
 	}
 
@@ -140,11 +151,16 @@ int solr_connection_init(const char *url, bool debug,
 	return 0;
 }
 
-void solr_connection_deinit(struct solr_connection *conn)
+void solr_connection_deinit(struct solr_connection **_conn)
 {
+	struct solr_connection *conn = *_conn;
+
+	*_conn = NULL;
 	XML_ParserFree(conn->xml_parser);
 	i_free(conn->http_host);
 	i_free(conn->http_base_url);
+	i_free(conn->http_user);
+	i_free(conn->http_password);
 	i_free(conn);
 }
 
@@ -232,15 +248,15 @@ solr_result_get(struct solr_lookup_xml_context *ctx, const char *box_id)
 	return result;
 }
 
-static void solr_lookup_add_doc(struct solr_lookup_xml_context *ctx)
+static int solr_lookup_add_doc(struct solr_lookup_xml_context *ctx)
 {
 	struct fts_score_map *score;
 	struct solr_result *result;
 	const char *box_id;
 
 	if (ctx->uid == 0) {
-		i_error("fts_solr: Query didn't return uid");
-		return;
+		i_error("fts_solr: uid missing from inside doc");
+		return -1;
 	}
 
 	if (ctx->mailbox == NULL) {
@@ -260,17 +276,23 @@ static void solr_lookup_add_doc(struct solr_lookup_xml_context *ctx)
 	}
 	result = solr_result_get(ctx, box_id);
 
-	seq_range_array_add(&result->uids, ctx->uid);
-	if (ctx->score != 0) {
+	if (seq_range_array_add(&result->uids, ctx->uid)) {
+		/* duplicate result */
+	} else if (ctx->score != 0) {
 		score = array_append_space(&result->scores);
 		score->uid = ctx->uid;
 		score->score = ctx->score;
 	}
+	return 0;
 }
 
 static void solr_lookup_xml_end(void *context, const char *name ATTR_UNUSED)
 {
 	struct solr_lookup_xml_context *ctx = context;
+	int ret;
+
+	if (ctx->content_state == SOLR_XML_CONTENT_STATE_ERROR)
+		return;
 
 	i_assert(ctx->depth >= (int)ctx->state);
 
@@ -282,13 +304,17 @@ static void solr_lookup_xml_end(void *context, const char *name ATTR_UNUSED)
 	}
 
 	if (ctx->depth == (int)ctx->state) {
+		ret = 0;
 		if (ctx->state == SOLR_XML_RESPONSE_STATE_DOC) {
 			T_BEGIN {
-				solr_lookup_add_doc(ctx);
+				ret = solr_lookup_add_doc(ctx);
 			} T_END;
 		}
 		ctx->state--;
-		ctx->content_state = SOLR_XML_CONTENT_STATE_NONE;
+		if (ret < 0)
+			ctx->content_state = SOLR_XML_CONTENT_STATE_ERROR;
+		else
+			ctx->content_state = SOLR_XML_CONTENT_STATE_NONE;
 	}
 	ctx->depth--;
 }
@@ -319,8 +345,11 @@ static void solr_lookup_xml_data(void *context, const char *str, int len)
 	case SOLR_XML_CONTENT_STATE_NONE:
 		break;
 	case SOLR_XML_CONTENT_STATE_UID:
-		if (uint32_parse(str, len, &ctx->uid) < 0)
-			i_error("fts_solr: received invalid uid");
+		if (uint32_parse(str, len, &ctx->uid) < 0 || ctx->uid == 0) {
+			i_error("fts_solr: received invalid uid '%s'",
+				t_strndup(str, len));
+			ctx->content_state = SOLR_XML_CONTENT_STATE_ERROR;
+		}
 		break;
 	case SOLR_XML_CONTENT_STATE_SCORE:
 		T_BEGIN {
@@ -344,6 +373,8 @@ static void solr_lookup_xml_data(void *context, const char *str, int len)
 	case SOLR_XML_CONTENT_STATE_UIDVALIDITY:
 		if (uint32_parse(str, len, &ctx->uidvalidity) < 0)
 			i_error("fts_solr: received invalid uidvalidity");
+		break;
+	case SOLR_XML_CONTENT_STATE_ERROR:
 		break;
 	}
 }
@@ -377,7 +408,8 @@ solr_connection_select_response(const struct http_response *response,
 				struct solr_connection *conn)
 {
 	if (response->status / 100 != 2) {
-		i_error("fts_solr: Lookup failed: %s", response->reason);
+		i_error("fts_solr: Lookup failed: %s",
+			http_response_get_message(response));
 		conn->request_status = -1;
 		return;
 	}
@@ -390,8 +422,8 @@ solr_connection_select_response(const struct http_response *response,
 
 	i_stream_ref(response->payload);
 	conn->payload = response->payload;
-	conn->io = io_add(i_stream_get_fd(response->payload), IO_READ,
-			  solr_connection_payload_input, conn);
+	conn->io = io_add_istream(response->payload,
+				  solr_connection_payload_input, conn);
 	solr_connection_payload_input(conn);
 }
 
@@ -403,9 +435,7 @@ int solr_connection_select(struct solr_connection *conn, const char *query,
 	const char *url;
 	int parse_ret;
 
-	i_assert(!conn->posting);
-
-	memset(&solr_lookup_context, 0, sizeof(solr_lookup_context));
+	i_zero(&solr_lookup_context);
 	solr_lookup_context.result_pool = pool;
 	hash_table_create(&solr_lookup_context.mailboxes, default_pool, 0,
 			  str_hash, strcmp);
@@ -424,15 +454,18 @@ int solr_connection_select(struct solr_connection *conn, const char *query,
 	http_req = http_client_request(solr_http_client, "GET",
 				       conn->http_host, url,
 				       solr_connection_select_response, conn);
+	if (conn->http_user != NULL) {
+		http_client_request_set_auth_simple(http_req, conn->http_user, conn->http_password);
+	}
 	http_client_request_set_port(http_req, conn->http_port);
 	http_client_request_set_ssl(http_req, conn->http_ssl);
-	http_client_request_add_header(http_req, "Content-Type", "text/xml");
 	http_client_request_submit(http_req);
 
 	conn->request_status = 0;
 	http_client_wait(solr_http_client);
 
-	if (conn->request_status < 0)
+	if (conn->request_status < 0 ||
+	    solr_lookup_context.content_state == SOLR_XML_CONTENT_STATE_ERROR)
 		return -1;
 
 	parse_ret = solr_xml_parse(conn, "", 0, TRUE);
@@ -447,17 +480,10 @@ static void
 solr_connection_update_response(const struct http_response *response,
 				struct solr_connection *conn)
 {
-	if (response == NULL) {
-		/* request failed */
-		i_error("fts_solr: HTTP POST request failed");
-		conn->request_status = -1;
-		return;
-	}
-
 	if (response->status / 100 != 2) {
-		i_error("fts_solr: Indexing failed: %s", response->reason);
+		i_error("fts_solr: Indexing failed: %s",
+			http_response_get_message(response));
 		conn->request_status = -1;
-		return;
 	}
 }
 
@@ -472,6 +498,9 @@ solr_connection_post_request(struct solr_connection *conn)
 	http_req = http_client_request(solr_http_client, "POST",
 				       conn->http_host, url,
 				       solr_connection_update_response, conn);
+	if (conn->http_user != NULL) {
+		http_client_request_set_auth_simple(http_req, conn->http_user, conn->http_password);
+	}
 	http_client_request_set_port(http_req, conn->http_port);
 	http_client_request_set_ssl(http_req, conn->http_ssl);
 	http_client_request_add_header(http_req, "Content-Type", "text/xml");
@@ -502,20 +531,24 @@ void solr_connection_post_more(struct solr_connection_post *post,
 	if (post->failed)
 		return;
 
-	if (http_client_request_send_payload(&post->http_req, data, size) != 0 &&
-	    conn->request_status < 0)
+	if (conn->request_status == 0)
+		(void)http_client_request_send_payload(&post->http_req, data, size);
+	if (conn->request_status < 0)
 		post->failed = TRUE;
 }
 
-int solr_connection_post_end(struct solr_connection_post *post)
+int solr_connection_post_end(struct solr_connection_post **_post)
 {
+	struct solr_connection_post *post = *_post;
 	struct solr_connection *conn = post->conn;
 	int ret = post->failed ? -1 : 0;
 
 	i_assert(conn->posting);
 
+	*_post = NULL;
+
 	if (!post->failed) {
-		if (http_client_request_finish_payload(&post->http_req) <= 0 ||
+		if (http_client_request_finish_payload(&post->http_req) < 0 ||
 			conn->request_status < 0) {
 			ret = -1;
 		}

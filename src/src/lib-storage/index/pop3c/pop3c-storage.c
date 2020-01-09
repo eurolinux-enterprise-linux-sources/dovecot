@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -8,7 +8,6 @@
 #include "mailbox-list-private.h"
 #include "index-mail.h"
 #include "pop3c-client.h"
-#include "pop3c-settings.h"
 #include "pop3c-sync.h"
 #include "pop3c-storage.h"
 
@@ -31,17 +30,17 @@ static struct mail_storage *pop3c_storage_alloc(void)
 
 static int
 pop3c_storage_create(struct mail_storage *_storage,
-		     struct mail_namespace *ns ATTR_UNUSED,
+		     struct mail_namespace *ns,
 		     const char **error_r)
 {
 	struct pop3c_storage *storage = (struct pop3c_storage *)_storage;
 
-	storage->set = mail_storage_get_driver_settings(_storage);
+	storage->set = mail_namespace_get_driver_settings(ns, _storage);
 	if (storage->set->pop3c_host[0] == '\0') {
 		*error_r = "missing pop3c_host";
 		return -1;
 	}
-	if (storage->set->pop3c_password == '\0') {
+	if (storage->set->pop3c_password[0] == '\0') {
 		*error_r = "missing pop3c_password";
 		return -1;
 	}
@@ -56,13 +55,14 @@ pop3c_client_create_from_set(struct mail_storage *storage,
 	struct pop3c_client_settings client_set;
 	string_t *str;
 
-	memset(&client_set, 0, sizeof(client_set));
+	i_zero(&client_set);
 	client_set.host = set->pop3c_host;
 	client_set.port = set->pop3c_port;
 	client_set.username = set->pop3c_user;
 	client_set.master_user = set->pop3c_master_user;
 	client_set.password = set->pop3c_password;
 	client_set.dns_client_socket_path =
+		storage->user->set->base_dir[0] == '\0' ? "" :
 		t_strconcat(storage->user->set->base_dir, "/",
 			    DNS_CLIENT_SOCKET_NAME, NULL);
 	str = t_str_new(128);
@@ -175,7 +175,7 @@ static int pop3c_mailbox_open(struct mailbox *box)
 	mbox->client = pop3c_client_create_from_set(box->storage,
 						    mbox->storage->set);
 	pop3c_client_login(mbox->client, pop3c_login_callback, mbox);
-	pop3c_client_run(mbox->client);
+	pop3c_client_wait_one(mbox->client);
 	return mbox->logged_in ? 0 : -1;
 }
 
@@ -308,7 +308,8 @@ struct mail_storage pop3c_storage = {
 		pop3c_storage_get_list_settings,
 		NULL,
 		pop3c_mailbox_alloc,
-		NULL
+		NULL,
+		NULL,
 	}
 };
 
@@ -343,7 +344,7 @@ struct mailbox pop3c_mailbox = {
 		index_transaction_commit,
 		index_transaction_rollback,
 		NULL,
-		index_mail_alloc,
+		pop3c_mail_alloc,
 		index_storage_search_init,
 		index_storage_search_deinit,
 		index_storage_search_next_nonblock,

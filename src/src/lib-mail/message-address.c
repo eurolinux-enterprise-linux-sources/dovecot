@@ -1,7 +1,8 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
+#include "strescape.h"
 #include "message-parser.h"
 #include "message-address.h"
 #include "rfc822-parser.h"
@@ -23,13 +24,56 @@ static void add_address(struct message_address_parser_context *ctx)
 	addr = p_new(ctx->pool, struct message_address, 1);
 
 	memcpy(addr, &ctx->addr, sizeof(ctx->addr));
-	memset(&ctx->addr, 0, sizeof(ctx->addr));
+	i_zero(&ctx->addr);
 
 	if (ctx->first_addr == NULL)
 		ctx->first_addr = addr;
 	else
 		ctx->last_addr->next = addr;
 	ctx->last_addr = addr;
+}
+
+/* quote with "" and escape all '\', '"' and "'" characters if need */
+static void str_append_maybe_escape(string_t *dest, const char *cstr, bool escape_dot)
+{
+	const char *p;
+
+	/* see if we need to quote it */
+	for (p = cstr; *p != '\0'; p++) {
+		if (!IS_ATEXT(*p) && (escape_dot || *p != '.'))
+			break;
+	}
+
+	if (*p == '\0') {
+		str_append_data(dest, cstr, (size_t) (p - cstr));
+		return;
+	}
+
+	/* see if we need to escape it */
+	for (p = cstr; *p != '\0'; p++) {
+		if (IS_ESCAPED_CHAR(*p))
+			break;
+	}
+
+	if (*p == '\0') {
+		/* only quote */
+		str_append_c(dest, '"');
+		str_append_data(dest, cstr, (size_t) (p - cstr));
+		str_append_c(dest, '"');
+		return;
+	}
+
+	/* quote and escape */
+	str_append_c(dest, '"');
+	str_append_data(dest, cstr, (size_t) (p - cstr));
+
+	for (; *p != '\0'; p++) {
+		if (IS_ESCAPED_CHAR(*p))
+			str_append_c(dest, '\\');
+		str_append_c(dest, *p);
+	}
+
+	str_append_c(dest, '"');
 }
 
 static int parse_local_part(struct message_address_parser_context *ctx)
@@ -40,7 +84,7 @@ static int parse_local_part(struct message_address_parser_context *ctx)
 	   local-part      = dot-atom / quoted-string / obs-local-part
 	   obs-local-part  = word *("." word)
 	*/
-	i_assert(ctx->parser.data != ctx->parser.end);
+	i_assert(ctx->parser.data < ctx->parser.end);
 
 	str_truncate(ctx->str, 0);
 	if (*ctx->parser.data == '"')
@@ -73,7 +117,7 @@ static int parse_domain_list(struct message_address_parser_context *ctx)
 	/* obs-domain-list = "@" domain *(*(CFWS / "," ) [CFWS] "@" domain) */
 	str_truncate(ctx->str, 0);
 	for (;;) {
-		if (ctx->parser.data == ctx->parser.end)
+		if (ctx->parser.data >= ctx->parser.end)
 			return 0;
 
 		if (*ctx->parser.data != '@')
@@ -107,19 +151,27 @@ static int parse_angle_addr(struct message_address_parser_context *ctx)
 
 	if (*ctx->parser.data == '@') {
 		if (parse_domain_list(ctx) <= 0 || *ctx->parser.data != ':') {
-			ctx->addr.route = "INVALID_ROUTE";
-			return -1;
+			if (ctx->fill_missing)
+				ctx->addr.route = "INVALID_ROUTE";
+			if (ctx->parser.data >= ctx->parser.end)
+				return -1;
+			/* try to continue anyway */
+		} else {
+			ctx->parser.data++;
 		}
-		ctx->parser.data++;
 		if ((ret = rfc822_skip_lwsp(&ctx->parser)) <= 0)
 			return ret;
 	}
 
-	if ((ret = parse_local_part(ctx)) <= 0)
-		return ret;
-	if (*ctx->parser.data == '@') {
-		if ((ret = parse_domain(ctx)) <= 0)
+	if (*ctx->parser.data == '>') {
+		/* <> address isn't valid */
+	} else {
+		if ((ret = parse_local_part(ctx)) <= 0)
 			return ret;
+		if (*ctx->parser.data == '@') {
+			if ((ret = parse_domain(ctx)) <= 0)
+				return ret;
+		}
 	}
 
 	if (*ctx->parser.data != '>')
@@ -147,29 +199,54 @@ static int parse_name_addr(struct message_address_parser_context *ctx)
 	}
 	if (parse_angle_addr(ctx) < 0) {
 		/* broken */
-		ctx->addr.domain = "SYNTAX_ERROR";
+		if (ctx->fill_missing)
+			ctx->addr.domain = "SYNTAX_ERROR";
 		ctx->addr.invalid_syntax = TRUE;
 	}
-	return ctx->parser.data != ctx->parser.end;
+	return ctx->parser.data < ctx->parser.end ? 1 : 0;
 }
 
 static int parse_addr_spec(struct message_address_parser_context *ctx)
 {
 	/* addr-spec       = local-part "@" domain */
-	int ret, ret2;
+	int ret, ret2 = -2;
+
+	i_assert(ctx->parser.data < ctx->parser.end);
 
 	str_truncate(ctx->parser.last_comment, 0);
 
+	bool quoted_string = *ctx->parser.data == '"';
 	ret = parse_local_part(ctx);
-	if (ret != 0 && *ctx->parser.data == '@') {
+	if (ret <= 0) {
+		/* end of input or parsing local-part failed */
+		ctx->addr.invalid_syntax = TRUE;
+	}
+	if (ret != 0 && ctx->parser.data < ctx->parser.end &&
+	    *ctx->parser.data == '@') {
 		ret2 = parse_domain(ctx);
 		if (ret2 <= 0)
 			ret = ret2;
 	}
 
-	if (str_len(ctx->parser.last_comment) > 0) {
-		ctx->addr.name =
-			p_strdup(ctx->pool, str_c(ctx->parser.last_comment));
+	if (str_len(ctx->parser.last_comment) > 0)
+		ctx->addr.name = p_strdup(ctx->pool, str_c(ctx->parser.last_comment));
+	else if (ret2 == -2) {
+		/* So far we've read user without @domain and without
+		   (Display Name). We'll assume that a single "user" (already
+		   read into addr.mailbox) is a mailbox, but if it's followed
+		   by anything else it's a display-name. */
+		str_append_c(ctx->str, ' ');
+		size_t orig_str_len = str_len(ctx->str);
+		(void)rfc822_parse_phrase(&ctx->parser, ctx->str);
+		if (str_len(ctx->str) != orig_str_len) {
+			ctx->addr.mailbox = NULL;
+			ctx->addr.name = p_strdup(ctx->pool, str_c(ctx->str));
+		} else {
+			if (!quoted_string)
+				ctx->addr.domain = "";
+		}
+		ctx->addr.invalid_syntax = TRUE;
+		ret = -1;
 	}
 	return ret;
 }
@@ -180,7 +257,7 @@ static void add_fixed_address(struct message_address_parser_context *ctx)
 		ctx->addr.mailbox = !ctx->fill_missing ? "" : "MISSING_MAILBOX";
 		ctx->addr.invalid_syntax = TRUE;
 	}
-	if (ctx->addr.domain == NULL) {
+	if (ctx->addr.domain == NULL || ctx->addr.domain[0] == '\0') {
 		ctx->addr.domain = !ctx->fill_missing ? "" : "MISSING_DOMAIN";
 		ctx->addr.invalid_syntax = TRUE;
 	}
@@ -198,6 +275,11 @@ static int parse_mailbox(struct message_address_parser_context *ctx)
 		/* nope, should be addr-spec */
 		ctx->parser.data = start;
 		ret = parse_addr_spec(ctx);
+		if (ctx->addr.invalid_syntax && ctx->addr.name == NULL &&
+		    ctx->addr.mailbox != NULL && ctx->addr.domain == NULL) {
+			ctx->addr.name = ctx->addr.mailbox;
+			ctx->addr.mailbox = NULL;
+		}
 	}
 
 	if (ret < 0)
@@ -233,10 +315,10 @@ static int parse_group(struct message_address_parser_context *ctx)
 			/* mailbox-list    =
 			   	(mailbox *("," mailbox)) / obs-mbox-list */
 			if (parse_mailbox(ctx) <= 0) {
-				ret = -1;
-				break;
+				/* broken mailbox - try to continue anyway. */
 			}
-			if (*ctx->parser.data != ',')
+			if (ctx->parser.data >= ctx->parser.end ||
+			    *ctx->parser.data != ',')
 				break;
 			ctx->parser.data++;
 			if (rfc822_skip_lwsp(&ctx->parser) <= 0) {
@@ -246,7 +328,8 @@ static int parse_group(struct message_address_parser_context *ctx)
 		}
 	}
 	if (ret >= 0) {
-		if (*ctx->parser.data != ';')
+		if (ctx->parser.data >= ctx->parser.end ||
+		    *ctx->parser.data != ';')
 			ret = -1;
 		else {
 			ctx->parser.data++;
@@ -281,10 +364,12 @@ static int parse_address_list(struct message_address_parser_context *ctx,
 	int ret = 0;
 
 	/* address-list    = (address *("," address)) / obs-addr-list */
-	while (max_addresses-- > 0) {
+	while (max_addresses > 0) {
+		max_addresses--;
 		if ((ret = parse_address(ctx)) == 0)
 			break;
-		if (*ctx->parser.data != ',') {
+		if (ctx->parser.data >= ctx->parser.end ||
+		    *ctx->parser.data != ',') {
 			ret = -1;
 			break;
 		}
@@ -306,7 +391,7 @@ message_address_parse_real(pool_t pool, const unsigned char *data, size_t size,
 {
 	struct message_address_parser_context ctx;
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 
 	rfc822_parser_init(&ctx.parser, data, size, t_str_new(128));
 	ctx.pool = pool;
@@ -315,9 +400,10 @@ message_address_parse_real(pool_t pool, const unsigned char *data, size_t size,
 
 	if (rfc822_skip_lwsp(&ctx.parser) <= 0) {
 		/* no addresses */
-		return NULL;
+	} else {
+		(void)parse_address_list(&ctx, max_addresses);
 	}
-	(void)parse_address_list(&ctx, max_addresses);
+	rfc822_parser_deinit(&ctx.parser);
 	return ctx.first_addr;
 }
 
@@ -340,6 +426,7 @@ message_address_parse(pool_t pool, const unsigned char *data, size_t size,
 
 void message_address_write(string_t *str, const struct message_address *addr)
 {
+	const char *tmp;
 	bool first = TRUE, in_group = FALSE;
 
 	/* a) mailbox@domain
@@ -356,8 +443,19 @@ void message_address_write(string_t *str, const struct message_address *addr)
 			if (!in_group) {
 				/* beginning of group. mailbox is the group
 				   name, others are NULL. */
-				if (addr->mailbox != NULL)
-					str_append(str, addr->mailbox);
+				if (addr->mailbox != NULL && *addr->mailbox != '\0') {
+					/* check for MIME encoded-word */
+					if (strstr(addr->mailbox, "=?") != NULL)
+						/* MIME encoded-word MUST NOT appear within a 'quoted-string'
+						   so escaping and quoting of phrase is not possible, instead
+						   use obsolete RFC822 phrase syntax which allow spaces */
+						str_append(str, addr->mailbox);
+					else
+						str_append_maybe_escape(str, addr->mailbox, TRUE);
+				} else {
+					/* empty group name needs to be quoted */
+					str_append(str, "\"\"");
+				}
 				str_append(str, ": ");
 				first = TRUE;
 			} else {
@@ -365,36 +463,50 @@ void message_address_write(string_t *str, const struct message_address *addr)
 				i_assert(addr->mailbox == NULL);
 
 				/* cut out the ", " */
-				str_truncate(str, str_len(str)-2);
+				tmp = str_c(str)+str_len(str)-2;
+				i_assert((tmp[0] == ',' || tmp[0] == ':') && tmp[1] == ' ');
+				if (tmp[0] == ',' && tmp[1] == ' ')
+					str_truncate(str, str_len(str)-2);
+				else if (tmp[0] == ':' && tmp[1] == ' ')
+					str_truncate(str, str_len(str)-1);
 				str_append_c(str, ';');
 			}
 
 			in_group = !in_group;
-		} else if ((addr->name == NULL || *addr->name == '\0') &&
-			   addr->route == NULL) {
-			/* no name and no route. use only mailbox@domain */
-			i_assert(addr->mailbox != NULL);
-
-			str_append(str, addr->mailbox);
-			str_append_c(str, '@');
-			str_append(str, addr->domain);
 		} else {
-			/* name and/or route. use full <mailbox@domain> Name */
+			/* "Display Name" <mailbox@domain> */
 			i_assert(addr->mailbox != NULL);
 
 			if (addr->name != NULL) {
-				str_append(str, addr->name);
-				str_append_c(str, ' ');
+				/* check for MIME encoded-word */
+				if (strstr(addr->name, "=?") != NULL)
+					/* MIME encoded-word MUST NOT appear within a 'quoted-string'
+					   so escaping and quoting of phrase is not possible, instead
+					   use obsolete RFC822 phrase syntax which allow spaces */
+					str_append(str, addr->name);
+				else
+					str_append_maybe_escape(str, addr->name, TRUE);
 			}
-			str_append_c(str, '<');
-			if (addr->route != NULL) {
-				str_append(str, addr->route);
-				str_append_c(str, ':');
+			if (addr->route != NULL ||
+			    addr->mailbox[0] != '\0' ||
+			    addr->domain[0] != '\0') {
+				if (addr->name != NULL && addr->name[0] != '\0')
+					str_append_c(str, ' ');
+				str_append_c(str, '<');
+				if (addr->route != NULL) {
+					str_append(str, addr->route);
+					str_append_c(str, ':');
+				}
+				if (addr->mailbox[0] == '\0')
+					str_append(str, "\"\"");
+				else
+					str_append_maybe_escape(str, addr->mailbox, FALSE);
+				if (addr->domain[0] != '\0') {
+					str_append_c(str, '@');
+					str_append(str, addr->domain);
+				}
+				str_append_c(str, '>');
 			}
-			str_append(str, addr->mailbox);
-			str_append_c(str, '@');
-			str_append(str, addr->domain);
-			str_append_c(str, '>');
 		}
 
 		addr = addr->next;
@@ -417,3 +529,30 @@ bool message_header_is_address(const char *hdr_name)
 	}
 	return FALSE;
 }
+
+void message_detail_address_parse(const char *delimiter_string,
+				  const char *address, const char **username_r,
+				  const char **detail_r)
+{
+	const char *p, *domain;
+
+	*username_r = address;
+	*detail_r = "";
+
+	if (*delimiter_string == '\0')
+		return;
+
+	domain = strchr(address, '@');
+	p = strstr(address, delimiter_string);
+	if (p != NULL && (domain == NULL || p < domain)) {
+		/* user+detail@domain */
+		*username_r = t_strdup_until(*username_r, p);
+		if (domain == NULL)
+			*detail_r = p+strlen(delimiter_string);
+		else {
+			*detail_r = t_strdup_until(p+strlen(delimiter_string), domain);
+			*username_r = t_strconcat(*username_r, domain, NULL);
+		}
+	}
+}
+

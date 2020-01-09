@@ -1,13 +1,10 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "array.h"
 #include "password-scheme.h"
 #include "auth-worker-server.h"
-#include "passdb-template.h"
 #include "passdb.h"
-
-#include <stdlib.h>
 
 static ARRAY(struct passdb_module_interface *) passdb_interfaces;
 static ARRAY(struct passdb_module *) passdb_modules;
@@ -78,11 +75,11 @@ bool passdb_get_credentials(struct auth_request *auth_request,
 			      credentials_r, size_r, &error);
 	if (ret <= 0) {
 		if (ret < 0) {
-			auth_request_log_error(auth_request, "password",
+			auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 				"Password data is not valid for scheme %s: %s",
 				input_scheme, error);
 		} else {
-			auth_request_log_error(auth_request, "password",
+			auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 				"Unknown scheme %s", input_scheme);
 		}
 		return FALSE;
@@ -105,7 +102,7 @@ bool passdb_get_credentials(struct auth_request *auth_request,
 				error = t_strdup_printf("%s (input: %s)",
 							error, input);
 			}
-			auth_request_log_info(auth_request, "password",
+			auth_request_log_info(auth_request, AUTH_SUBSYS_DB,
 					      "%s", error);
 			return FALSE;
 		}
@@ -120,13 +117,13 @@ bool passdb_get_credentials(struct auth_request *auth_request,
 					       auth_request->realm, NULL);
 		}
 		if (auth_request->set->debug_passwords) {
-			auth_request_log_debug(auth_request, "password",
+			auth_request_log_debug(auth_request, AUTH_SUBSYS_DB,
 				"Generating %s from user '%s', password '%s'",
 				wanted_scheme, username, plaintext);
 		}
 		if (!password_generate(plaintext, username,
 				       wanted_scheme, credentials_r, size_r)) {
-			auth_request_log_error(auth_request, "password",
+			auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 				"Requested unknown scheme %s", wanted_scheme);
 			return FALSE;
 		}
@@ -146,6 +143,9 @@ void passdb_handle_credentials(enum passdb_result result,
 	if (result != PASSDB_RESULT_OK) {
 		callback(result, NULL, 0, auth_request);
 		return;
+	} else if (auth_fields_exists(auth_request->extra_fields, "noauthenticate")) {
+		callback(PASSDB_RESULT_NEXT, NULL, 0, auth_request);
+		return;
 	}
 
 	if (password != NULL) {
@@ -155,8 +155,12 @@ void passdb_handle_credentials(enum passdb_result result,
 	} else if (*auth_request->credentials_scheme == '\0') {
 		/* We're doing a passdb lookup (not authenticating).
 		   Pass through a NULL password without an error. */
+	} else if (auth_request->delayed_credentials != NULL) {
+		/* We already have valid credentials from an earlier
+		   passdb lookup. auth_request_lookup_credentials_finish()
+		   will use them. */
 	} else {
-		auth_request_log_info(auth_request, "password",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_DB,
 			"Requested %s scheme, but we have a NULL password",
 			auth_request->credentials_scheme);
 		result = PASSDB_RESULT_SCHEME_NOT_AVAILABLE;
@@ -219,12 +223,19 @@ passdb_preinit(pool_t pool, const struct auth_passdb_settings *set)
 	passdb->id = ++auth_passdb_id;
 	passdb->iface = *iface;
 	passdb->args = p_strdup(pool, set->args);
+	if (*set->mechanisms == '\0') {
+		passdb->mechanisms = NULL;
+	} else if (strcasecmp(set->mechanisms, "none") == 0) {
+		passdb->mechanisms = (const char *const[]){NULL};
+	} else {
+		passdb->mechanisms = (const char* const*)p_strsplit_spaces(pool, set->mechanisms, " ,");
+	}
 
-	passdb->default_fields_tmpl =
-		passdb_template_build(pool, set->default_fields);
-	passdb->override_fields_tmpl =
-		passdb_template_build(pool, set->override_fields);
-
+	if (*set->username_filter == '\0') {
+		passdb->username_filter = NULL;
+	} else {
+		passdb->username_filter = (const char* const*)p_strsplit_spaces(pool, set->username_filter, " ,");
+	}
 	array_append(&passdb_modules, &passdb, 1);
 	return passdb;
 }
@@ -234,9 +245,6 @@ void passdb_init(struct passdb_module *passdb)
 	if (passdb->iface.init != NULL && passdb->init_refcount == 0)
 		passdb->iface.init(passdb);
 	passdb->init_refcount++;
-
-	i_assert(passdb->default_pass_scheme != NULL ||
-		 passdb->cache_key == NULL);
 }
 
 void passdb_deinit(struct passdb_module *passdb)
@@ -259,7 +267,7 @@ void passdb_deinit(struct passdb_module *passdb)
 	passdb->iface = passdb_iface_deinit;
 }
 
-void passdbs_generate_md5(unsigned char md5[MD5_RESULTLEN])
+void passdbs_generate_md5(unsigned char md5[STATIC_ARRAY MD5_RESULTLEN])
 {
 	struct md5_context ctx;
 	struct passdb_module *const *passdbs;
@@ -288,6 +296,7 @@ extern struct passdb_module_interface passdb_ldap;
 extern struct passdb_module_interface passdb_sql;
 extern struct passdb_module_interface passdb_sia;
 extern struct passdb_module_interface passdb_static;
+extern struct passdb_module_interface passdb_oauth2;
 
 void passdbs_init(void)
 {
@@ -305,6 +314,7 @@ void passdbs_init(void)
 	passdb_register_module(&passdb_sql);
 	passdb_register_module(&passdb_sia);
 	passdb_register_module(&passdb_static);
+	passdb_register_module(&passdb_oauth2);
 }
 
 void passdbs_deinit(void)

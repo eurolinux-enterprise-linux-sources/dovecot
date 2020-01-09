@@ -17,10 +17,21 @@ enum http_request_parse_error {
 	HTTP_REQUEST_PARSE_ERROR_PAYLOAD_TOO_LARGE   /* payload too large (fatal) */
 };
 
+enum http_request_parse_flags {
+	/* Strictly adhere to the HTTP protocol specification */
+	HTTP_REQUEST_PARSE_FLAG_STRICT = BIT(0)
+};
+
 struct http_request_parser *
 http_request_parser_init(struct istream *input,
-	const struct http_request_limits *limits) ATTR_NULL(2);
+	const struct http_request_limits *limits,
+	enum http_request_parse_flags flags) ATTR_NULL(2);
 void http_request_parser_deinit(struct http_request_parser **_parser);
+
+int http_request_parse_finish_payload(
+	struct http_request_parser *parser,
+	enum http_request_parse_error *error_code_r,
+	const char **error_r);
 
 int http_request_parse_next(struct http_request_parser *parser,
 			    pool_t pool, struct http_request *request,

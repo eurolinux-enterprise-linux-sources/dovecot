@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -24,7 +24,7 @@ cmd_altmove_box(struct doveadm_mail_cmd_context *ctx,
 	enum modify_type modify_type =
 		!reverse ? MODIFY_ADD : MODIFY_REMOVE;
 
-	if (doveadm_mail_iter_init(ctx, info, search_args, 0, NULL,
+	if (doveadm_mail_iter_init(ctx, info, search_args, 0, NULL, FALSE,
 				   &iter) < 0)
 		return -1;
 
@@ -45,7 +45,7 @@ ns_purge(struct doveadm_mail_cmd_context *ctx, struct mail_namespace *ns,
 {
 	if (mail_storage_purge(storage) < 0) {
 		i_error("Purging namespace '%s' failed: %s", ns->prefix,
-			mail_storage_get_last_error(storage, NULL));
+			mail_storage_get_last_internal_error(storage, NULL));
 		doveadm_mail_failed_storage(ctx, storage);
 		return -1;
 	}
@@ -150,6 +150,13 @@ static struct doveadm_mail_cmd_context *cmd_altmove_alloc(void)
 	return &ctx->ctx;
 }
 
-struct doveadm_mail_cmd cmd_altmove = {
-	cmd_altmove_alloc, "altmove", "[-r] <search query>"
+struct doveadm_cmd_ver2 doveadm_cmd_altmove_ver2 = {
+	.name = "altmove",
+	.mail_cmd = cmd_altmove_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "[-r] <search query>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('r', "reverse", CMD_PARAM_BOOL, 0)
+DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

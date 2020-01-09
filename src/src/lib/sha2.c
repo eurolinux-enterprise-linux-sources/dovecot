@@ -175,8 +175,9 @@ static const uint64_t sha512_k[80] =
 
 /* SHA-256 functions */
 
-static void sha256_transf(struct sha256_ctx *ctx, const unsigned char *data,
-			  size_t block_nb)
+static void ATTR_UNSIGNED_WRAPS
+sha256_transf(struct sha256_ctx *ctx, const unsigned char *data,
+	      size_t block_nb)
 {
 	uint32_t w[64];
 	uint32_t wv[8];
@@ -265,7 +266,7 @@ void sha256_loop(struct sha256_ctx *ctx, const void *data,
 }
 
 void sha256_result(struct sha256_ctx *ctx,
-		   unsigned char digest[SHA256_RESULTLEN])
+		   unsigned char digest[STATIC_ARRAY SHA256_RESULTLEN])
 {
 	size_t block_nb;
 	size_t pm_len;
@@ -290,7 +291,7 @@ void sha256_result(struct sha256_ctx *ctx,
 }
 
 void sha256_get_digest(const void *data, size_t size,
-		       unsigned char digest[SHA256_RESULTLEN])
+		       unsigned char digest[STATIC_ARRAY SHA256_RESULTLEN])
 {
 	struct sha256_ctx ctx;
 
@@ -301,8 +302,9 @@ void sha256_get_digest(const void *data, size_t size,
 
 /* SHA-512 functions */
 
-static void sha512_transf(struct sha512_ctx *ctx, const unsigned char *data,
-			  size_t block_nb)
+static void ATTR_UNSIGNED_WRAPS
+sha512_transf(struct sha512_ctx *ctx, const unsigned char *data,
+	      size_t block_nb)
 {
 	uint64_t w[80];
 	uint64_t wv[8];
@@ -390,7 +392,7 @@ void sha512_loop(struct sha512_ctx *ctx, const void *data,
 }
 
 void sha512_result(struct sha512_ctx *ctx,
-		   unsigned char digest[SHA512_RESULTLEN])
+		   unsigned char digest[STATIC_ARRAY SHA512_RESULTLEN])
 {
 	unsigned int block_nb;
 	unsigned int pm_len;
@@ -415,7 +417,7 @@ void sha512_result(struct sha512_ctx *ctx,
 }
 
 void sha512_get_digest(const void *data, size_t size,
-		       unsigned char digest[SHA512_RESULTLEN])
+		       unsigned char digest[STATIC_ARRAY SHA512_RESULTLEN])
 {
 	struct sha512_ctx ctx;
 

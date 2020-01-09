@@ -1,6 +1,8 @@
 #ifndef ACL_API_H
 #define ACL_API_H
 
+#include <sys/stat.h>
+
 struct mailbox_list;
 struct mail_storage;
 struct mailbox;
@@ -79,6 +81,7 @@ struct acl_rights {
 	/* These rights are global for all users */
 	unsigned int global:1;
 };
+ARRAY_DEFINE_TYPE(acl_rights, struct acl_rights);
 
 struct acl_rights_update {
 	struct acl_rights rights;

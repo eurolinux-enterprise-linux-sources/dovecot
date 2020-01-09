@@ -17,6 +17,11 @@ enum http_message_parse_error {
 	                                              (fatal) */
 };
 
+enum http_message_parse_flags {
+	/* Strictly adhere to the HTTP protocol specification */
+	HTTP_MESSAGE_PARSE_FLAG_STRICT = BIT(0)
+};
+
 struct http_message {
 	pool_t pool;
 
@@ -40,6 +45,7 @@ struct http_message_parser {
 
 	struct http_header_limits header_limits;
 	uoff_t max_payload_size;
+	enum http_message_parse_flags flags;
 
 	const unsigned char *cur, *end;
 
@@ -55,10 +61,13 @@ struct http_message_parser {
 
 void http_message_parser_init(struct http_message_parser *parser,
 	struct istream *input, const struct http_header_limits *hdr_limits,
-	uoff_t max_payload_size) ATTR_NULL(3);
+	uoff_t max_payload_size, enum http_message_parse_flags flags)
+	ATTR_NULL(3);
 void http_message_parser_deinit(struct http_message_parser *parser);
 void http_message_parser_restart(struct http_message_parser *parser,
 	pool_t pool);
+
+pool_t http_message_parser_get_pool(struct http_message_parser *parser);
 
 int http_message_parse_finish_payload(struct http_message_parser *parser);
 int http_message_parse_version(struct http_message_parser *parser);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "eacces-error.h"
@@ -24,6 +24,7 @@ static void sdbox_file_init_paths(struct sdbox_file *file, const char *fname)
 	i_free(file->file.alt_path);
 	file->file.primary_path =
 		i_strdup_printf("%s/%s", mailbox_get_path(box), fname);
+	file->file.cur_path = file->file.primary_path;
 
 	if (mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_ALT_MAILBOX,
 				&alt_path) > 0)
@@ -44,10 +45,7 @@ struct dbox_file *sdbox_file_init(struct sdbox_mailbox *mbox, uint32_t uid)
 			sdbox_file_init_paths(file, fname);
 			file->uid = uid;
 		} else {
-			file->file.primary_path =
-				i_strdup_printf("%s/%s",
-						mailbox_get_path(&mbox->box),
-						dbox_generate_tmp_filename());
+			sdbox_file_init_paths(file, dbox_generate_tmp_filename());
 		}
 	} T_END;
 	dbox_file_init(&file->file);
@@ -149,20 +147,24 @@ static int sdbox_file_rename_attachments(struct sdbox_file *file)
 	return ret;
 }
 
-int sdbox_file_assign_uid(struct sdbox_file *file, uint32_t uid)
+int sdbox_file_assign_uid(struct sdbox_file *file, uint32_t uid,
+			  bool ignore_if_exists)
 {
-	const char *old_path, *new_fname, *new_path;
+	const char *p, *old_path, *dir, *new_fname, *new_path;
 	struct stat st;
 
 	i_assert(file->uid == 0);
 	i_assert(uid != 0);
 
 	old_path = file->file.cur_path;
-	new_fname = t_strdup_printf(SDBOX_MAIL_FILE_FORMAT, uid);
-	new_path = t_strdup_printf("%s/%s", mailbox_get_path(&file->mbox->box),
-				   new_fname);
+	p = strrchr(old_path, '/');
+	i_assert(p != NULL);
+	dir = t_strdup_until(old_path, p);
 
-	if (stat(new_path, &st) == 0) {
+	new_fname = t_strdup_printf(SDBOX_MAIL_FILE_FORMAT, uid);
+	new_path = t_strdup_printf("%s/%s", dir, new_fname);
+
+	if (!ignore_if_exists && stat(new_path, &st) == 0) {
 		mail_storage_set_critical(&file->file.storage->storage,
 			"sdbox: %s already exists, rebuilding index", new_path);
 		sdbox_set_mailbox_corrupted(&file->mbox->box);
@@ -255,7 +257,8 @@ int sdbox_file_create_fd(struct dbox_file *file, const char *path, bool parents)
 		dir = t_strdup_until(path, p);
 		if (mkdir_parents_chgrp(dir, perm->dir_create_mode,
 					perm->file_create_gid,
-					perm->file_create_gid_origin) < 0) {
+					perm->file_create_gid_origin) < 0 &&
+		   errno != EEXIST) {
 			mail_storage_set_critical(box->storage,
 				"mkdir_parents(%s) failed: %m", dir);
 			return -1;
@@ -300,6 +303,8 @@ int sdbox_file_move(struct dbox_file *file, bool alt_path)
 
 	if (dbox_file_is_in_alt(file) == alt_path)
 		return 0;
+	if (file->alt_path == NULL)
+		return 0;
 
 	if (stat(file->cur_path, &st) < 0 && errno == ENOENT) {
 		/* already expunged/moved by another session */
@@ -307,6 +312,9 @@ int sdbox_file_move(struct dbox_file *file, bool alt_path)
 	}
 
 	dest_path = !alt_path ? file->primary_path : file->alt_path;
+
+	i_assert(dest_path != NULL);
+
 	p = strrchr(dest_path, '/');
 	i_assert(p != NULL);
 	dest_dir = t_strdup_until(dest_path, p);
@@ -321,20 +329,15 @@ int sdbox_file_move(struct dbox_file *file, bool alt_path)
 
 	output = o_stream_create_fd_file(out_fd, 0, FALSE);
 	i_stream_seek(file->input, 0);
-	while ((ret = o_stream_send_istream(output, file->input)) > 0) ;
+	ret = o_stream_send_istream(output, file->input) > 0 ? 0 : -1;
 	if (o_stream_nfinish(output) < 0) {
-		mail_storage_set_critical(storage, "write(%s) failed: %m",
-					  temp_path);
+		mail_storage_set_critical(storage, "write(%s) failed: %s",
+			temp_path, o_stream_get_error(output));
 		ret = -1;
 	} else if (file->input->stream_errno != 0) {
-		errno = file->input->stream_errno;
-		dbox_file_set_syscall_error(file, "ftruncate()");
+		mail_storage_set_critical(storage, "read(%s) failed: %s",
+			temp_path, i_stream_get_error(file->input));
 		ret = -1;
-	} else if (ret < 0) {
-		mail_storage_set_critical(storage,
-			"o_stream_send_istream(%s, %s) "
-			"failed with unknown error",
-			temp_path, file->cur_path);
 	}
 	o_stream_unref(&output);
 
@@ -351,7 +354,7 @@ int sdbox_file_move(struct dbox_file *file, bool alt_path)
 		ret = -1;
 	}
 	if (ret < 0) {
-		(void)unlink(temp_path);
+		i_unlink(temp_path);
 		return -1;
 	}
 	/* preserve the original atime/mtime. this isn't necessary for Dovecot,
@@ -369,14 +372,14 @@ int sdbox_file_move(struct dbox_file *file, bool alt_path)
 	if (rename(temp_path, dest_path) < 0) {
 		mail_storage_set_critical(storage,
 			"rename(%s, %s) failed: %m", temp_path, dest_path);
-		(void)unlink(temp_path);
+		i_unlink_if_exists(temp_path);
 		return -1;
 	}
 	if (storage->set->parsed_fsync_mode != FSYNC_MODE_NEVER) {
 		if (fdatasync_path(dest_dir) < 0) {
 			mail_storage_set_critical(storage,
 				"fdatasync(%s) failed: %m", dest_dir);
-			(void)unlink(dest_path);
+			i_unlink(dest_path);
 			return -1;
 		}
 	}
@@ -384,7 +387,7 @@ int sdbox_file_move(struct dbox_file *file, bool alt_path)
 		dbox_file_set_syscall_error(file, "unlink()");
 		if (errno == EACCES) {
 			/* configuration problem? revert the write */
-			(void)unlink(dest_path);
+			i_unlink(dest_path);
 		}
 		/* who knows what happened to the file. keep both just to be
 		   sure both won't get deleted. */

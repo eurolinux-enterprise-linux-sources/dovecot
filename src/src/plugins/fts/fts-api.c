@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,8 +6,8 @@
 #include "mail-index.h"
 #include "mail-namespace.h"
 #include "mail-storage-private.h"
+#include "mailbox-list-iter.h"
 #include "mail-search.h"
-#include "../virtual/virtual-storage.h"
 #include "fts-api-private.h"
 
 static ARRAY(const struct fts_backend *) backends;
@@ -89,7 +89,7 @@ int fts_backend_get_last_uid(struct fts_backend *backend, struct mailbox *box,
 {
 	struct fts_index_header hdr;
 
-	if (strcmp(box->storage->name, VIRTUAL_STORAGE_NAME) == 0) {
+	if (box->virtual_vfuncs != NULL) {
 		/* virtual mailboxes themselves don't have any indexes,
 		   so catch this call here */
 		if (!fts_index_get_header(box, &hdr))
@@ -198,8 +198,47 @@ int fts_backend_refresh(struct fts_backend *backend)
 	return backend->v.refresh(backend);
 }
 
+int fts_backend_reset_last_uids(struct fts_backend *backend)
+{
+	struct mailbox_list_iterate_context *iter;
+	const struct mailbox_info *info;
+	struct mailbox *box;
+	int ret = 0;
+
+	iter = mailbox_list_iter_init(backend->ns->list, "*",
+				      MAILBOX_LIST_ITER_SKIP_ALIASES |
+				      MAILBOX_LIST_ITER_NO_AUTO_BOXES);
+	while ((info = mailbox_list_iter_next(iter)) != NULL) {
+		if ((info->flags &
+		     (MAILBOX_NONEXISTENT | MAILBOX_NOSELECT)) != 0)
+			continue;
+
+		box = mailbox_alloc(info->ns->list, info->vname, 0);
+		if (mailbox_open(box) == 0) {
+			if (fts_index_set_last_uid(box, 0) < 0)
+				ret = -1;
+		}
+		mailbox_free(&box);
+	}
+	if (mailbox_list_iter_deinit(&iter) < 0)
+		ret = -1;
+	return ret;
+}
+
 int fts_backend_rescan(struct fts_backend *backend)
 {
+	struct mailbox *box;
+	bool virtual_storage;
+
+	box = mailbox_alloc(backend->ns->list, "", 0);
+	virtual_storage = box->virtual_vfuncs != NULL;
+	mailbox_free(&box);
+
+	if (virtual_storage) {
+		/* just reset the last-uids for a virtual storage. */
+		return fts_backend_reset_last_uids(backend);
+	}
+
 	return backend->v.rescan == NULL ? 0 :
 		backend->v.rescan(backend);
 }
@@ -276,7 +315,9 @@ bool fts_backend_default_can_lookup(struct fts_backend *backend,
 		case SEARCH_HEADER_COMPRESS_LWSP:
 		case SEARCH_BODY:
 		case SEARCH_TEXT:
-			return TRUE;
+			if (!args->no_fts)
+				return TRUE;
+			break;
 		default:
 			break;
 		}
@@ -301,14 +342,15 @@ static int fts_score_map_sort(const struct fts_score_map *m1,
 }
 
 int fts_backend_lookup(struct fts_backend *backend, struct mailbox *box,
-		       struct mail_search_arg *args, bool and_args,
+		       struct mail_search_arg *args,
+		       enum fts_lookup_flags flags,
 		       struct fts_result *result)
 {
 	array_clear(&result->definite_uids);
 	array_clear(&result->maybe_uids);
 	array_clear(&result->scores);
 
-	if (backend->v.lookup(backend, box, args, and_args, result) < 0)
+	if (backend->v.lookup(backend, box, args, flags, result) < 0)
 		return -1;
 
 	if (!result->scores_sorted && array_is_created(&result->scores)) {
@@ -320,7 +362,8 @@ int fts_backend_lookup(struct fts_backend *backend, struct mailbox *box,
 
 int fts_backend_lookup_multi(struct fts_backend *backend,
 			     struct mailbox *const boxes[],
-			     struct mail_search_arg *args, bool and_args,
+			     struct mail_search_arg *args,
+			     enum fts_lookup_flags flags,
 			     struct fts_multi_result *result)
 {
 	unsigned int i;
@@ -329,7 +372,7 @@ int fts_backend_lookup_multi(struct fts_backend *backend,
 
 	if (backend->v.lookup_multi != NULL) {
 		if (backend->v.lookup_multi(backend, boxes, args,
-					    and_args, result) < 0)
+					    flags, result) < 0)
 			return -1;
 		if (result->box_results == NULL) {
 			result->box_results = p_new(result->pool,
@@ -348,7 +391,7 @@ int fts_backend_lookup_multi(struct fts_backend *backend,
 		p_array_init(&box_result->maybe_uids, result->pool, 32);
 		p_array_init(&box_result->scores, result->pool, 32);
 		if (backend->v.lookup(backend, boxes[i], args,
-				      and_args, box_result) < 0)
+				      flags, box_result) < 0)
 			return -1;
 	}
 	return 0;
@@ -379,7 +422,7 @@ bool fts_index_get_header(struct mailbox *box, struct fts_index_header *hdr_r)
 	mail_index_get_header_ext(view, fts_index_get_ext_id(box),
 				  &data, &data_size);
 	if (data_size < sizeof(*hdr_r)) {
-		memset(hdr_r, 0, sizeof(*hdr_r));
+		i_zero(hdr_r);
 		ret = FALSE;
 	} else {
 		memcpy(hdr_r, data, data_size);
@@ -416,7 +459,7 @@ int fts_index_have_compatible_settings(struct mailbox_list *list,
 	struct mailbox *box;
 	struct fts_index_header hdr;
 	const char *vname;
-	unsigned int len;
+	size_t len;
 	int ret;
 
 	if ((ns->flags & NAMESPACE_FLAG_INBOX_USER) != 0)
@@ -430,8 +473,8 @@ int fts_index_have_compatible_settings(struct mailbox_list *list,
 
 	box = mailbox_alloc(list, vname, 0);
 	if (mailbox_sync(box, (enum mailbox_sync_flags)0) < 0) {
-		i_error("lucene: Failed to sync mailbox INBOX: %s",
-			mailbox_get_last_error(box, NULL));
+		i_error("fts: Failed to sync mailbox %s: %s", vname,
+			mailbox_get_last_internal_error(box, NULL));
 		ret = -1;
 	} else {
 		ret = fts_index_get_header(box, &hdr) &&
@@ -454,6 +497,25 @@ bool fts_header_want_indexed(const char *hdr_name)
 			return TRUE;
 	}
 	return FALSE;
+}
+
+bool fts_header_has_language(const char *hdr_name)
+{
+	/* FIXME: should email address headers be detected as different
+	   languages? That mainly contains people's names.. */
+	/*if (message_header_is_address(hdr_name))
+		return TRUE;*/
+
+	/* Subject definitely contains language-specific data that can be
+	   detected. Comment and Keywords headers also could contain, although
+	   just about nobody uses those headers.
+
+	   For now we assume that other headers contain non-language specific
+	   data that we don't want to filter in special ways. For example
+	   it is good to be able to search for Message-IDs. */
+	return strcasecmp(hdr_name, "Subject") == 0 ||
+		strcasecmp(hdr_name, "Comments") == 0 ||
+		strcasecmp(hdr_name, "Keywords") == 0;
 }
 
 int fts_mailbox_get_guid(struct mailbox *box, const char **guid_r)

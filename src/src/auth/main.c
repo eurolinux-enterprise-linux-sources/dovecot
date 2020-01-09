@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "array.h"
@@ -24,11 +24,13 @@
 #include "auth-penalty.h"
 #include "auth-token.h"
 #include "auth-request-handler.h"
+#include "auth-request-stats.h"
 #include "auth-worker-server.h"
 #include "auth-worker-client.h"
 #include "auth-master-connection.h"
 #include "auth-client-connection.h"
 #include "auth-postfix-connection.h"
+#include "auth-policy.h"
 
 #include <unistd.h>
 #include <sys/stat.h>
@@ -187,7 +189,7 @@ static void main_preinit(void)
 
 	services = read_global_settings();
 
-	memset(&mod_set, 0, sizeof(mod_set));
+	i_zero(&mod_set);
 	mod_set.abi_version = DOVECOT_ABI_VERSION;
 	mod_set.require_init_funcs = TRUE;
 	mod_set.debug = global_auth_settings->debug;
@@ -198,6 +200,7 @@ static void main_preinit(void)
 
 	if (!worker)
 		auth_penalty = auth_penalty_init(AUTH_PENALTY_ANVIL_PATH);
+	auth_request_stats_init();
 	mech_init(global_auth_settings);
 	mech_reg = mech_register_init(global_auth_settings);
 	dict_drivers_register_builtin();
@@ -217,7 +220,7 @@ void auth_module_load(const char *names)
 {
 	struct module_dir_load_settings mod_set;
 
-	memset(&mod_set, 0, sizeof(mod_set));
+	i_zero(&mod_set);
 	mod_set.abi_version = DOVECOT_ABI_VERSION;
 	mod_set.require_init_funcs = TRUE;
 	mod_set.debug = global_auth_settings->debug;
@@ -244,6 +247,7 @@ static void main_init(void)
 	auth_worker_server_init();
 	auths_init();
 	auth_request_handler_init();
+	auth_policy_init();
 
 	if (worker) {
 		/* workers have only a single connection from the master
@@ -263,6 +267,7 @@ static void main_deinit(void)
 		/* cancel all pending anvil penalty lookups */
 		auth_penalty_deinit(&auth_penalty);
 	}
+	auth_policy_deinit();
 	/* deinit auth workers, which aborts pending requests */
         auth_worker_server_deinit();
 	/* deinit passdbs and userdbs. it aborts any pending async requests. */
@@ -293,6 +298,8 @@ static void main_deinit(void)
 	passdbs_deinit();
 	passdb_cache_deinit();
         password_schemes_deinit();
+	auth_request_stats_deinit();
+
 	sql_drivers_deinit();
 	random_deinit();
 	child_wait_deinit();

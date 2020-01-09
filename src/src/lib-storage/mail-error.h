@@ -7,7 +7,9 @@
 #define MAIL_ERRSTR_NO_PERMISSION "Permission denied"
 
 /* And just for making error strings consistent: */
-#define MAIL_ERRSTR_NO_SPACE "Not enough disk space"
+#define MAIL_ERRSTR_NO_QUOTA "Not enough disk quota"
+/* FIXME: Obsolete - remove for v2.3 */
+#define MAIL_ERRSTR_NO_SPACE MAIL_ERRSTR_NO_QUOTA
 #define MAIL_ERRSTR_LOCK_TIMEOUT "Timeout while waiting for lock"
 
 /* Message to show to users when critical error occurs */
@@ -24,14 +26,16 @@ enum mail_error {
 
 	/* Temporary internal error */
 	MAIL_ERROR_TEMP,
+	/* Temporary failure because a subsystem is down */
+	MAIL_ERROR_UNAVAILABLE,
 	/* It's not possible to do the wanted operation */
 	MAIL_ERROR_NOTPOSSIBLE,
 	/* Invalid parameters (eg. mailbox name not valid) */
 	MAIL_ERROR_PARAMS,
 	/* No permission to do the request */
 	MAIL_ERROR_PERM,
-	/* Out of disk space or quota */
-	MAIL_ERROR_NOSPACE,
+	/* Out of disk quota for user */
+	MAIL_ERROR_NOQUOTA,
 	/* Item (e.g. mailbox) doesn't exist or it's not visible to us */
 	MAIL_ERROR_NOTFOUND,
 	/* Item (e.g. mailbox) already exists */
@@ -46,7 +50,15 @@ enum mail_error {
 	MAIL_ERROR_CONVERSION,
 	/* Can't do the requested data conversion because the original data
 	   isn't valid. */
-	MAIL_ERROR_INVALIDDATA
+	MAIL_ERROR_INVALIDDATA,
+	/* Operation ran against some kind of a limit. */
+	MAIL_ERROR_LIMIT,
+	/* Operation couldn't be finished as efficiently as required by
+	   mail.lookup_abort. */
+	MAIL_ERROR_LOOKUP_ABORTED,
+
+	/* FIXME: Obsolete - remove in v2.3 */
+	MAIL_ERROR_NOSPACE = MAIL_ERROR_NOQUOTA
 };
 
 /* Convert errno to mail_error and an error string. Returns TRUE if successful,

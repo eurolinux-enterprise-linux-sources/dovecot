@@ -5,13 +5,17 @@
 
 #include <openssl/ssl.h>
 
+#ifndef HAVE_ASN1_STRING_GET0_DATA
+#  define ASN1_STRING_get0_data(str) ASN1_STRING_data(str)
+#endif
+
 struct ssl_iostream_context {
 	SSL_CTX *ssl_ctx;
 
 	pool_t pool;
 	const struct ssl_iostream_settings *set;
 
-	DH *dh_512, *dh_1024;
+	DH *dh_512, *dh_default;
 	int username_nid;
 
 	unsigned int client_ctx:1;
@@ -26,9 +30,13 @@ struct ssl_iostream {
 
 	struct istream *plain_input;
 	struct ostream *plain_output;
+	struct istream *ssl_input;
 	struct ostream *ssl_output;
 
-	char *host;
+	/* SSL clients: host where we connected to */
+	char *connected_host;
+	/* SSL servers: host requested by the client via SNI */
+	char *sni_host;
 	char *last_error;
 	char *log_prefix;
 	char *plain_stream_errstr;
@@ -67,11 +75,22 @@ void openssl_iostream_global_deinit(void);
 
 int openssl_iostream_load_key(const struct ssl_iostream_settings *set,
 			      EVP_PKEY **pkey_r, const char **error_r);
-const char *ssl_iostream_get_use_certificate_error(const char *cert);
 int openssl_cert_match_name(SSL *ssl, const char *verify_name);
 int openssl_get_protocol_options(const char *protocols);
 #define OPENSSL_ALL_PROTOCOL_OPTIONS \
 	(SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1)
+
+#ifdef HAVE_SSL_CTX_SET_MIN_PROTO_VERSION
+/* min_protocol_r is the version int for SSL_CTX_set_min_proto_version().
+   Return 0 on success, and -1 on failure.
+
+   If ssl_protocols only disables protocols like "!SSLv3 !TLSv1", then all the
+   remaining protocols are considered enabled. If it enables some protocols
+   like "TLSv1.1 TLSv1.2", then only the explicitly enabled protocols are
+   considered enabled. */
+int ssl_protocols_to_min_protocol(const char *ssl_protocols,
+				  int *min_protocol_r, const char **error_r);
+#endif
 
 /* Sync plain_input/plain_output streams with BIOs. Returns TRUE if at least
    one byte was read/written. */
@@ -91,10 +110,17 @@ int openssl_iostream_handle_write_error(struct ssl_iostream *ssl_io, int ret,
 
 const char *openssl_iostream_error(void);
 const char *openssl_iostream_key_load_error(void);
+const char *
+openssl_iostream_use_certificate_error(const char *cert, const char *set_name);
+void openssl_iostream_clear_errors(void);
 
-int openssl_iostream_generate_params(buffer_t *output, const char **error_r);
+int openssl_iostream_generate_params(buffer_t *output, unsigned int dh_length,
+				     const char **error_r);
 int openssl_iostream_context_import_params(struct ssl_iostream_context *ctx,
 					   const buffer_t *input);
 void openssl_iostream_context_free_params(struct ssl_iostream_context *ctx);
+
+void ssl_iostream_openssl_init(void);
+void ssl_iostream_openssl_deinit(void);
 
 #endif

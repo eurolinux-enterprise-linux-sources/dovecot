@@ -5,11 +5,12 @@
 
 struct client;
 struct mail_storage;
+struct mail_storage_service_ctx;
 
 typedef void command_func_t(struct client *client);
 
 #define MSGS_BITMASK_SIZE(client) \
-	(((client)->messages_count + (CHAR_BIT-1)) / CHAR_BIT)
+	(MALLOC_ADD((client)->messages_count, (CHAR_BIT-1)) / CHAR_BIT)
 
 /* Stop reading input when output buffer has this many bytes. Once the buffer
    size has dropped to half of it, start reading input again. */
@@ -61,13 +62,14 @@ struct client {
 
 	unsigned int uid_validity;
 	unsigned int messages_count;
-	unsigned int deleted_count, expunged_count, seen_change_count;
+	unsigned int deleted_count, seen_change_count;
 	uoff_t total_size;
 	uoff_t deleted_size;
 	uint32_t last_seen_pop3_msn, lowest_retr_pop3_msn;
 
 	/* All sequences currently visible in the mailbox. */
 	ARRAY_TYPE(seq_range) all_seqs;
+	uint32_t highest_seq;
 
 	/* [msgnum] contains mail seq. anything after it has seq = msgnum+1 */
 	uint32_t *msgnum_to_seq_map;
@@ -94,11 +96,13 @@ struct client {
 	/* Module-specific contexts. */
 	ARRAY(union pop3_module_context *) module_contexts;
 
+	unsigned int destroyed:1;
 	unsigned int disconnected:1;
 	unsigned int deleted:1;
 	unsigned int waiting_input:1;
 	unsigned int anvil_sent:1;
 	unsigned int message_uidls_save:1;
+	unsigned int delete_success:1;
 };
 
 struct pop3_module_register {
@@ -116,10 +120,11 @@ extern unsigned int pop3_client_count;
 
 /* Create new client with specified input/output handles. socket specifies
    if the handle is a socket. */
-int client_create(int fd_in, int fd_out, const char *session_id,
-		  struct mail_user *user,
-		  struct mail_storage_service_user *service_user,
-		  const struct pop3_settings *set, struct client **client_r);
+struct client *client_create(int fd_in, int fd_out, const char *session_id,
+			     struct mail_user *user,
+			     struct mail_storage_service_user *service_user,
+			     const struct pop3_settings *set);
+int client_init_mailbox(struct client *client, const char **error_r);
 void client_destroy(struct client *client, const char *reason) ATTR_NULL(2);
 
 /* Disconnect client connection */
@@ -133,6 +138,8 @@ void client_send_storage_error(struct client *client);
 bool client_handle_input(struct client *client);
 bool client_update_mails(struct client *client);
 
-void clients_destroy_all(void);
+void clients_destroy_all(struct mail_storage_service_ctx *storage_service);
+
+int pop3_lock_session(struct client *client);
 
 #endif

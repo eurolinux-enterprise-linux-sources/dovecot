@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2010 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 extern "C" {
 #include "lib.h"
@@ -6,7 +6,9 @@ extern "C" {
 #include "unichar.h"
 #include "hash.h"
 #include "hex-binary.h"
+#include "ioloop.h"
 #include "unlink-directory.h"
+#include "ioloop.h"
 #include "mail-index.h"
 #include "mail-search.h"
 #include "mail-namespace.h"
@@ -17,12 +19,12 @@ extern "C" {
 #include "lucene-wrapper.h"
 
 #include <sys/stat.h>
-#ifdef HAVE_LUCENE_TEXTCAT
-#  include <libtextcat/textcat.h>
-#else
-#ifdef HAVE_LUCENE_EXTTEXTCAT
+#ifdef HAVE_LIBEXTTEXTCAT_TEXTCAT_H
 #  include <libexttextcat/textcat.h>
-#endif
+#elif defined (HAVE_LIBTEXTCAT_TEXTCAT_H)
+#  include <libtextcat/textcat.h>
+#elif defined (HAVE_FTS_TEXTCAT)
+#  include <textcat.h>
 #endif
 };
 #include <CLucene.h>
@@ -35,6 +37,7 @@ extern "C" {
 #define FTS_LUCENE_MAX_SEARCH_TERMS 1000
 
 #define LUCENE_LOCK_OVERRIDE_SECS 60
+#define LUCENE_INDEX_CLOSE_TIMEOUT_MSECS (120*1000)
 
 using namespace lucene::document;
 using namespace lucene::index;
@@ -66,13 +69,15 @@ struct lucene_index {
 	IndexReader *reader;
 	IndexWriter *writer;
 	IndexSearcher *searcher;
+	struct timeout *to_close;
 
 	buffer_t *normalizer_buf;
 	Analyzer *default_analyzer, *cur_analyzer;
 	ARRAY(struct lucene_analyzer) analyzers;
 
 	Document *doc;
-	uint32_t prev_uid;
+	uint32_t prev_uid, prev_part_idx;
+	bool no_analyzer;
 };
 
 struct rescan_context {
@@ -94,9 +99,13 @@ struct rescan_context {
 };
 
 static void *textcat = NULL;
+#ifdef HAVE_FTS_TEXTCAT
 static bool textcat_broken = FALSE;
+#endif
 static int textcat_refcount = 0;
 
+static void lucene_handle_error(struct lucene_index *index, CLuceneError &err,
+				const char *msg);
 static void rescan_clear_unseen_mailboxes(struct lucene_index *index,
 					  struct rescan_context *rescan_ctx);
 
@@ -105,7 +114,6 @@ struct lucene_index *lucene_index_init(const char *path,
 				       const struct fts_lucene_settings *set)
 {
 	struct lucene_index *index;
-	unsigned int len;
 
 	index = i_new(struct lucene_index, 1);
 	index->path = i_strdup(path);
@@ -118,8 +126,11 @@ struct lucene_index *lucene_index_init(const char *path,
 		/* this is valid only for doveadm dump, so it doesn't matter */
 		index->set.default_language = "";
 	}
-#ifdef HAVE_LUCENE_STEMMER
-	if (!set->no_snowball) {
+	if (index->set.use_libfts) {
+		index->default_analyzer = _CLNEW KeywordAnalyzer();
+	} else
+#ifdef HAVE_FTS_STEMMER
+	if (set == NULL || !set->no_snowball) {
 		index->default_analyzer =
 			_CLNEW snowball::SnowballAnalyzer(index->normalizer,
 							  index->set.default_language);
@@ -141,9 +152,26 @@ struct lucene_index *lucene_index_init(const char *path,
 
 void lucene_index_close(struct lucene_index *index)
 {
-	_CLDELETE(index->reader);
-	_CLDELETE(index->writer);
+	if (index->to_close != NULL)
+		timeout_remove(&index->to_close);
+
 	_CLDELETE(index->searcher);
+	if (index->writer != NULL) {
+		try {
+			index->writer->close();
+		} catch (CLuceneError &err) {
+			lucene_handle_error(index, err, "IndexWriter::close");
+		}
+		_CLDELETE(index->writer);
+	}
+	if (index->reader != NULL) {
+		try {
+			index->reader->close();
+		} catch (CLuceneError &err) {
+			lucene_handle_error(index, err, "IndexReader::close");
+		}
+		_CLDELETE(index->reader);
+	}
 }
 
 void lucene_index_deinit(struct lucene_index *index)
@@ -157,7 +185,7 @@ void lucene_index_deinit(struct lucene_index *index)
 	}
 	array_free(&index->analyzers);
 	if (--textcat_refcount == 0 && textcat != NULL) {
-#ifdef HAVE_LUCENE_TEXTCAT
+#ifdef HAVE_FTS_TEXTCAT
 		textcat_Done(textcat);
 #endif
 		textcat = NULL;
@@ -175,7 +203,7 @@ static void lucene_data_translate(struct lucene_index *index,
 	const char *whitespace_chars = index->set.whitespace_chars;
 	unsigned int i;
 
-	if (*whitespace_chars == '\0')
+	if (*whitespace_chars == '\0' || index->set.use_libfts)
 		return;
 
 	for (i = 0; i < len; i++) {
@@ -201,8 +229,7 @@ void lucene_utf8_n_to_tchar(const unsigned char *src, size_t srcsize,
 }
 
 static const wchar_t *
-t_lucene_utf8_to_tchar(struct lucene_index *index,
-		       const char *str, bool translate)
+t_lucene_utf8_to_tchar(struct lucene_index *index, const char *str)
 {
 	ARRAY_TYPE(unichars) dest_arr;
 	const unichar_t *chars;
@@ -248,8 +275,7 @@ static void lucene_handle_error(struct lucene_index *index, CLuceneError &err,
 	     err.number() == CL_ERR_IO)) {
 		/* delete corrupted index. most IO errors are also about
 		   missing files and other such corruption.. */
-		if (unlink_directory(index->path,
-				     UNLINK_DIRECTORY_FLAG_RMDIR) < 0 &&
+		if (unlink_directory(index->path, (enum unlink_directory_flags)0) < 0 &&
 		    errno != ENOENT)
 			i_error("unlink_directory(%s) failed: %m", index->path);
 		rescan_clear_unseen_mailboxes(index, NULL);
@@ -258,8 +284,11 @@ static void lucene_handle_error(struct lucene_index *index, CLuceneError &err,
 
 static int lucene_index_open(struct lucene_index *index)
 {
-	if (index->reader != NULL)
+	if (index->reader != NULL) {
+		i_assert(index->to_close != NULL);
+		timeout_reset(index->to_close);
 		return 1;
+	}
 
 	if (!IndexReader::indexExists(index->path))
 		return 0;
@@ -270,6 +299,9 @@ static int lucene_index_open(struct lucene_index *index)
 		lucene_handle_error(index, err, "IndexReader::open()");
 		return -1;
 	}
+	i_assert(index->to_close == NULL);
+	index->to_close = timeout_add(LUCENE_INDEX_CLOSE_TIMEOUT_MSECS,
+				      lucene_index_close, index);
 	return 1;
 }
 
@@ -305,6 +337,22 @@ lucene_doc_get_uid(struct lucene_index *index, Document *doc, uint32_t *uid_r)
 	}
 	*uid_r = num;
 	return 0;
+}
+
+static uint32_t
+lucene_doc_get_part(struct lucene_index *index, Document *doc)
+{
+	Field *field = doc->getField(_T("part"));
+	const TCHAR *part = field == NULL ? NULL : field->stringValue();
+	if (part == NULL)
+		return 0;
+
+	uint32_t num = 0;
+	while (*part != 0) {
+		num = num*10 + (*part - '0');
+		part++;
+	}
+	return num;
 }
 
 int lucene_index_get_last_uid(struct lucene_index *index, uint32_t *last_uid_r)
@@ -363,7 +411,6 @@ int lucene_index_get_doc_count(struct lucene_index *index, uint32_t *count_r)
 
 static int lucene_settings_check(struct lucene_index *index)
 {
-	struct fts_index_header hdr;
 	uint32_t set_checksum;
 	int ret = 0;
 
@@ -372,8 +419,10 @@ static int lucene_settings_check(struct lucene_index *index)
 	if (ret != 0)
 		return ret;
 
+	i_warning("fts-lucene: Settings have changed, rebuilding index for mailbox");
+
 	/* settings changed, rebuild index */
-	if (unlink_directory(index->path, UNLINK_DIRECTORY_FLAG_RMDIR) < 0) {
+	if (unlink_directory(index->path, (enum unlink_directory_flags)0) < 0) {
 		i_error("unlink_directory(%s) failed: %m", index->path);
 		ret = -1;
 	} else {
@@ -412,7 +461,7 @@ int lucene_index_build_init(struct lucene_index *index)
 	return 0;
 }
 
-#ifdef HAVE_LUCENE_TEXTCAT
+#ifdef HAVE_FTS_TEXTCAT
 static Analyzer *get_analyzer(struct lucene_index *index, const char *lang)
 {
 	normalizer_func_t *normalizer = index->normalizer;
@@ -494,10 +543,13 @@ static int lucene_index_build_flush(struct lucene_index *index)
 		return 0;
 
 	try {
-		index->writer->addDocument(index->doc,
-					   index->cur_analyzer != NULL ?
-					   index->cur_analyzer :
-					   index->default_analyzer);
+		CL_NS(analysis)::Analyzer *analyzer = NULL;
+
+		if (!index->set.use_libfts) {
+			analyzer = index->cur_analyzer != NULL ?
+				index->cur_analyzer : index->default_analyzer;
+		}
+		index->writer->addDocument(index->doc, analyzer);
 	} catch (CLuceneError &err) {
 		lucene_handle_error(index, err, "IndexWriter::addDocument()");
 		ret = -1;
@@ -510,24 +562,29 @@ static int lucene_index_build_flush(struct lucene_index *index)
 }
 
 int lucene_index_build_more(struct lucene_index *index, uint32_t uid,
-			    const unsigned char *data, size_t size,
-			    const char *hdr_name)
+			    uint32_t part_idx, const unsigned char *data,
+			    size_t size, const char *hdr_name)
 {
 	wchar_t id[MAX_INT_STRLEN];
 	size_t namesize, datasize;
 
-	if (uid != index->prev_uid) {
+	if (uid != index->prev_uid || part_idx != index->prev_part_idx) {
 		if (lucene_index_build_flush(index) < 0)
 			return -1;
 		index->prev_uid = uid;
+		index->prev_part_idx = part_idx;
 
 		index->doc = _CLNEW Document();
 		swprintf(id, N_ELEMENTS(id), L"%u", uid);
 		index->doc->add(*_CLNEW Field(_T("uid"), id, Field::STORE_YES | Field::INDEX_UNTOKENIZED));
+		if (part_idx != 0) {
+			swprintf(id, N_ELEMENTS(id), L"%u", part_idx);
+			index->doc->add(*_CLNEW Field(_T("part"), id, Field::STORE_YES | Field::INDEX_UNTOKENIZED));
+		}
 		index->doc->add(*_CLNEW Field(_T("box"), index->mailbox_guid, Field::STORE_YES | Field::INDEX_UNTOKENIZED));
 	}
 
-	if (index->normalizer_buf != NULL) {
+	if (index->normalizer_buf != NULL && !index->set.use_libfts) {
 		buffer_set_used_size(index->normalizer_buf, 0);
 		index->normalizer(data, size, index->normalizer_buf);
 		data = (const unsigned char *)index->normalizer_buf->data;
@@ -535,10 +592,16 @@ int lucene_index_build_more(struct lucene_index *index, uint32_t uid,
 	}
 
 	datasize = uni_utf8_strlen_n(data, size) + 1;
-	wchar_t dest[datasize];
+	wchar_t *dest, *dest_free = NULL;
+	if (datasize < 4096)
+		dest = t_new(wchar_t, datasize);
+	else
+		dest = dest_free = i_new(wchar_t, datasize);
 	lucene_utf8_n_to_tchar(data, size, dest, datasize);
-	lucene_data_translate(index, dest, datasize);
+	lucene_data_translate(index, dest, datasize-1);
 
+	int token_flag = index->set.use_libfts ?
+		Field::INDEX_UNTOKENIZED : Field::INDEX_TOKENIZED;
 	if (hdr_name != NULL) {
 		/* hdr_name should be ASCII, but don't break in case it isn't */
 		hdr_name = t_str_lcase(hdr_name);
@@ -546,16 +609,18 @@ int lucene_index_build_more(struct lucene_index *index, uint32_t uid,
 		wchar_t wname[namesize];
 		lucene_utf8_n_to_tchar((const unsigned char *)hdr_name,
 				       strlen(hdr_name), wname, namesize);
-		index->doc->add(*_CLNEW Field(_T("hdr"), wname, Field::STORE_NO | Field::INDEX_TOKENIZED));
-		index->doc->add(*_CLNEW Field(_T("hdr"), dest, Field::STORE_NO | Field::INDEX_TOKENIZED));
+		if (!index->set.use_libfts)
+			index->doc->add(*_CLNEW Field(_T("hdr"), wname, Field::STORE_NO | token_flag));
+		index->doc->add(*_CLNEW Field(_T("hdr"), dest, Field::STORE_NO | token_flag));
 
 		if (fts_header_want_indexed(hdr_name))
-			index->doc->add(*_CLNEW Field(wname, dest, Field::STORE_NO | Field::INDEX_TOKENIZED));
+			index->doc->add(*_CLNEW Field(wname, dest, Field::STORE_NO | token_flag));
 	} else if (size > 0) {
-		if (index->cur_analyzer == NULL)
+		if (index->cur_analyzer == NULL && !index->set.use_libfts)
 			index->cur_analyzer = guess_analyzer(index, data, size);
-		index->doc->add(*_CLNEW Field(_T("body"), dest, Field::STORE_NO | Field::INDEX_TOKENIZED));
+		index->doc->add(*_CLNEW Field(_T("body"), dest, Field::STORE_NO | token_flag));
 	}
+	i_free(dest_free);
 	return 0;
 }
 
@@ -568,6 +633,7 @@ int lucene_index_build_deinit(struct lucene_index *index)
 		return 0;
 	}
 	index->prev_uid = 0;
+	index->prev_part_idx = 0;
 
 	if (index->writer == NULL) {
 		lucene_index_close(index);
@@ -684,7 +750,7 @@ rescan_open_mailbox(struct rescan_context *ctx, Document *doc)
 		enum mail_error error;
 		const char *errstr;
 
-		errstr = mailbox_get_last_error(ctx->box, &error);
+		errstr = mailbox_get_last_internal_error(ctx->box, &error);
 		if (error == MAIL_ERROR_NOTFOUND)
 			ret = 0;
 		else {
@@ -699,7 +765,7 @@ rescan_open_mailbox(struct rescan_context *ctx, Document *doc)
 	if (mailbox_sync(ctx->box, (enum mailbox_sync_flags)0) < 0) {
 		i_error("lucene: Failed to sync mailbox %s: %s",
 			mailbox_get_vname(ctx->box),
-			mailbox_get_last_error(ctx->box, NULL));
+			mailbox_get_last_internal_error(ctx->box, NULL));
 		mailbox_free(&ctx->box);
 		ctx->box_ret = -1;
 		return -1;
@@ -753,6 +819,30 @@ rescan_next(struct rescan_context *ctx, Document *doc)
 	}
 }
 
+static void
+rescan_clear_unseen_mailbox(struct lucene_index *index,
+			    struct rescan_context *rescan_ctx,
+			    const char *vname,
+			    const struct fts_index_header *hdr)
+{
+	struct mailbox *box;
+	struct mailbox_metadata metadata;
+
+	box = mailbox_alloc(index->list, vname,
+			    (enum mailbox_flags)0);
+	if (mailbox_open(box) == 0 &&
+	    mailbox_get_metadata(box, MAILBOX_METADATA_GUID,
+				 &metadata) == 0 &&
+	    (rescan_ctx == NULL ||
+	     hash_table_lookup(rescan_ctx->seen_mailbox_guids,
+			       metadata.guid) == NULL)) {
+		/* this mailbox had no records in lucene index.
+		   make sure its last indexed uid is 0 */
+		(void)fts_index_set_header(box, hdr);
+	}
+	mailbox_free(&box);
+}
+
 static void rescan_clear_unseen_mailboxes(struct lucene_index *index,
 					  struct rescan_context *rescan_ctx)
 {
@@ -762,37 +852,31 @@ static void rescan_clear_unseen_mailboxes(struct lucene_index *index,
 		 MAILBOX_LIST_ITER_RETURN_NO_FLAGS);
 	struct mailbox_list_iterate_context *iter;
 	const struct mailbox_info *info;
-	struct mailbox *box;
-	struct mailbox_metadata metadata;
 	struct fts_index_header hdr;
+	struct mail_namespace *ns = index->list->ns;
+	const char *vname;
 
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.settings_checksum = fts_lucene_settings_checksum(&index->set);
 
 	iter = mailbox_list_iter_init(index->list, "*", iter_flags);
-	while ((info = mailbox_list_iter_next(iter)) != NULL) {
-		box = mailbox_alloc(index->list, info->vname,
-				    (enum mailbox_flags)0);
-		if (mailbox_open(box) == 0 &&
-		    mailbox_get_metadata(box, MAILBOX_METADATA_GUID,
-					 &metadata) == 0 &&
-		    (rescan_ctx == NULL ||
-		     hash_table_lookup(rescan_ctx->seen_mailbox_guids,
-				       metadata.guid) == NULL)) {
-			/* this mailbox had no records in lucene index.
-			   make sure its last indexed uid is 0 */
-			(void)fts_index_set_header(box, &hdr);
-		}
-		mailbox_free(&box);
-	}
+	while ((info = mailbox_list_iter_next(iter)) != NULL)
+		rescan_clear_unseen_mailbox(index, rescan_ctx, info->vname, &hdr);
 	(void)mailbox_list_iter_deinit(&iter);
+
+	if (ns->prefix_len > 0 &&
+	    ns->prefix[ns->prefix_len-1] == mail_namespace_get_sep(ns)) {
+		/* namespace prefix itself isn't returned by the listing */
+		vname = t_strndup(index->list->ns->prefix,
+				  index->list->ns->prefix_len-1);
+		rescan_clear_unseen_mailbox(index, rescan_ctx, vname, &hdr);
+	}
 }
 
 int lucene_index_rescan(struct lucene_index *index)
 {
 	static const TCHAR *sort_fields[] = { _T("box"), _T("uid"), NULL };
 	struct rescan_context ctx;
-	guid_128_t guid;
 	bool failed = false;
 	int ret;
 
@@ -825,12 +909,11 @@ int lucene_index_rescan(struct lucene_index *index)
 				index->reader->deleteDocument(hits->id(i));
 		}
 		_CLDELETE(hits);
-		index->reader->close();
-		lucene_index_close(index);
 	} catch (CLuceneError &err) {
 		lucene_handle_error(index, err, "rescan search");
 		failed = true;
 	}
+	lucene_index_close(index);
 	if (ctx.box != NULL)
 		rescan_finish(&ctx);
 	array_free(&ctx.uids);
@@ -938,14 +1021,7 @@ int lucene_index_expunge_from_log(struct lucene_index *index,
 		}
 	}
 
-	try {
-		if (index->reader != NULL)
-			index->reader->close();
-		lucene_index_close(index);
-	} catch (CLuceneError &err) {
-		lucene_handle_error(index, err, "expunge delete");
-		ret = -1;
-	}
+	lucene_index_close(index);
 
 	ret2 = fts_expunge_log_read_end(&ctx);
 	if (ret < 0 || ret2 < 0)
@@ -968,6 +1044,12 @@ int lucene_index_optimize(struct lucene_index *index)
 		writer->optimize();
 	} catch (CLuceneError &err) {
 		lucene_handle_error(index, err, "IndexWriter::optimize()");
+		ret = -1;
+	}
+	try {
+		writer->close();
+	} catch (CLuceneError &err) {
+		lucene_handle_error(index, err, "IndexWriter::close()");
 		ret = -1;
 	}
 	if (writer != NULL)
@@ -1075,6 +1157,18 @@ lucene_get_query_str(struct lucene_index *index,
 	const TCHAR *wvalue;
 	Analyzer *analyzer;
 
+	if (index->set.use_libfts) {
+		const wchar_t *wstr = t_lucene_utf8_to_tchar(index, str);
+		Term* tm = _CLNEW Term(key, wstr);
+		Query* ret;
+		if (fuzzy)
+			ret = _CLNEW FuzzyQuery( tm );
+		else
+			ret = _CLNEW TermQuery( tm );
+		_CLDECDELETE(tm);
+		return ret;
+	}
+
 	if (index->normalizer_buf != NULL) {
 		buffer_set_used_size(index->normalizer_buf, 0);
 		index->normalizer(str, strlen(str), index->normalizer_buf);
@@ -1082,7 +1176,7 @@ lucene_get_query_str(struct lucene_index *index,
 		str = (const char *)index->normalizer_buf->data;
 	}
 
-	wvalue = t_lucene_utf8_to_tchar(index, str, TRUE);
+	wvalue = t_lucene_utf8_to_tchar(index, str);
 	analyzer = guess_analyzer(index, str, strlen(str));
 	if (analyzer == NULL)
 		analyzer = index->default_analyzer;
@@ -1100,9 +1194,14 @@ lucene_get_query(struct lucene_index *index,
 static bool
 lucene_add_definite_query(struct lucene_index *index,
 			  ARRAY_TYPE(lucene_query) &queries,
-			  struct mail_search_arg *arg, bool and_args)
+			  struct mail_search_arg *arg,
+			  enum fts_lookup_flags flags)
 {
+	bool and_args = (flags & FTS_LOOKUP_FLAG_AND_ARGS) != 0;
 	Query *q;
+
+	if (arg->no_fts)
+		return false;
 
 	if (arg->match_not && !and_args) {
 		/* FIXME: we could handle this by doing multiple queries.. */
@@ -1137,7 +1236,7 @@ lucene_add_definite_query(struct lucene_index *index,
 			return false;
 
 		q = lucene_get_query(index,
-				     t_lucene_utf8_to_tchar(index, t_str_lcase(arg->hdr_field_name), FALSE),
+				     t_lucene_utf8_to_tchar(index, t_str_lcase(arg->hdr_field_name)),
 				     arg);
 		break;
 	default:
@@ -1164,9 +1263,14 @@ lucene_add_definite_query(struct lucene_index *index,
 static bool
 lucene_add_maybe_query(struct lucene_index *index,
 		       ARRAY_TYPE(lucene_query) &queries,
-		       struct mail_search_arg *arg, bool and_args)
+		       struct mail_search_arg *arg,
+		       enum fts_lookup_flags flags)
 {
+	bool and_args = (flags & FTS_LOOKUP_FLAG_AND_ARGS) != 0;
 	Query *q = NULL;
+
+	if (arg->no_fts)
+		return false;
 
 	if (arg->match_not) {
 		/* FIXME: we could handle this by doing multiple queries.. */
@@ -1177,7 +1281,7 @@ lucene_add_maybe_query(struct lucene_index *index,
 	case SEARCH_HEADER:
 	case SEARCH_HEADER_ADDRESS:
 	case SEARCH_HEADER_COMPRESS_LWSP:
-		if (*arg->value.str == '\0') {
+		if (*arg->value.str == '\0' && !index->set.use_libfts) {
 			/* checking potential existence of the header name */
 			q = lucene_get_query_str(index, _T("hdr"),
 				t_str_lcase(arg->hdr_field_name), FALSE);
@@ -1208,7 +1312,6 @@ lucene_add_maybe_query(struct lucene_index *index,
 		lq->occur = BooleanClause::MUST;
 	else
 		lq->occur = BooleanClause::MUST_NOT;
-	return true;
 	return true;
 }
 
@@ -1271,7 +1374,9 @@ lucene_index_search(struct lucene_index *index,
 				break;
 			}
 
-			if (result != NULL) {
+			if (seq_range_array_add(uids_r, uid)) {
+				/* duplicate result */
+			} else if (result != NULL) {
 				if (uid < last_uid)
 					result->scores_sorted = false;
 				last_uid = uid;
@@ -1280,7 +1385,6 @@ lucene_index_search(struct lucene_index *index,
 				score->uid = uid;
 				score->score = hits->score(i);
 			}
-			seq_range_array_add(uids_r, uid);
 		}
 		_CLDELETE(hits);
 		return ret;
@@ -1291,7 +1395,8 @@ lucene_index_search(struct lucene_index *index,
 }
 
 int lucene_index_lookup(struct lucene_index *index,
-			struct mail_search_arg *args, bool and_args,
+			struct mail_search_arg *args,
+			enum fts_lookup_flags flags,
 			struct fts_result *result)
 {
 	struct mail_search_arg *arg;
@@ -1304,16 +1409,26 @@ int lucene_index_lookup(struct lucene_index *index,
 	bool have_definites = false;
 
 	for (arg = args; arg != NULL; arg = arg->next) {
-		if (lucene_add_definite_query(index, def_queries, arg, and_args)) {
+		if (lucene_add_definite_query(index, def_queries, arg, flags)) {
 			arg->match_always = true;
 			have_definites = true;
 		}
 	}
 
 	if (have_definites) {
+		ARRAY_TYPE(seq_range) *uids_arr =
+			(flags & FTS_LOOKUP_FLAG_NO_AUTO_FUZZY) == 0 ?
+			&result->definite_uids : &result->maybe_uids;
 		if (lucene_index_search(index, def_queries, result,
-					&result->definite_uids) < 0)
+					uids_arr) < 0)
 			return -1;
+	}
+
+	if (have_definites) {
+		/* FIXME: mixing up definite + maybe queries is broken. if the
+		   definite query matched, it'll just assume that the maybe
+		   queries matched as well */
+		return 0;
 	}
 
 	ARRAY_TYPE(lucene_query) maybe_queries;
@@ -1321,7 +1436,7 @@ int lucene_index_lookup(struct lucene_index *index,
 	bool have_maybies = false;
 
 	for (arg = args; arg != NULL; arg = arg->next) {
-		if (lucene_add_maybe_query(index, maybe_queries, arg, and_args)) {
+		if (lucene_add_maybe_query(index, maybe_queries, arg, flags)) {
 			arg->match_always = true;
 			have_maybies = true;
 		}
@@ -1339,6 +1454,7 @@ static int
 lucene_index_search_multi(struct lucene_index *index,
 			  HASH_TABLE_TYPE(wguid_result) guids,
 			  ARRAY_TYPE(lucene_query) &queries,
+			  enum fts_lookup_flags flags,
 			  struct fts_multi_result *result)
 {
 	struct fts_score_map *score;
@@ -1386,14 +1502,20 @@ lucene_index_search_multi(struct lucene_index *index,
 				break;
 			}
 
-			if (!array_is_created(&br->definite_uids)) {
-				p_array_init(&br->definite_uids, result->pool, 32);
+			ARRAY_TYPE(seq_range) *uids_arr =
+				(flags & FTS_LOOKUP_FLAG_NO_AUTO_FUZZY) == 0 ?
+				&br->maybe_uids : &br->definite_uids;
+			if (!array_is_created(uids_arr)) {
+				p_array_init(uids_arr, result->pool, 32);
 				p_array_init(&br->scores, result->pool, 32);
 			}
-			seq_range_array_add(&br->definite_uids, uid);
-			score = array_append_space(&br->scores);
-			score->uid = uid;
-			score->score = hits->score(i);
+			if (seq_range_array_add(uids_arr, uid)) {
+				/* duplicate result */
+			} else {
+				score = array_append_space(&br->scores);
+				score->uid = uid;
+				score->score = hits->score(i);
+			}
 		}
 		_CLDELETE(hits);
 		return ret;
@@ -1405,7 +1527,8 @@ lucene_index_search_multi(struct lucene_index *index,
 
 int lucene_index_lookup_multi(struct lucene_index *index,
 			      HASH_TABLE_TYPE(wguid_result) guids,
-			      struct mail_search_arg *args, bool and_args,
+			      struct mail_search_arg *args,
+			      enum fts_lookup_flags flags,
 			      struct fts_multi_result *result)
 {
 	struct mail_search_arg *arg;
@@ -1418,15 +1541,15 @@ int lucene_index_lookup_multi(struct lucene_index *index,
 	bool have_definites = false;
 
 	for (arg = args; arg != NULL; arg = arg->next) {
-		if (lucene_add_definite_query(index, def_queries, arg, and_args)) {
+		if (lucene_add_definite_query(index, def_queries, arg, flags)) {
 			arg->match_always = true;
 			have_definites = true;
 		}
 	}
 
 	if (have_definites) {
-		if (lucene_index_search_multi(index, guids,
-					      def_queries, result) < 0)
+		if (lucene_index_search_multi(index, guids, def_queries, flags,
+					      result) < 0)
 			return -1;
 	}
 	return 0;
@@ -1488,6 +1611,7 @@ lucene_index_iter_next(struct lucene_index_iter *iter)
 	(void)fts_lucene_get_mailbox_guid(iter->index, doc,
 					  iter->rec.mailbox_guid);
 	(void)lucene_doc_get_uid(iter->index, doc, &iter->rec.uid);
+	iter->rec.part_num = lucene_doc_get_part(iter->index, doc);
 	return &iter->rec;
 }
 

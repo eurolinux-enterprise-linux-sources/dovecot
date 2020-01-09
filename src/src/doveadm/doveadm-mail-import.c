@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -13,6 +13,8 @@
 struct import_cmd_context {
 	struct doveadm_mail_cmd_context ctx;
 
+	const char *src_location;
+	const char *src_username;
 	struct mail_user *src_user;
 	const char *dest_parent;
 	bool subscribe;
@@ -61,8 +63,9 @@ dest_mailbox_open_or_create(struct import_cmd_context *ctx,
 	}
 
 	box = mailbox_alloc(ns->list, name, MAILBOX_FLAG_SAVEONLY);
+	mailbox_set_reason(box, ctx->ctx.cmd->name);
 	if (mailbox_create(box, NULL, FALSE) < 0) {
-		errstr = mailbox_get_last_error(box, &error);
+		errstr = mailbox_get_last_internal_error(box, &error);
 		if (error != MAIL_ERROR_EXISTS) {
 			i_error("Couldn't create mailbox %s: %s", name, errstr);
 			doveadm_mail_failed_mailbox(&ctx->ctx, box);
@@ -73,12 +76,12 @@ dest_mailbox_open_or_create(struct import_cmd_context *ctx,
 	if (ctx->subscribe) {
 		if (mailbox_set_subscribed(box, TRUE) < 0) {
 			i_error("Couldn't subscribe to mailbox %s: %s",
-				name, mailbox_get_last_error(box, NULL));
+				name, mailbox_get_last_internal_error(box, NULL));
 		}
 	}
 	if (mailbox_sync(box, MAILBOX_SYNC_FLAG_FULL_READ) < 0) {
 		i_error("Syncing mailbox %s failed: %s", name,
-			mailbox_get_last_error(box, NULL));
+			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_mailbox(&ctx->ctx, box);
 		mailbox_free(&box);
 		return -1;
@@ -108,14 +111,14 @@ cmd_import_box_contents(struct doveadm_mail_iter *iter, struct mail *src_mail,
 		if (mailbox_copy(&save_ctx, src_mail) < 0) {
 			i_error("Copying box=%s uid=%u failed: %s",
 				mailbox, src_mail->uid,
-				mailbox_get_last_error(dest_box, NULL));
+				mailbox_get_last_internal_error(dest_box, NULL));
 			ret = -1;
 		}
 	} while (doveadm_mail_iter_next(iter, &src_mail));
 
 	if (mailbox_transaction_commit(&dest_trans) < 0) {
 		i_error("Committing copied mails to %s failed: %s", mailbox,
-			mailbox_get_last_error(dest_box, NULL));
+			mailbox_get_last_internal_error(dest_box, NULL));
 		ret = -1;
 	}
 	return ret;
@@ -131,7 +134,7 @@ cmd_import_box(struct import_cmd_context *ctx, struct mail_user *dest_user,
 	struct mail *mail;
 	int ret = 0;
 
-	if (doveadm_mail_iter_init(&ctx->ctx, info, search_args, 0, NULL,
+	if (doveadm_mail_iter_init(&ctx->ctx, info, search_args, 0, NULL, TRUE,
 				   &iter) < 0)
 		return -1;
 
@@ -152,6 +155,32 @@ cmd_import_box(struct import_cmd_context *ctx, struct mail_user *dest_user,
 	return ret;
 }
 
+static void cmd_import_init_source_user(struct import_cmd_context *ctx, struct mail_user *dest_user)
+{
+	struct mail_storage_service_input input;
+	struct mail_storage_service_user *service_user;
+	struct mail_user *user;
+	const char *error;
+
+	/* create a user for accessing the source storage */
+	i_zero(&input);
+	input.module = "mail";
+	input.username = ctx->src_username != NULL ?
+			 ctx->src_username :
+			 dest_user->username;
+
+	input.flags_override_add = MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES |
+		MAIL_STORAGE_SERVICE_FLAG_NO_RESTRICT_ACCESS;
+	if (mail_storage_service_lookup_next(ctx->ctx.storage_service, &input,
+					     &service_user, &user, &error) < 0)
+		i_fatal("Import user initialization failed: %s", error);
+	if (mail_namespaces_init_location(user, ctx->src_location, &error) < 0)
+		i_fatal("Import namespace initialization failed: %s", error);
+
+	ctx->src_user = user;
+	mail_storage_service_user_unref(&service_user);
+}
+
 static int
 cmd_import_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 {
@@ -162,6 +191,9 @@ cmd_import_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	struct doveadm_mailbox_list_iter *iter;
 	const struct mailbox_info *info;
 	int ret = 0;
+
+	if (ctx->src_user == NULL)
+		cmd_import_init_source_user(ctx, user);
 
 	iter = doveadm_mailbox_list_iter_init(_ctx, ctx->src_user,
 					      _ctx->search_args, iter_flags);
@@ -178,39 +210,20 @@ static void cmd_import_init(struct doveadm_mail_cmd_context *_ctx,
 			    const char *const args[])
 {
 	struct import_cmd_context *ctx = (struct import_cmd_context *)_ctx;
-	struct mail_storage_service_input input;
-	struct mail_storage_service_user *service_user;
-	struct mail_user *user;
-	const char *src_location, *error;
 
 	if (str_array_length(args) < 3)
 		doveadm_mail_help_name("import");
-	src_location = args[0];
+	ctx->src_location = p_strdup(_ctx->pool, args[0]);
 	ctx->dest_parent = p_strdup(_ctx->pool, args[1]);
 	ctx->ctx.search_args = doveadm_mail_build_search_args(args+2);
-
-	/* create a user for accessing the source storage */
-	memset(&input, 0, sizeof(input));
-	input.module = "mail";
-	input.username = "doveadm";
-	input.flags_override_add = MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES |
-		MAIL_STORAGE_SERVICE_FLAG_NO_RESTRICT_ACCESS;
-	input.flags_override_remove = MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP;
-	if (mail_storage_service_lookup_next(ctx->ctx.storage_service, &input,
-					     &service_user, &user, &error) < 0)
-		i_fatal("Import user initialization failed: %s", error);
-	if (mail_namespaces_init_location(user, src_location, &error) < 0)
-		i_fatal("Import namespace initialization failed: %s", error);
-
-	ctx->src_user = user;
-	mail_storage_service_user_free(&service_user);
 }
 
 static void cmd_import_deinit(struct doveadm_mail_cmd_context *_ctx)
 {
 	struct import_cmd_context *ctx = (struct import_cmd_context *)_ctx;
 
-	mail_user_unref(&ctx->src_user);
+	if (ctx->src_user != NULL)
+		mail_user_unref(&ctx->src_user);
 }
 
 static bool cmd_import_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
@@ -218,6 +231,9 @@ static bool cmd_import_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
 	struct import_cmd_context *ctx = (struct import_cmd_context *)_ctx;
 
 	switch (c) {
+	case 'U':
+		ctx->src_username = p_strdup(_ctx->pool, optarg);
+		break;
 	case 's':
 		ctx->subscribe = TRUE;
 		break;
@@ -240,7 +256,16 @@ static struct doveadm_mail_cmd_context *cmd_import_alloc(void)
 	return &ctx->ctx;
 }
 
-struct doveadm_mail_cmd cmd_import = {
-	cmd_import_alloc, "import",
-	"[-s] <source mail location> <dest parent mailbox> <search query>"
+struct doveadm_cmd_ver2 doveadm_cmd_import_ver2 = {
+	.name = "import",
+	.mail_cmd = cmd_import_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "[-U source-user] [-s] <source mail location> <dest parent mailbox> <search query>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('U', "source-user", CMD_PARAM_STR, 0)
+DOVEADM_CMD_PARAM('s', "subscribe", CMD_PARAM_BOOL, 0)
+DOVEADM_CMD_PARAM('\0', "source-location", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "dest-parent-mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

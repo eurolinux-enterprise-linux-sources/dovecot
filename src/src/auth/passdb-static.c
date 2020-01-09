@@ -1,11 +1,9 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
-#include "array.h"
-#include "str.h"
-#include "var-expand.h"
 #include "passdb.h"
 #include "passdb-template.h"
+#include "password-scheme.h"
 
 struct static_passdb_module {
 	struct passdb_module module;
@@ -13,37 +11,58 @@ struct static_passdb_module {
 	const char *static_password_tmpl;
 };
 
-static void
-static_save_fields(struct auth_request *request, const char **password_r)
+static enum passdb_result
+static_save_fields(struct auth_request *request, const char **password_r, const char **scheme_r)
 {
 	struct static_passdb_module *module =
 		(struct static_passdb_module *)request->passdb->passdb;
-        const struct var_expand_table *table;
-	string_t *str = t_str_new(128);
 
-	auth_request_log_debug(request, "static", "lookup");
+	*password_r = NULL;
+	*scheme_r = NULL;
+
+	auth_request_log_debug(request, AUTH_SUBSYS_DB, "lookup");
 	passdb_template_export(module->tmpl, request);
 
-	if (module->static_password_tmpl == NULL)
+	if (module->static_password_tmpl != NULL) {
+		*password_r = t_auth_request_var_expand(
+			module->static_password_tmpl, request, NULL);
+	} else if (auth_fields_exists(request->extra_fields, "nopassword")) {
 		*password_r = "";
-	else {
-		table = auth_request_get_var_expand_table(request, NULL);
-		var_expand(str, module->static_password_tmpl, table);
-		*password_r = str_c(str);
+	} else {
+		auth_request_log_info(request, AUTH_SUBSYS_DB,
+			"No password returned (and no nopassword)");
+		return PASSDB_RESULT_PASSWORD_MISMATCH;
 	}
+
+	*scheme_r = password_get_scheme(password_r);
+
+	if (*scheme_r == NULL)
+		*scheme_r = STATIC_PASS_SCHEME;
+
+	auth_request_set_field(request, "password",
+			       *password_r, *scheme_r);
+
+	return PASSDB_RESULT_OK;
 }
 
 static void
 static_verify_plain(struct auth_request *request, const char *password,
 		    verify_plain_callback_t *callback)
 {
+	enum passdb_result result;
 	const char *static_password;
+	const char *static_scheme;
+
 	int ret;
 
-	static_save_fields(request, &static_password);
+	result = static_save_fields(request, &static_password, &static_scheme);
+	if (result != PASSDB_RESULT_OK) {
+		callback(result, request);
+		return;
+	}
 
 	ret = auth_request_password_verify(request, password, static_password,
-					   STATIC_PASS_SCHEME, "static");
+					   static_scheme, AUTH_SUBSYS_DB);
 	if (ret <= 0) {
 		callback(PASSDB_RESULT_PASSWORD_MISMATCH, request);
 		return;
@@ -56,11 +75,13 @@ static void
 static_lookup_credentials(struct auth_request *request,
 			  lookup_credentials_callback_t *callback)
 {
+	enum passdb_result result;
 	const char *static_password;
+	const char *static_scheme;
 
-	static_save_fields(request, &static_password);
-	passdb_handle_credentials(PASSDB_RESULT_OK, static_password,
-				  STATIC_PASS_SCHEME, callback, request);
+	result = static_save_fields(request, &static_password, &static_scheme);
+	passdb_handle_credentials(result, static_password,
+				  static_scheme, callback, request);
 }
 
 static struct passdb_module *

@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -39,10 +39,18 @@ static int cmd_index_box_precache(struct mailbox *box)
 	int ret = 0;
 
 	if (mailbox_get_metadata(box, MAILBOX_METADATA_PRECACHE_FIELDS,
-				 &metadata) < 0 ||
-	    mailbox_get_status(box, STATUS_MESSAGES | STATUS_LAST_CACHED_SEQ,
-			       &status) < 0)
+				 &metadata) < 0) {
+		i_error("Mailbox %s: Precache-fields lookup failed: %s",
+			mailbox_get_vname(box),
+			mailbox_get_last_internal_error(box, NULL));
+	}
+	if (mailbox_get_status(box, STATUS_MESSAGES | STATUS_LAST_CACHED_SEQ,
+			       &status) < 0) {
+		i_error("Mailbox %s: Status lookup failed: %s",
+			mailbox_get_vname(box),
+			mailbox_get_last_internal_error(box, NULL));
 		return -1;
+	}
 
 	seq = status.last_cached_seq + 1;
 	if (seq > status.messages) {
@@ -74,10 +82,18 @@ static int cmd_index_box_precache(struct mailbox *box)
 	}
 	if (doveadm_verbose)
 		printf("\r%u/%u\n", counter, max);
-	if (mailbox_search_deinit(&ctx) < 0)
+	if (mailbox_search_deinit(&ctx) < 0) {
+		i_error("Mailbox %s: Mail search failed: %s",
+			mailbox_get_vname(box),
+			mailbox_get_last_internal_error(box, NULL));
 		ret = -1;
-	if (mailbox_transaction_commit(&trans) < 0)
+	}
+	if (mailbox_transaction_commit(&trans) < 0) {
+		i_error("Mailbox %s: Transaction commit failed: %s",
+			mailbox_get_vname(box),
+			mailbox_get_last_internal_error(box, NULL));
 		ret = -1;
+	}
 	return ret;
 }
 
@@ -90,13 +106,14 @@ cmd_index_box(struct index_cmd_context *ctx, const struct mailbox_info *info)
 
 	box = mailbox_alloc(info->ns->list, info->vname,
 			    MAILBOX_FLAG_IGNORE_ACLS);
+	mailbox_set_reason(box, ctx->ctx.cmd->name);
 	if (ctx->max_recent_msgs != 0) {
 		/* index only if there aren't too many recent messages.
 		   don't bother syncing the mailbox, that alone can take a
 		   while with large maildirs. */
 		if (mailbox_open(box) < 0) {
 			i_error("Opening mailbox %s failed: %s", info->vname,
-				mail_storage_get_last_error(mailbox_get_storage(box), NULL));
+				mailbox_get_last_internal_error(box, NULL));
 			doveadm_mail_failed_mailbox(&ctx->ctx, box);
 			mailbox_free(&box);
 			return -1;
@@ -111,7 +128,7 @@ cmd_index_box(struct index_cmd_context *ctx, const struct mailbox_info *info)
 
 	if (mailbox_sync(box, MAILBOX_SYNC_FLAG_FULL_READ) < 0) {
 		i_error("Syncing mailbox %s failed: %s", info->vname,
-			mail_storage_get_last_error(mailbox_get_storage(box), NULL));
+			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_mailbox(&ctx->ctx, box);
 		ret = -1;
 	} else {
@@ -143,6 +160,7 @@ static void cmd_index_queue(struct index_cmd_context *ctx,
 {
 	if (ctx->queue_fd == -1)
 		index_queue_connect(ctx);
+	i_assert(ctx->queue_fd != -1);
 
 	T_BEGIN {
 		string_t *str = t_str_new(256);
@@ -192,7 +210,8 @@ cmd_index_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 		} T_END;
 	}
 	if (mailbox_list_iter_deinit(&iter) < 0) {
-		i_error("Listing mailboxes failed");
+		i_error("Listing mailboxes failed: %s",
+			mailbox_list_get_last_internal_error(user->namespaces->list, NULL));
 		doveadm_mail_failed_error(_ctx, MAIL_ERROR_TEMP);
 		ret = -1;
 	}
@@ -261,6 +280,14 @@ static struct doveadm_mail_cmd_context *cmd_index_alloc(void)
 	return &ctx->ctx;
 }
 
-struct doveadm_mail_cmd cmd_index = {
-	cmd_index_alloc, "index", "[-q] [-n <max recent>] <mailbox mask>"
+struct doveadm_cmd_ver2 doveadm_cmd_index_ver2 = {
+	.name = "index",
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX"[-q] [-n <max recent>] <mailbox mask>",
+	.mail_cmd = cmd_index_alloc,
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('q',"queue",CMD_PARAM_BOOL,0)
+DOVEADM_CMD_PARAM('n',"max-recent",CMD_PARAM_STR,0)
+DOVEADM_CMD_PARAM('\0',"mailbox-mask",CMD_PARAM_STR,CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

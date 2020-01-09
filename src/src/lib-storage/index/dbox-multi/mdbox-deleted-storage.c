@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -183,7 +183,7 @@ static int mdbox_deleted_sync(struct mdbox_mailbox *mbox,
 	if (mdbox_deleted_mailbox_create_indexes(&mbox->box, NULL, NULL) < 0)
 		return -1;
 
-	memset(&rec, 0, sizeof(rec));
+	i_zero(&rec);
 	rec.save_date = ioloop_time;
 
 	sync_flags = index_storage_get_sync_flags(&mbox->box);
@@ -230,13 +230,8 @@ mdbox_deleted_storage_sync_init(struct mailbox *box,
 	enum mdbox_sync_flags mdbox_sync_flags = 0;
 	int ret = 0;
 
-	if (!box->opened) {
-		if (mailbox_open(box) < 0)
-			ret = -1;
-	}
-
-	if (ret == 0 && (index_mailbox_want_full_sync(&mbox->box, flags) ||
-			 mbox->storage->corrupted))
+	if (index_mailbox_want_full_sync(&mbox->box, flags) ||
+	    mbox->storage->corrupted)
 		ret = mdbox_deleted_sync(mbox, mdbox_sync_flags);
 
 	return index_mailbox_sync_init(box, flags, ret < 0);
@@ -258,7 +253,8 @@ struct mail_storage mdbox_deleted_storage = {
 		dbox_storage_get_list_settings,
 		NULL,
 		mdbox_deleted_mailbox_alloc,
-		NULL
+		NULL,
+		NULL,
 	}
 };
 

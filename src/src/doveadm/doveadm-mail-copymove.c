@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "mail-storage.h"
@@ -13,6 +13,7 @@
 struct copy_cmd_context {
 	struct doveadm_mail_cmd_context ctx;
 
+	const char *source_username;
 	struct mail_storage_service_user *source_service_user;
 	struct mail_user *source_user;
 
@@ -28,10 +29,10 @@ cmd_copy_box(struct copy_cmd_context *ctx, struct mailbox *destbox,
 	struct mailbox_transaction_context *desttrans;
 	struct mail_save_context *save_ctx;
 	struct mail *mail;
-	int ret = 0;
+	int ret = 0, ret2;
 
 	if (doveadm_mail_iter_init(&ctx->ctx, info, ctx->ctx.search_args, 0,
-				   NULL, &iter) < 0)
+				   NULL, FALSE, &iter) < 0)
 		return -1;
 
 	/* use a separately committed transaction for each mailbox.
@@ -43,13 +44,15 @@ cmd_copy_box(struct copy_cmd_context *ctx, struct mailbox *destbox,
 	while (doveadm_mail_iter_next(iter, &mail)) {
 		save_ctx = mailbox_save_alloc(desttrans);
 		mailbox_save_copy_flags(save_ctx, mail);
-		if (mailbox_copy(&save_ctx, mail) == 0) {
-			if (ctx->move)
-				mail_expunge(mail);
-		} else {
-			i_error("Copying message UID %u from '%s' failed: %s",
+		if (ctx->move)
+			ret2 = mailbox_move(&save_ctx, mail);
+		else
+			ret2 = mailbox_copy(&save_ctx, mail);
+		if (ret2 < 0) {
+			i_error("%s message UID %u from '%s' failed: %s",
+				ctx->move ? "Moving" : "Copying",
 				mail->uid, info->vname,
-				mailbox_get_last_error(destbox, NULL));
+				mailbox_get_last_internal_error(destbox, NULL));
 			doveadm_mail_failed_mailbox(&ctx->ctx, destbox);
 			ret = -1;
 		}
@@ -58,7 +61,7 @@ cmd_copy_box(struct copy_cmd_context *ctx, struct mailbox *destbox,
 	if (mailbox_transaction_commit(&desttrans) < 0) {
 		i_error("Committing %s mails failed: %s",
 			ctx->move ? "moved" : "copied",
-			mailbox_get_last_error(destbox, NULL));
+			mailbox_get_last_internal_error(destbox, NULL));
 		doveadm_mail_failed_mailbox(&ctx->ctx, destbox);
 		/* rollback expunges */
 		doveadm_mail_iter_deinit_rollback(&iter);
@@ -71,13 +74,13 @@ cmd_copy_box(struct copy_cmd_context *ctx, struct mailbox *destbox,
 }
 
 static void
-cmd_copy_alloc_source_user(struct copy_cmd_context *ctx, const char *username)
+cmd_copy_alloc_source_user(struct copy_cmd_context *ctx)
 {
 	struct mail_storage_service_input input;
 	const char *error;
 
 	input = ctx->ctx.storage_service_input;
-	input.username = username;
+	input.username = ctx->source_username;
 
 	if (mail_storage_service_lookup_next(ctx->ctx.storage_service, &input,
 					     &ctx->source_service_user,
@@ -100,11 +103,15 @@ cmd_copy_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	const struct mailbox_info *info;
 	int ret = 0;
 
+	if (ctx->source_username != NULL && ctx->source_user == NULL)
+		cmd_copy_alloc_source_user(ctx);
+
 	ns = mail_namespace_find(user->namespaces, ctx->destname);
 	destbox = mailbox_alloc(ns->list, ctx->destname, MAILBOX_FLAG_SAVEONLY);
+	mailbox_set_reason(destbox, _ctx->cmd->name);
 	if (mailbox_open(destbox) < 0) {
 		i_error("Can't open mailbox '%s': %s", ctx->destname,
-			mailbox_get_last_error(destbox, NULL));
+			mailbox_get_last_internal_error(destbox, NULL));
 		doveadm_mail_failed_mailbox(&ctx->ctx, destbox);
 		mailbox_free(&destbox);
 		return -1;
@@ -122,7 +129,7 @@ cmd_copy_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 
 	if (mailbox_sync(destbox, 0) < 0) {
 		i_error("Syncing mailbox '%s' failed: %s", ctx->destname,
-			mailbox_get_last_error(destbox, NULL));
+			mailbox_get_last_internal_error(destbox, NULL));
 		doveadm_mail_failed_mailbox(&ctx->ctx, destbox);
 		ret = -1;
 	}
@@ -146,7 +153,7 @@ static void cmd_copy_init(struct doveadm_mail_cmd_context *_ctx,
 		     MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP) == 0)
 			i_fatal("Use -u parameter to specify destination user");
 
-		cmd_copy_alloc_source_user(ctx, args[1]);
+		ctx->source_username = p_strdup(_ctx->pool, args[1]);
 		args += 2;
 	}
 
@@ -161,7 +168,7 @@ static void cmd_copy_deinit(struct doveadm_mail_cmd_context *_ctx)
 	struct copy_cmd_context *ctx = (struct copy_cmd_context *)_ctx;
 
 	if (ctx->source_user != NULL) {
-		mail_storage_service_user_free(&ctx->source_service_user);
+		mail_storage_service_user_unref(&ctx->source_service_user);
 		mail_user_unref(&ctx->source_user);
 	}
 }
@@ -187,9 +194,28 @@ static struct doveadm_mail_cmd_context *cmd_move_alloc(void)
 	return &ctx->ctx;
 }
 
-struct doveadm_mail_cmd cmd_copy = {
-	cmd_copy_alloc, "copy", "<destination> [user <source user>] <search query>"
+struct doveadm_cmd_ver2 doveadm_cmd_copy_ver2 = {
+	.name = "copy",
+	.mail_cmd = cmd_copy_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<destination> [user <source user>] <search query>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "destination-mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "source-type", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "source-user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };
-struct doveadm_mail_cmd cmd_move = {
-	cmd_move_alloc, "move", "<destination> [user <source user>] <search query>"
+
+struct doveadm_cmd_ver2 doveadm_cmd_move_ver2 = {
+	.name = "move",
+	.mail_cmd = cmd_move_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<destination> [user <source user>] <search query>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "destination-mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "source-type", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "source-user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

@@ -76,6 +76,38 @@ struct sql_db_vfuncs {
 
 	void (*update)(struct sql_transaction_context *ctx, const char *query,
 		       unsigned int *affected_rows);
+	const char *(*escape_blob)(struct sql_db *db,
+				   const unsigned char *data, size_t size);
+	void (*transaction_commit2)(struct sql_transaction_context *ctx,
+				    sql_commit2_callback_t *callback,
+				    void *context);
+
+	struct sql_prepared_statement *
+		(*prepared_statement_init)(struct sql_db *db,
+					   const char *query_template);
+	void (*prepared_statement_deinit)(struct sql_prepared_statement *prep_stmt);
+
+
+	struct sql_statement *
+		(*statement_init)(struct sql_db *db, const char *query_template);
+	struct sql_statement *
+		(*statement_init_prepared)(struct sql_prepared_statement *prep_stmt);
+	void (*statement_abort)(struct sql_statement *stmt);
+	void (*statement_set_timestamp)(struct sql_statement *stmt,
+					const struct timespec *ts);
+	void (*statement_bind_str)(struct sql_statement *stmt,
+				   unsigned int column_idx, const char *value);
+	void (*statement_bind_binary)(struct sql_statement *stmt,
+				      unsigned int column_idx, const void *value,
+				      size_t value_size);
+	void (*statement_bind_int64)(struct sql_statement *stmt,
+				     unsigned int column_idx, int64_t value);
+	void (*statement_query)(struct sql_statement *stmt,
+				sql_query_callback_t *callback, void *context);
+	struct sql_result *(*statement_query_s)(struct sql_statement *stmt);
+	void (*update_stmt)(struct sql_transaction_context *ctx,
+			    struct sql_statement *stmt,
+			    unsigned int *affected_rows);
 };
 
 struct sql_db {
@@ -121,6 +153,20 @@ struct sql_result_vfuncs {
 	const char *const *(*get_values)(struct sql_result *result);
 
 	const char *(*get_error)(struct sql_result *result);
+	void (*more)(struct sql_result **result, bool async,
+		     sql_query_callback_t *callback, void *context);
+};
+
+struct sql_prepared_statement {
+	struct sql_db *db;
+};
+
+struct sql_statement {
+	struct sql_db *db;
+
+	pool_t pool;
+	const char *query_template;
+	ARRAY_TYPE(const_string) args;
 };
 
 struct sql_field_map {
@@ -139,6 +185,7 @@ struct sql_result {
 	struct sql_field_map *map;
 	void *fetch_dest;
 	size_t fetch_dest_size;
+	enum sql_result_error_type error_type;
 
 	unsigned int failed:1;
 	unsigned int failed_try_retry:1;
@@ -164,5 +211,6 @@ void sql_db_set_state(struct sql_db *db, enum sql_db_state state);
 
 void sql_transaction_add_query(struct sql_transaction_context *ctx, pool_t pool,
 			       const char *query, unsigned int *affected_rows);
+const char *sql_statement_get_query(struct sql_statement *stmt);
 
 #endif

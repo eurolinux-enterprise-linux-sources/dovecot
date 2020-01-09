@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -37,21 +37,30 @@ static bool http_url_parse_authority(struct http_url_parser *url_parser)
 
 	if ((ret = uri_parse_authority(parser, &auth)) < 0)
 		return FALSE;
+	if (auth.host_literal == NULL || *auth.host_literal == '\0') {
+		/* RFC 7230, Section 2.7.1: http URI Scheme
+
+		   A sender MUST NOT generate an "http" URI with an empty host
+		   identifier.  A recipient that processes such a URI reference MUST
+		   reject it as invalid.
+		 */
+		parser->error = "HTTP URL does not allow empty host identifier";
+		return FALSE;
+	}
 	if (ret > 0) {
 		if (auth.enc_userinfo != NULL) {
 			const char *p;
 
 			if ((url_parser->flags & HTTP_URL_ALLOW_USERINFO_PART) == 0) {
-				/* http://tools.ietf.org/html/draft-ietf-httpbis-p1-messaging-20
+				/* RFC 7230, Section 2.7.1: http URI Scheme
 
-					 Section 2.8.1:
-
-					 {...} Senders MUST NOT include a userinfo subcomponent (and its "@"
-					 delimiter) when transmitting an "http" URI in a message. Recipients
-					 of HTTP messages that contain a URI reference SHOULD parse for the
-					 existence of userinfo and treat its presence as an error, likely
-					 indicating that the deprecated subcomponent is being used to
-					 obscure the authority for the sake of phishing attacks.
+				   A sender MUST NOT generate the userinfo subcomponent (and its "@"
+				   delimiter) when an "http" URI reference is generated within a
+				   message as a request target or header field value.  Before making
+				   use of an "http" URI reference received from an untrusted source,
+				   a recipient SHOULD parse for userinfo and treat its presence as
+				   an error; it is likely being used to obscure the authority for
+				   the sake of phishing attacks.
 				 */
 				parser->error = "HTTP URL does not allow `userinfo@' part";
 				return FALSE;
@@ -104,14 +113,12 @@ static bool http_url_do_parse(struct http_url_parser *url_parser)
 	const char *part;
 	int ret;
 
-	/*
-	   http://tools.ietf.org/html/draft-ietf-httpbis-p1-messaging-23
-	     Appendix C:
+	/* RFC 7230, Appendix B:
 
 	   http-URI       = "http://" authority path-abempty [ "?" query ]
-	                      [ "#" fragment ]
+	                    [ "#" fragment ]
 	   https-URI      = "https://" authority path-abempty [ "?" query ]
-	                      [ "#" fragment ]
+	                    [ "#" fragment ]
 	   partial-URI    = relative-part [ "?" query ]
 
 	   request-target = origin-form / absolute-form / authority-form /
@@ -121,12 +128,11 @@ static bool http_url_do_parse(struct http_url_parser *url_parser)
 	   absolute-form  = absolute-URI
 	   authority-form = authority
 	   asterisk-form  = "*"
-	                    ; Not parsed here
+	                  ; Not parsed here
 
 	   absolute-path  = 1*( "/" segment )
 
-	   http://tools.ietf.org/html/rfc3986
-	     Appendix A: (implemented in uri-util.h)
+	   RFC 3986, Appendix A: (implemented in uri-util.h)
 
 	   absolute-URI   = scheme ":" hier-part [ "?" query ]
 
@@ -295,8 +301,6 @@ static bool http_url_do_parse(struct http_url_parser *url_parser)
 	if ((ret = uri_parse_query(parser, &part)) < 0)
 		return FALSE;
 	if (ret > 0) {
-		if (!uri_data_decode(parser, part, NULL, NULL)) // check only
-			return FALSE;
 		if (url != NULL)
 			url->enc_query = p_strdup(parser->pool, part);
 	} else if (relative && !have_path && url != NULL) {
@@ -311,18 +315,14 @@ static bool http_url_do_parse(struct http_url_parser *url_parser)
 			parser->error = "URL fragment not allowed for HTTP URL in this context";
 			return FALSE;
 		}
-		if (!uri_data_decode(parser, part, NULL, NULL)) // check only
-			return FALSE;
 		if (url != NULL)
 			url->enc_fragment =  p_strdup(parser->pool, part);
 	} else if (relative && !have_path && url != NULL) {
 		url->enc_fragment = p_strdup(parser->pool, base->enc_fragment);
 	}
 
-	if (parser->cur != parser->end) {
-		parser->error = "HTTP URL contains invalid character";
-		return FALSE;
-	}
+	/* must be at end of URL now */
+	i_assert(parser->cur == parser->end);
 
 	if (have_scheme)
 		url_parser->req_format = HTTP_REQUEST_TARGET_FORMAT_ABSOLUTE;
@@ -343,6 +343,7 @@ int http_url_parse(const char *url, struct http_url *base,
 
 	memset(&url_parser, '\0', sizeof(url_parser));
 	uri_parser_init(&url_parser.parser, pool, url);
+	url_parser.parser.allow_pct_nul = (flags & HTTP_URL_ALLOW_PCT_NUL) != 0;
 
 	url_parser.url = p_new(pool, struct http_url, 1);
 	url_parser.base = base;
@@ -391,7 +392,7 @@ int http_url_request_target_parse(const char *request_target,
 		return 0;
 	}
 
-	memset(&base, 0, sizeof(base));
+	i_zero(&base);
 	base.host_name = host.host_literal;
 	base.host_ip = host.host_ip;
 	base.port = host.port;
@@ -424,6 +425,7 @@ int http_url_request_target_parse(const char *request_target,
 void http_url_copy_authority(pool_t pool, struct http_url *dest,
 	const struct http_url *src)
 {
+	i_zero(dest);
 	dest->host_name = p_strdup(pool, src->host_name);
 	if (src->have_host_ip) {
 		dest->host_ip = src->host_ip;
@@ -436,6 +438,17 @@ void http_url_copy_authority(pool_t pool, struct http_url *dest,
 	dest->have_ssl = src->have_ssl;
 }
 
+struct http_url *http_url_clone_authority(pool_t pool,
+	const struct http_url *src)
+{
+	struct http_url *new_url;
+
+	new_url = p_new(pool, struct http_url, 1);
+	http_url_copy_authority(pool, new_url, src);
+
+	return new_url;
+}
+
 void http_url_copy(pool_t pool, struct http_url *dest,
 	const struct http_url *src)
 {
@@ -445,7 +458,15 @@ void http_url_copy(pool_t pool, struct http_url *dest,
 	dest->enc_fragment = p_strdup(pool, src->enc_fragment);
 }
 
-struct http_url *http_url_clone(pool_t pool,const struct http_url *src)
+void http_url_copy_with_userinfo(pool_t pool, struct http_url *dest,
+	const struct http_url *src)
+{
+	http_url_copy(pool, dest, src);
+	dest->user = p_strdup(pool, src->user);
+	dest->password = p_strdup(pool, src->password);
+}
+
+struct http_url *http_url_clone(pool_t pool, const struct http_url *src)
 {
 	struct http_url *new_url;
 
@@ -454,6 +475,18 @@ struct http_url *http_url_clone(pool_t pool,const struct http_url *src)
 
 	return new_url;
 }
+
+struct http_url *http_url_clone_with_userinfo(pool_t pool,
+	const struct http_url *src)
+{
+	struct http_url *new_url;
+
+	new_url = p_new(pool, struct http_url, 1);
+	http_url_copy_with_userinfo(pool, new_url, src);
+
+	return new_url;
+}
+
 
 /*
  * HTTP URL construction

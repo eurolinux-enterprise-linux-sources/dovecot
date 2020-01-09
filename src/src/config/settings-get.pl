@@ -10,6 +10,7 @@ print '#include "fsync-mode.h"'."\n";
 print '#include "hash-format.h"'."\n";
 print '#include "net.h"'."\n";
 print '#include "unichar.h"'."\n";
+print '#include "hash-method.h"'."\n";
 print '#include "settings-parser.h"'."\n";
 print '#include "all-settings.h"'."\n";
 print '#include <stddef.h>'."\n";
@@ -37,11 +38,11 @@ foreach my $file (@ARGV) {
   while (<$f>) {
     my $write = 0;
     if ($state == 0) {
-      if (/struct .*_settings {/ ||
-	  /struct setting_define.*{/ ||
-	  /struct .*_default_settings = {/) {
+      if (/struct .*_settings \{/ ||
+	  /struct setting_define.*\{/ ||
+	  /struct .*_default_settings = \{/) {
 	$state++;
-      } elsif (/^struct service_settings (.*) = {/) {
+      } elsif (/^struct service_settings (.*) = \{/) {
 	$state++;
 	if ($ifdef eq "") {
 	  $state_ifdef = 0;
@@ -51,7 +52,7 @@ foreach my $file (@ARGV) {
 	}
 	push @services, $1;
 	push @service_ifdefs, $ifdef;
-      } elsif (/^(static )?const struct setting_parser_info (.*) = {/) {
+      } elsif (/^(static )?const struct setting_parser_info (.*) = \{/) {
 	$cur_name = $2;
 	$state++ if ($cur_name !~ /^\*default_/);
       } elsif (/^extern const struct setting_parser_info (.*);/) {
@@ -132,7 +133,7 @@ for (my $i = 0; $i < scalar(@services); $i++) {
 }
 print "};\n";
 print "buffer_t config_all_services_buf = {\n";
-print "\tconfig_all_services, sizeof(config_all_services), { 0, }\n";
+print "\tconfig_all_services, sizeof(config_all_services), { NULL, }\n";
 print "};\n";
 
 print "const struct setting_parser_info *all_default_roots[] = {\n";

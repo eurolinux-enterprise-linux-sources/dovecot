@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -30,16 +30,33 @@ static const struct setting_define mail_storage_setting_defines[] = {
 	DEF(SET_STR_VARS, mail_attachment_dir),
 	DEF(SET_STR, mail_attachment_hash),
 	DEF(SET_SIZE, mail_attachment_min_size),
+	DEF(SET_STR, mail_attachment_detection_options),
 	DEF(SET_STR_VARS, mail_attribute_dict),
 	DEF(SET_UINT, mail_prefetch_count),
 	DEF(SET_STR, mail_cache_fields),
 	DEF(SET_STR, mail_always_cache_fields),
 	DEF(SET_STR, mail_never_cache_fields),
+	DEF(SET_STR, mail_server_comment),
+	DEF(SET_STR, mail_server_admin),
 	DEF(SET_UINT, mail_cache_min_mail_count),
+	DEF(SET_TIME, mail_cache_unaccessed_field_drop),
+	DEF(SET_SIZE, mail_cache_record_max_size),
+	DEF(SET_SIZE, mail_cache_compress_min_size),
+	DEF(SET_UINT, mail_cache_compress_delete_percentage),
+	DEF(SET_UINT, mail_cache_compress_continued_percentage),
+	DEF(SET_UINT, mail_cache_compress_header_continue_count),
+	DEF(SET_SIZE, mail_index_rewrite_min_log_bytes),
+	DEF(SET_SIZE, mail_index_rewrite_max_log_bytes),
+	DEF(SET_SIZE, mail_index_log_rotate_min_size),
+	DEF(SET_SIZE, mail_index_log_rotate_max_size),
+	DEF(SET_TIME, mail_index_log_rotate_min_age),
+	DEF(SET_TIME, mail_index_log2_max_age),
 	DEF(SET_TIME, mailbox_idle_check_interval),
 	DEF(SET_UINT, mail_max_keyword_length),
 	DEF(SET_TIME, mail_max_lock_timeout),
 	DEF(SET_TIME, mail_temp_scan_interval),
+	DEF(SET_UINT, mail_vsize_bg_after_count),
+	DEF(SET_UINT, mail_sort_max_read_count),
 	DEF(SET_BOOL, mail_save_crlf),
 	DEF(SET_ENUM, mail_fsync),
 	DEF(SET_BOOL, mmap_disable),
@@ -47,6 +64,8 @@ static const struct setting_define mail_storage_setting_defines[] = {
 	DEF(SET_BOOL, mail_nfs_storage),
 	DEF(SET_BOOL, mail_nfs_index),
 	DEF(SET_BOOL, mailbox_list_index),
+	DEF(SET_BOOL, mailbox_list_index_very_dirty_syncs),
+	DEF(SET_BOOL, mailbox_list_index_include_inbox),
 	DEF(SET_BOOL, mail_debug),
 	DEF(SET_BOOL, mail_full_filesystem_access),
 	DEF(SET_BOOL, maildir_stat_dirs),
@@ -67,16 +86,33 @@ const struct mail_storage_settings mail_storage_default_settings = {
 	.mail_attachment_dir = "",
 	.mail_attachment_hash = "%{sha1}",
 	.mail_attachment_min_size = 1024*128,
+	.mail_attachment_detection_options = "",
 	.mail_attribute_dict = "",
 	.mail_prefetch_count = 0,
 	.mail_cache_fields = "flags",
 	.mail_always_cache_fields = "",
 	.mail_never_cache_fields = "imap.envelope",
+	.mail_server_comment = "",
+	.mail_server_admin = "",
 	.mail_cache_min_mail_count = 0,
+	.mail_cache_unaccessed_field_drop = 60*60*24*30,
+	.mail_cache_record_max_size = 64 * 1024,
+	.mail_cache_compress_min_size = 32 * 1024,
+	.mail_cache_compress_delete_percentage = 20,
+	.mail_cache_compress_continued_percentage = 200,
+	.mail_cache_compress_header_continue_count = 4,
+	.mail_index_rewrite_min_log_bytes = 8 * 1024,
+	.mail_index_rewrite_max_log_bytes = 128 * 1024,
+	.mail_index_log_rotate_min_size = 32 * 1024,
+	.mail_index_log_rotate_max_size = 1024 * 1024,
+	.mail_index_log_rotate_min_age = 5 * 60,
+	.mail_index_log2_max_age = 3600 * 24 * 2,
 	.mailbox_idle_check_interval = 30,
 	.mail_max_keyword_length = 50,
 	.mail_max_lock_timeout = 0,
 	.mail_temp_scan_interval = 7*24*60*60,
+	.mail_vsize_bg_after_count = 0,
+	.mail_sort_max_read_count = 0,
 	.mail_save_crlf = FALSE,
 	.mail_fsync = "optimized:never:always",
 	.mmap_disable = FALSE,
@@ -84,6 +120,8 @@ const struct mail_storage_settings mail_storage_default_settings = {
 	.mail_nfs_storage = FALSE,
 	.mail_nfs_index = FALSE,
 	.mailbox_list_index = FALSE,
+	.mailbox_list_index_very_dirty_syncs = FALSE,
+	.mailbox_list_index_include_inbox = FALSE,
 	.mail_debug = FALSE,
 	.mail_full_filesystem_access = FALSE,
 	.maildir_stat_dirs = FALSE,
@@ -119,6 +157,9 @@ static const struct setting_define mailbox_setting_defines[] = {
 	{ SET_ENUM, "auto", offsetof(struct mailbox_settings, autocreate), NULL } ,
 	DEF(SET_STR, special_use),
 	DEF(SET_STR, driver),
+	DEF(SET_STR, comment),
+	DEF(SET_TIME, autoexpunge),
+	DEF(SET_UINT, autoexpunge_max_mails),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -129,7 +170,10 @@ const struct mailbox_settings mailbox_default_settings = {
 		MAILBOX_SET_AUTO_CREATE":"
 		MAILBOX_SET_AUTO_SUBSCRIBE,
 	.special_use = "",
-	.driver = ""
+	.driver = "",
+	.comment = "",
+	.autoexpunge = 0,
+	.autoexpunge_max_mails = 0
 };
 
 const struct setting_parser_info mailbox_setting_parser_info = {
@@ -169,6 +213,7 @@ static const struct setting_define mail_namespace_setting_defines[] = {
 	DEF(SET_BOOL, subscriptions),
 	DEF(SET_BOOL, ignore_on_failure),
 	DEF(SET_BOOL, disabled),
+	DEF(SET_UINT, order),
 
 	DEFLIST_UNIQUE(mailboxes, "mailbox", &mailbox_setting_parser_info),
 
@@ -189,6 +234,7 @@ const struct mail_namespace_settings mail_namespace_default_settings = {
 	.subscriptions = TRUE,
 	.ignore_on_failure = FALSE,
 	.disabled = FALSE,
+	.order = 0,
 
 	.mailboxes = ARRAY_INIT
 };
@@ -312,6 +358,13 @@ const void *mail_storage_get_driver_settings(struct mail_storage *storage)
 						 storage->name);
 }
 
+const void *mail_namespace_get_driver_settings(struct mail_namespace *ns,
+					       struct mail_storage *storage)
+{
+	return mail_user_set_get_driver_settings(storage->user->set_info,
+						 ns->user_set, storage->name);
+}
+
 const struct dynamic_settings_parser *
 mail_storage_get_dynamic_parsers(pool_t pool)
 {
@@ -320,7 +373,7 @@ mail_storage_get_dynamic_parsers(pool_t pool)
 	unsigned int i, j, count;
 
 	storages = array_get(&mail_storage_classes, &count);
-	parsers = p_new(pool, struct dynamic_settings_parser, count + 1);
+	parsers = p_new(pool, struct dynamic_settings_parser, 1 + count + 1);
 	parsers[0].name = MAIL_STORAGE_SET_DRIVER_NAME;
 	parsers[0].info = &mail_storage_setting_parser_info;
 
@@ -332,6 +385,7 @@ mail_storage_get_dynamic_parsers(pool_t pool)
 		parsers[j].info = storages[i]->v.get_setting_parser_info();
 		j++;
 	}
+	parsers[j].name = NULL;
 	return parsers;
 }
 
@@ -343,7 +397,7 @@ fix_base_path(struct mail_user_settings *set, pool_t pool, const char **str)
 }
 
 /* <settings checks> */
-static bool mail_storage_settings_check(void *_set, pool_t pool ATTR_UNUSED,
+static bool mail_storage_settings_check(void *_set, pool_t pool,
 					const char **error_r)
 {
 	struct mail_storage_settings *set = _set;
@@ -383,6 +437,11 @@ static bool mail_storage_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 				    &set->parsed_lock_method)) {
 		*error_r = t_strdup_printf("Unknown lock_method: %s",
 					   set->lock_method);
+		return FALSE;
+	}
+
+	if (set->mail_cache_compress_delete_percentage > 100) {
+		*error_r = "mail_cache_compress_delete_percentage can't be over 100";
 		return FALSE;
 	}
 
@@ -439,6 +498,39 @@ static bool mail_storage_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 		return FALSE;
 	}
 #endif
+
+	// FIXME: check set->mail_server_admin syntax (RFC 5464, Section 6.2.2)
+
+	/* parse mail_attachment_indicator_options */
+	if (*set->mail_attachment_detection_options != '\0') {
+		ARRAY_TYPE(const_string) content_types;
+		p_array_init(&content_types, pool, 2);
+
+		const char *const *options =
+			t_strsplit_spaces(set->mail_attachment_detection_options, " ");
+
+		while(*options != NULL) {
+			const char *opt = *options;
+
+			if (strcmp(opt, "add-flags-on-save") == 0) {
+				set->parsed_mail_attachment_detection_add_flags_on_save = TRUE;
+			} else if (strcmp(opt, "exclude-inlined") == 0) {
+				set->parsed_mail_attachment_exclude_inlined = TRUE;
+			} else if (strncmp(opt, "content-type=", 13) == 0) {
+				const char *value = p_strdup(pool, opt+13);
+				array_append(&content_types, &value, 1);
+			} else {
+				*error_r = t_strdup_printf("mail_attachment_detection_options: "
+					"Unknown option: %s", opt);
+				return FALSE;
+			}
+			options++;
+		}
+
+		array_append_zero(&content_types);
+		set->parsed_mail_attachment_content_type_filter = array_idx(&content_types, 0);
+	}
+
 	return TRUE;
 }
 

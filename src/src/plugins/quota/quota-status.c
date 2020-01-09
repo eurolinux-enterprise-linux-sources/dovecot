@@ -1,17 +1,20 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ostream.h"
 #include "connection.h"
 #include "restrict-access.h"
+#include "settings-parser.h"
 #include "master-service.h"
 #include "master-service-settings.h"
 #include "mail-namespace.h"
 #include "mail-storage.h"
 #include "mail-storage-settings.h"
 #include "mail-storage-service.h"
+#include "message-address.h"
 #include "quota-private.h"
 #include "quota-plugin.h"
+#include "quota-status-settings.h"
 
 enum quota_protocol {
 	QUOTA_PROTOCOL_UNKNOWN = 0,
@@ -25,6 +28,8 @@ struct quota_client {
 	uoff_t size;
 };
 
+static struct quota_status_settings *quota_status_settings;
+static pool_t quota_status_pool;
 static enum quota_protocol protocol;
 static struct mail_storage_service_ctx *storage_service;
 static struct connection_list *clients;
@@ -45,34 +50,30 @@ static void client_reset(struct quota_client *client)
 	i_free_and_null(client->recipient);
 }
 
-static int
-quota_check(struct mail_user *user, uoff_t mail_size,
-	    const char **error_r, bool *too_large_r)
+static enum quota_alloc_result
+quota_check(struct mail_user *user, uoff_t mail_size, const char **error_r)
 {
 	struct quota_user *quser = QUOTA_USER_CONTEXT(user);
 	struct mail_namespace *ns;
 	struct mailbox *box;
 	struct quota_transaction_context *ctx;
-	int ret;
+	enum quota_alloc_result ret;
 
 	if (quser == NULL) {
 		/* no quota for user */
-		return 1;
+		return QUOTA_ALLOC_RESULT_OK;
 	}
 
 	ns = mail_namespace_find_inbox(user->namespaces);
 	box = mailbox_alloc(ns->list, "INBOX", MAILBOX_FLAG_POST_SESSION);
+	mailbox_set_reason(box, "quota status");
 
 	ctx = quota_transaction_begin(box);
-	ret = quota_test_alloc(ctx, I_MAX(1, mail_size), too_large_r);
+	ret = quota_test_alloc(ctx, I_MAX(1, mail_size));
+	*error_r = quota_alloc_result_errstr(ret, ctx);
 	quota_transaction_rollback(&ctx);
 
 	mailbox_free(&box);
-
-	if (ret < 0)
-		*error_r = "Internal quota calculation error";
-	else if (ret == 0)
-		*error_r = quser->quota->set->quota_exceeded_msg;
 	return ret;
 }
 
@@ -82,7 +83,7 @@ static void client_handle_request(struct quota_client *client)
 	struct mail_storage_service_user *service_user;
 	struct mail_user *user;
 	const char *value = NULL, *error;
-	bool too_large;
+	const char *detail ATTR_UNUSED;
 	int ret;
 
 	if (client->recipient == NULL) {
@@ -90,33 +91,45 @@ static void client_handle_request(struct quota_client *client)
 		return;
 	}
 
-	memset(&input, 0, sizeof(input));
-	input.username = client->recipient;
-
+	i_zero(&input);
+	message_detail_address_parse(quota_status_settings->recipient_delimiter,
+				     client->recipient, &input.username,
+				     &detail);
 	ret = mail_storage_service_lookup_next(storage_service, &input,
 					       &service_user, &user, &error);
 	restrict_access_allow_coredumps(TRUE);
 	if (ret == 0) {
 		value = nouser_reply;
 	} else if (ret > 0) {
-		if ((ret = quota_check(user, client->size, &error, &too_large)) > 0) {
-			/* under quota */
-			value = mail_user_plugin_getenv(user, "quota_status_success");
+		enum quota_alloc_result qret = quota_check(user, client->size,
+							   &error);
+		switch (qret) {
+		case QUOTA_ALLOC_RESULT_OK: /* under quota */
+			value = mail_user_plugin_getenv(user,
+						"quota_status_success");
 			if (value == NULL)
 				value = "OK";
-		} else if (ret == 0) {
-			if (too_large) {
-				/* even over maximum quota */
-				value = mail_user_plugin_getenv(user, "quota_status_toolarge");
-			}
+			break;
+		case QUOTA_ALLOC_RESULT_OVER_MAXSIZE:
+		/* even over maximum quota */
+		case QUOTA_ALLOC_RESULT_OVER_QUOTA_LIMIT:
+			value = mail_user_plugin_getenv(user,
+						"quota_status_toolarge");
+			/* fall through */
+		case QUOTA_ALLOC_RESULT_OVER_QUOTA:
 			if (value == NULL)
-				value = mail_user_plugin_getenv(user, "quota_status_overquota");
+				value = mail_user_plugin_getenv(user,
+						"quota_status_overquota");
 			if (value == NULL)
 				value = t_strdup_printf("554 5.2.2 %s", error);
+			break;
+		case QUOTA_ALLOC_RESULT_TEMPFAIL:
+			ret = -1;
+			break;
 		}
 		value = t_strdup(value); /* user's pool is being freed */
 		mail_user_unref(&user);
-		mail_storage_service_user_free(&service_user);
+		mail_storage_service_user_unref(&service_user);
 	}
 	if (ret < 0) {
 		/* temporary failure */
@@ -179,25 +192,31 @@ static void main_preinit(void)
 
 static void main_init(void)
 {
+	static const struct setting_parser_info *set_roots[] = {
+		&quota_status_setting_parser_info,
+		NULL
+	};
 	struct mail_storage_service_input input;
 	const struct setting_parser_info *user_info;
 	const struct setting_parser_context *set_parser;
 	const struct mail_user_settings *user_set;
+	const struct quota_status_settings *set;
 	const char *value, *error;
 	pool_t pool;
 
 	clients = connection_list_init(&client_set, &client_vfuncs);
-	storage_service = mail_storage_service_init(master_service, NULL,
+	storage_service = mail_storage_service_init(master_service, set_roots,
 		MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP |
 		MAIL_STORAGE_SERVICE_FLAG_TEMP_PRIV_DROP |
 		MAIL_STORAGE_SERVICE_FLAG_ENABLE_CORE_DUMPS |
 		MAIL_STORAGE_SERVICE_FLAG_NO_CHDIR);
 
-	memset(&input, 0, sizeof(input));
+	i_zero(&input);
 	input.service = "quota-status";
 	input.module = "mail";
 	input.username = "";
 
+	quota_status_pool = pool_alloconly_create("quota status settings", 512);
 	pool = pool_alloconly_create("service all settings", 4096);
 	if (mail_storage_service_read_settings(storage_service, &input, pool,
 					       &user_info, &set_parser,
@@ -205,15 +224,19 @@ static void main_init(void)
 		i_fatal("%s", error);
 	user_set = master_service_settings_parser_get_others(master_service,
 							     set_parser)[0];
+	set = master_service_settings_get_others(master_service)[1];
+
+	quota_status_settings = settings_dup(&quota_status_setting_parser_info, set,
+					     quota_status_pool);
 	value = mail_user_set_plugin_getenv(user_set, "quota_status_nouser");
-	nouser_reply = value != NULL ? i_strdup(value) :
-		i_strdup("REJECT Unknown user");
+	nouser_reply = p_strdup(quota_status_pool,
+				value != NULL ? value : "REJECT Unknown user");
 	pool_unref(&pool);
 }
 
 static void main_deinit(void)
 {
-	i_free(nouser_reply);
+	pool_unref(&quota_status_pool);
 	connection_list_deinit(&clients);
 	mail_storage_service_deinit(&storage_service);
 }

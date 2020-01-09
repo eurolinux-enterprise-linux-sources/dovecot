@@ -64,12 +64,12 @@ void io_loop_handle_add(struct io_file *io)
 	if ((io->io.condition & (IO_READ | IO_ERROR)) != 0) {
 		MY_EV_SET(&ev, io->fd, EVFILT_READ, EV_ADD, 0, 0, io);
 		if (kevent(ctx->kq, &ev, 1, NULL, 0, NULL) < 0)
-			i_fatal("kevent(EV_ADD, READ, %d) failed: %m", io->fd);
+			i_panic("kevent(EV_ADD, READ, %d) failed: %m", io->fd);
 	}
 	if ((io->io.condition & IO_WRITE) != 0) {
 		MY_EV_SET(&ev, io->fd, EVFILT_WRITE, EV_ADD, 0, 0, io);
 		if (kevent(ctx->kq, &ev, 1, NULL, 0, NULL) < 0)
-			i_fatal("kevent(EV_ADD, WRITE, %d) failed: %m", io->fd);
+			i_panic("kevent(EV_ADD, WRITE, %d) failed: %m", io->fd);
 	}
 
 	/* allow kevent() to return the maximum number of events
@@ -108,7 +108,7 @@ void io_loop_handle_remove(struct io_file *io, bool closed)
 		i_free(io);
 }
 
-void io_loop_handler_run(struct ioloop *ioloop)
+void io_loop_handler_run_internal(struct ioloop *ioloop)
 {
 	struct ioloop_handler_context *ctx = ioloop->handler_context;
 	struct kevent *events;
@@ -117,18 +117,29 @@ void io_loop_handler_run(struct ioloop *ioloop)
 	struct timespec ts;
 	struct io_file *io;
 	unsigned int events_count;
-	int ret, i;
+	int ret, i, msecs;
 
 	/* get the time left for next timeout task */
-	io_loop_get_wait_time(ioloop, &tv);
+	msecs = io_loop_get_wait_time(ioloop, &tv);
 	ts.tv_sec = tv.tv_sec;
 	ts.tv_nsec = tv.tv_usec * 1000;
 
 	/* wait for events */
 	events = array_get_modifiable(&ctx->events, &events_count);
-	ret = kevent (ctx->kq, NULL, 0, events, events_count, &ts);
-	if (ret < 0 && errno != EINTR)
-		i_fatal("kevent(): %m");
+
+	if (events_count > 0) {
+		ret = kevent (ctx->kq, NULL, 0, events, events_count, &ts);
+		if (ret < 0 && errno != EINTR) {
+			i_panic("kevent(events=%u, ts=%ld.%u) failed: %m",
+				events_count, (long)ts.tv_sec,
+				(unsigned int)ts.tv_nsec);
+		}
+	} else {
+		if (msecs < 0)
+			i_panic("BUG: No IOs or timeouts set. Not waiting for infinity.");
+		usleep(msecs * 1000);
+		ret = 0;
+	}
 
 	/* reference all IOs */
 	for (i = 0; i < ret; i++) {

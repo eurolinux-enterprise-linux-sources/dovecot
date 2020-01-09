@@ -1,6 +1,7 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "str.h"
 #include "istream.h"
 #include "http-parser.h"
 #include "http-date.h"
@@ -31,19 +32,26 @@ struct http_response_parser {
 
 struct http_response_parser *
 http_response_parser_init(struct istream *input,
-	const struct http_header_limits *hdr_limits)
+	const struct http_header_limits *hdr_limits,
+	enum http_response_parse_flags flags)
 {
 	struct http_response_parser *parser;
+	enum http_message_parse_flags msg_flags = 0;
 
 	/* FIXME: implement status line limit */
+	if ((flags & HTTP_RESPONSE_PARSE_FLAG_STRICT) != 0)
+		msg_flags |= HTTP_MESSAGE_PARSE_FLAG_STRICT;
 	parser = i_new(struct http_response_parser, 1);
-	http_message_parser_init(&parser->parser, input, hdr_limits, 0);
+	http_message_parser_init(&parser->parser,
+		input, hdr_limits, 0, msg_flags);
 	return parser;
 }
 
 void http_response_parser_deinit(struct http_response_parser **_parser)
 {
 	struct http_response_parser *parser = *_parser;
+
+	*_parser = NULL;
 
 	http_message_parser_deinit(&parser->parser);
 	i_free(parser);
@@ -70,6 +78,9 @@ static int http_response_parse_status(struct http_response_parser *parser)
 		return -1;
 	parser->response_status =
 		(p[0] - '0')*100 + (p[1] - '0')*10 + (p[2] - '0');
+	if (parser->response_status < 100 ||
+		parser->response_status >= 600)
+		return -1;
 	parser->parser.cur += 3;
 	return 1;
 }
@@ -77,6 +88,7 @@ static int http_response_parse_status(struct http_response_parser *parser)
 static int http_response_parse_reason(struct http_response_parser *parser)
 {
 	const unsigned char *p = parser->parser.cur;
+	pool_t pool;
 
 	/* reason-phrase = *( HTAB / SP / VCHAR / obs-text )
 	 */
@@ -86,21 +98,44 @@ static int http_response_parse_reason(struct http_response_parser *parser)
 
 	if (p == parser->parser.end)
 		return 0;
+	pool = http_message_parser_get_pool(&parser->parser);
 	parser->response_reason =
-		p_strdup_until(parser->parser.msg.pool, parser->parser.cur, p);
+		p_strdup_until(pool, parser->parser.cur, p);
 	parser->parser.cur = p;
 	return 1;
 }
 
-static inline const char *_chr_sanitize(unsigned char c)
+static const char *_reply_sanitize(struct http_message_parser *parser)
 {
-	if (c >= 0x20 && c < 0x7F)
-		return t_strdup_printf("`%c'", c);
-	if (c == 0x0a)
-		return "<LF>";
-	if (c == 0x0d)
-		return "<CR>";
-	return t_strdup_printf("<0x%02x>", c);
+	string_t *str = t_str_new(32);
+	const unsigned char *p;
+	unsigned int i;
+	bool quote_open = FALSE;
+
+	i_assert(parser->cur < parser->end);
+	for (p = parser->cur, i = 0; p < parser->end && i < 20; p++, i++) {
+		if (*p >= 0x20 && *p < 0x7F) {
+			if (!quote_open) {
+				str_append_c(str, '`');
+				quote_open = TRUE;
+			}
+			str_append_c(str, *p);
+		} else {
+			if (quote_open) {
+				str_append_c(str, '\'');
+				quote_open = FALSE;
+			}
+			if (*p == 0x0a)
+				str_append(str, "<LF>");
+			else if (*p == 0x0d)
+				str_append(str, "<CR>");
+			else
+				str_printfa(str, "<0x%02x>", *p);
+		}
+	}
+	if (quote_open)
+		str_append_c(str, '\'');
+	return str_c(str);
 }
 
 static int http_response_parse(struct http_response_parser *parser)
@@ -108,20 +143,22 @@ static int http_response_parse(struct http_response_parser *parser)
 	struct http_message_parser *_parser = &parser->parser;
 	int ret;
 
-	/* status-line   = HTTP-version SP status-code SP reason-phrase CRLF
+	/* RFC 7230, Section 3.1.2: Status Line
+
+	   status-line   = HTTP-version SP status-code SP reason-phrase CRLF
 	   status-code   = 3DIGIT
 	   reason-phrase = *( HTAB / SP / VCHAR / obs-text )
 	 */
-
 	switch (parser->state) {
 	case HTTP_RESPONSE_PARSE_STATE_INIT:
-		http_response_parser_restart(parser);
 		parser->state = HTTP_RESPONSE_PARSE_STATE_VERSION;
 		/* fall through */
 	case HTTP_RESPONSE_PARSE_STATE_VERSION:
 		if ((ret=http_message_parse_version(_parser)) <= 0) {
 			if (ret < 0)
-				_parser->error = "Invalid HTTP version in response";
+				_parser->error = t_strdup_printf(
+					"Invalid HTTP version in response: %s",
+					_reply_sanitize(_parser));
 			return ret;
 		}
 		parser->state = HTTP_RESPONSE_PARSE_STATE_SP1;
@@ -132,7 +169,7 @@ static int http_response_parse(struct http_response_parser *parser)
 		if (*_parser->cur != ' ') {
 			_parser->error = t_strdup_printf
 				("Expected ' ' after response version, but found %s",
-					_chr_sanitize(*_parser->cur));
+					_reply_sanitize(_parser));
 			return -1;
 		}
 		_parser->cur++;
@@ -154,7 +191,7 @@ static int http_response_parse(struct http_response_parser *parser)
 		if (*_parser->cur != ' ') {
 			_parser->error = t_strdup_printf
 				("Expected ' ' after response status code, but found %s",
-					_chr_sanitize(*_parser->cur));
+					_reply_sanitize(_parser));
 			return -1;
 		}
 		_parser->cur++;
@@ -182,7 +219,7 @@ static int http_response_parse(struct http_response_parser *parser)
 		if (*_parser->cur != '\n') {
 			_parser->error = t_strdup_printf
 				("Expected line end after response, but found %s",
-					_chr_sanitize(*_parser->cur));
+					_reply_sanitize(_parser));
 			return -1;
 		}
 		_parser->cur++;
@@ -239,16 +276,17 @@ http_response_parse_retry_after(const char *hdrval, time_t resp_time,
 {
 	time_t delta;
 
-	/* http://tools.ietf.org/html/draft-ietf-httpbis-p2-semantics-23
-	     Section 7.1.3:
+	/* RFC 7231, Section 7.1.3: Retry-After
 
-	   The value of this field can be either an HTTP-date or an integer
-	   number of seconds (in decimal) after the time of the response.
-	   Time spans are non-negative decimal integers, representing time in
-	   seconds.
+	   The value of this field can be either an HTTP-date or a number of
+	   seconds to delay after the response is received.
 
-     Retry-After = HTTP-date / delta-seconds
-     delta-seconds  = 1*DIGIT
+	     Retry-After = HTTP-date / delta-seconds
+
+	   A delay-seconds value is a non-negative decimal integer, representing
+	   time in seconds.
+
+       delta-seconds  = 1*DIGIT
 	 */
 	if (str_to_time(hdrval, &delta) >= 0) {
 		if (resp_time == (time_t)-1) {
@@ -270,6 +308,8 @@ int http_response_parse_next(struct http_response_parser *parser,
 	time_t retry_after = (time_t)-1;
 	int ret;
 
+	i_zero(response);
+
 	/* make sure we finished streaming payload from previous response
 	   before we continue. */
 	if ((ret = http_message_parse_finish_payload(&parser->parser)) <= 0) {
@@ -277,7 +317,12 @@ int http_response_parse_next(struct http_response_parser *parser,
 		return ret;
 	}
 
-	/* HTTP-message   = start-line
+	if (parser->state == HTTP_RESPONSE_PARSE_STATE_INIT)
+		http_response_parser_restart(parser);
+
+	/* RFC 7230, Section 3:
+		
+	   HTTP-message   = start-line
 	                   *( header-field CRLF )
 	                    CRLF
 	                    [ message-body ]
@@ -293,11 +338,10 @@ int http_response_parse_next(struct http_response_parser *parser,
 		return ret;
 	}
 
-	/* http://tools.ietf.org/html/draft-ietf-httpbis-p1-messaging-21
-	     Section 3.3.2:
+	/* RFC 7230, Section 3.3.2: Content-Length
 
 	   A server MUST NOT send a Content-Length header field in any response
-	   with a status code of 1xx (Informational) or 204 (No Content). [...]
+	   with a status code of 1xx (Informational) or 204 (No Content).
 	 */
 	if ((parser->response_status / 100 == 1 || parser->response_status == 204) &&
 	    parser->parser.msg.content_length > 0) {
@@ -308,14 +352,13 @@ int http_response_parse_next(struct http_response_parser *parser,
 		return -1;
 	}
 
-	/* http://tools.ietf.org/html/draft-ietf-httpbis-p1-messaging-21
-	     Section 3.3.3:
+	/* RFC 7230, Section 3.3.3: Message Body Length
 
-	   Any response to a HEAD request and any response with a 1xx
-	   (Informational), 204 (No Content), or 304 (Not Modified) status
-	   code is always terminated by the first empty line after the
-	   header fields, regardless of the header fields present in the
-	   message, and thus cannot contain a message body.
+	   1.  Any response to a HEAD request and any response with a 1xx
+	       (Informational), 204 (No Content), or 304 (Not Modified) status
+	       code is always terminated by the first empty line after the
+	       header fields, regardless of the header fields present in the
+	       message, and thus cannot contain a message body.
 	 */
 	if (parser->response_status / 100 == 1 || parser->response_status == 204
 		|| parser->response_status == 304) { // HEAD is handled in caller
@@ -332,8 +375,7 @@ int http_response_parse_next(struct http_response_parser *parser,
 		}
 	}
 
-	/* http://tools.ietf.org/html/draft-ietf-httpbis-p2-semantics-23
-	     Section 7.1.3:
+	/* RFC 7231, Section 7.1.3: Retry-After
 	
 	   Servers send the "Retry-After" header field to indicate how long the
 	   user agent ought to wait before making a follow-up request.  When
@@ -354,7 +396,6 @@ int http_response_parse_next(struct http_response_parser *parser,
 
 	parser->state = HTTP_RESPONSE_PARSE_STATE_INIT;
 
-	memset(response, 0, sizeof(*response));
 	response->status = parser->response_status;
 	response->reason = parser->response_reason;
 	response->version_major = parser->parser.msg.version_major;

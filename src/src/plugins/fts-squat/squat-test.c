@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -43,7 +43,8 @@ int main(int argc ATTR_UNUSED, char *argv[])
 	char *line, *str, buf[4096];
 	buffer_t *valid;
 	int ret, fd;
-	unsigned int len, last = 0, seq = 1, node_count, uidlist_count;
+	unsigned int last = 0, seq = 1, node_count, uidlist_count;
+	size_t len;
 	enum squat_index_type index_type;
 	bool data_header = TRUE, first = TRUE, skip_body = FALSE;
 	bool mime_header = TRUE;
@@ -53,8 +54,8 @@ int main(int argc ATTR_UNUSED, char *argv[])
 	double cputime;
 
 	lib_init();
-	(void)unlink(trie_path);
-	(void)unlink(uidlist_path);
+	i_unlink_if_exists(trie_path);
+	i_unlink_if_exists(uidlist_path);
 	trie = squat_trie_init(trie_path, time(NULL),
 			       FILE_LOCK_METHOD_FCNTL, FALSE, 0600, (gid_t)-1);
 
@@ -137,7 +138,7 @@ int main(int argc ATTR_UNUSED, char *argv[])
 	}
 
 	clock_end = clock();
-	gettimeofday(&tv_end, NULL);
+	(void)gettimeofday(&tv_end, NULL);
 
 	cputime = (double)(clock_end - clock_start) / CLOCKS_PER_SEC;
 	fprintf(stderr, "\n - Index time: %.2f CPU seconds, "

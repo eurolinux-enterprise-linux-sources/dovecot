@@ -41,6 +41,8 @@ int mdbox_map_open(struct mdbox_map *map);
 int mdbox_map_open_or_create(struct mdbox_map *map);
 /* Refresh the map. Returns 0 if ok, -1 if error. */
 int mdbox_map_refresh(struct mdbox_map *map);
+/* Returns TRUE if map has been fsck'd. */
+bool mdbox_map_is_fscked(struct mdbox_map *map);
 
 /* Return the current rebuild counter */
 uint32_t mdbox_map_get_rebuild_count(struct mdbox_map *map);
@@ -70,7 +72,8 @@ int mdbox_map_get_file_msgs(struct mdbox_map *map, uint32_t file_id,
    same atomic context. */
 struct mdbox_map_atomic_context *mdbox_map_atomic_begin(struct mdbox_map *map);
 /* Lock the map immediately. */
-int mdbox_map_atomic_lock(struct mdbox_map_atomic_context *atomic);
+int mdbox_map_atomic_lock(struct mdbox_map_atomic_context *atomic,
+			  const char *reason);
 /* Returns TRUE if map is locked */
 bool mdbox_map_atomic_is_locked(struct mdbox_map_atomic_context *atomic);
 /* When finish() is called, rollback the changes. If data was already written
@@ -80,6 +83,8 @@ void mdbox_map_atomic_set_failed(struct mdbox_map_atomic_context *atomic);
    transaction or append is committed within this atomic, but not when the
    atomic is used standalone. */
 void mdbox_map_atomic_set_success(struct mdbox_map_atomic_context *atomic);
+/* Remove fsck'd flag. */
+void mdbox_map_atomic_unset_fscked(struct mdbox_map_atomic_context *atomic);
 /* Commit/rollback changes within this atomic context. */
 int mdbox_map_atomic_finish(struct mdbox_map_atomic_context **atomic);
 
@@ -88,7 +93,8 @@ mdbox_map_transaction_begin(struct mdbox_map_atomic_context *atomic,
 			    bool external);
 /* Write transaction to map and leave it locked. Call _free() to update tail
    offset and unlock. */
-int mdbox_map_transaction_commit(struct mdbox_map_transaction_context *ctx);
+int mdbox_map_transaction_commit(struct mdbox_map_transaction_context *ctx,
+				 const char *reason);
 void mdbox_map_transaction_free(struct mdbox_map_transaction_context **ctx);
 
 int mdbox_map_update_refcount(struct mdbox_map_transaction_context *ctx,

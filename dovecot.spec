@@ -3,9 +3,9 @@
 Summary: Secure imap and pop3 server
 Name: dovecot
 Epoch: 1
-Version: 2.2.10
+Version: 2.2.36
 %global prever %{nil}
-Release: 8%{?dist}
+Release: 3%{?dist}
 #dovecot itself is MIT, a few sources are PD, pigeonhole is LGPLv2
 License: MIT and LGPLv2
 Group: System Environment/Daemons
@@ -14,7 +14,7 @@ URL: http://www.dovecot.org/
 Source: http://www.dovecot.org/releases/2.2/%{name}-%{version}%{?prever}.tar.gz
 Source1: dovecot.init
 Source2: dovecot.pam
-%global pigeonholever 0.4.2
+%global pigeonholever 0.4.24
 Source8: http://www.rename-it.nl/dovecot/2.2/dovecot-2.2-pigeonhole-%{pigeonholever}.tar.gz
 #wget http://hg.rename-it.nl/dovecot-2.2-pigeonhole/archive/%{pigeonholever}.tar.bz2 -O dovecot-2.2-pigeonhole-%{pigeonholever}.tar.bz2
 #Source8: dovecot-2.2-pigeonhole-%{pigeonholever}.tar.bz2
@@ -29,8 +29,6 @@ Patch1: dovecot-2.0-defaultconfig.patch
 Patch2: dovecot-1.0.beta2-mkcert-permissions.patch
 Patch3: dovecot-1.0.rc7-mkcert-paths.patch
 
-
-Patch4: dovecot-2.1.10-reload.patch
 Patch5: dovecot-2.1-privatetmp.patch
 
 #wait for network
@@ -39,25 +37,12 @@ Patch6: dovecot-2.1.10-waitonline.patch
 #workaround for chroot installation without /dev/random present, rhbz#1026790
 Patch7: dovecot-2.2.9-nodevrand.patch
 
-# dovecot < 2.2.13, rhbz#1096402,rhbz#1108004
-Patch8: dovecot-2.2.10-CVE_2014_3430.patch
-Patch9: dovecot-pigeonhole-2.2.10-b6c55ac6460d.patch
+# sent upstream, rhbz#1630380
+Patch9: dovecot-2.2.36-aclfix.patch
 
-# from upstream, for dovecot < 2.2.13, rhbz#1234868
-Patch10: dovecot-2.2-e84555e6eb59.patch
+# dovecot < 2.3, rhbz#1280436
+Patch10: dovecot-2.2-gidcheck.patch
 
-# rhbz#1249625
-Patch11: dovecot-2.2.10-valgrindlog.patch
-
-# 2x rhbz#1331478
-Patch12: dovecot-2.2.10-ed6e472cab0e.patch
-Patch13: dovecot-2.2.10-b8864211b88ed7521e9af514590639344af38910.patch
-
-# dovecot < 2.2.14, rhbz#1224496
-Patch14: dovecot-2.2.10-0e1a3c909a13.patch
-
-# dovecot < 2.2.25, rhbz#1280436
-Patch15: dovecot-2.2-gidcheck.patch
 
 Source15: prestartscript
 
@@ -152,21 +137,13 @@ This package provides the development files for dovecot.
 %patch1 -p1 -b .default-settings
 %patch2 -p1 -b .mkcert-permissions
 %patch3 -p1 -b .mkcert-paths
-%patch4 -p1 -b .reload
-%patch5 -p1 -b .privatetmp
 %patch6 -p1 -b .waitonline
 %patch7 -p1 -b .nodevrand
-%patch8 -p1 -b .CVE_2014_3430
-%patch10 -p1 -b .e84555e6eb59
-%patch11 -p1 -b .valgrindlog
-%patch12 -p1 -b .ed6e472cab0e
-%patch13 -p1 -b .b8864211b88ed7521e9af514590639344af38910
-%patch14 -p1 -b .0e1a3c909a13
-%patch15 -p1 -b .gidcheck
+%patch9 -p1 -b .aclfix
+%patch10 -p1 -b .gidcheck
 sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src/plugins/fts-lucene/Makefile.in
 #pigeonhole
 pushd dovecot-2*2-pigeonhole-%{pigeonholever}
-%patch9 -p1 -b .2.2.10-b6c55ac6460d
 popd
 
 %build
@@ -236,9 +213,9 @@ mv $RPM_BUILD_ROOT/%{_docdir}/%{name}-%{version} %{_builddir}/%{name}-%{version}
 pushd dovecot-2*2-pigeonhole-%{pigeonholever}
 make install DESTDIR=$RPM_BUILD_ROOT
 
-mv $RPM_BUILD_ROOT/%{_docdir}/%{name}-%{version} $RPM_BUILD_ROOT/%{_docdir}/%{name}-2.2-pigeonhole-%{pigeonholever}
+mv $RPM_BUILD_ROOT/%{_docdir}/%{name}-%{version} $RPM_BUILD_ROOT/%{_docdir}/%{name}-pigeonhole
 
-install -m 644 AUTHORS ChangeLog COPYING COPYING.LGPL INSTALL NEWS README $RPM_BUILD_ROOT/%{_docdir}/%{name}-2.2-pigeonhole-%{pigeonholever}
+install -m 644 AUTHORS ChangeLog COPYING COPYING.LGPL INSTALL NEWS README $RPM_BUILD_ROOT/%{_docdir}/%{name}-pigeonhole
 popd
 
 
@@ -275,9 +252,9 @@ mkdir -p $RPM_BUILD_ROOT/var/run/dovecot/{login,empty}
 mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/dovecot/conf.d
 install -p -m 644 docinstall/example-config/dovecot.conf $RPM_BUILD_ROOT%{_sysconfdir}/dovecot
 install -p -m 644 docinstall/example-config/conf.d/*.conf $RPM_BUILD_ROOT%{_sysconfdir}/dovecot/conf.d
-install -p -m 644 $RPM_BUILD_ROOT/%{_docdir}/%{name}-2.2-pigeonhole-%{pigeonholever}/example-config/conf.d/*.conf $RPM_BUILD_ROOT%{_sysconfdir}/dovecot/conf.d
+install -p -m 644 $RPM_BUILD_ROOT/%{_docdir}/%{name}-pigeonhole/example-config/conf.d/*.conf $RPM_BUILD_ROOT%{_sysconfdir}/dovecot/conf.d
 install -p -m 644 docinstall/example-config/conf.d/*.conf.ext $RPM_BUILD_ROOT%{_sysconfdir}/dovecot/conf.d
-install -p -m 644 $RPM_BUILD_ROOT/%{_docdir}/%{name}-2.2-pigeonhole-%{pigeonholever}/example-config/conf.d/*.conf.ext $RPM_BUILD_ROOT%{_sysconfdir}/dovecot/conf.d ||:
+install -p -m 644 $RPM_BUILD_ROOT/%{_docdir}/%{name}-pigeonhole/example-config/conf.d/*.conf.ext $RPM_BUILD_ROOT%{_sysconfdir}/dovecot/conf.d ||:
 install -p -m 644 doc/dovecot-openssl.cnf $RPM_BUILD_ROOT%{ssldir}/dovecot-openssl.cnf
 
 install -p -m755 doc/mkcert.sh $RPM_BUILD_ROOT%{_libexecdir}/%{name}/mkcert.sh
@@ -448,33 +425,49 @@ make check
 %dir %{_libdir}/dovecot
 %dir %{_libdir}/dovecot/auth
 %dir %{_libdir}/dovecot/dict
+%dir %{_libdir}/dovecot/stats
 %{_libdir}/dovecot/doveadm
+%exclude %{_libdir}/dovecot/doveadm/*sieve*
 %{_libdir}/dovecot/*.so.*
-#these (*.so files) are plugins, not a devel files
+#these (*.so files) are plugins, not devel files
 %{_libdir}/dovecot/*_plugin.so
 %exclude %{_libdir}/dovecot/*_sieve_plugin.so
+%{_libdir}/dovecot/auth/lib20_auth_var_expand_crypt.so
 %{_libdir}/dovecot/auth/libauthdb_imap.so
 %{_libdir}/dovecot/auth/libauthdb_ldap.so
 %{_libdir}/dovecot/auth/libmech_gssapi.so
 %{_libdir}/dovecot/auth/libdriver_sqlite.so
 %{_libdir}/dovecot/dict/libdriver_sqlite.so
+%{_libdir}/dovecot/dict/libdict_ldap.so
+%{_libdir}/dovecot/stats/libstats_auth.so
+%{_libdir}/dovecot/stats/libstats_mail.so
 %{_libdir}/dovecot/libdriver_sqlite.so
 %{_libdir}/dovecot/libssl_iostream_openssl.so
+%{_libdir}/dovecot/libfs_compress.so
+%{_libdir}/dovecot/libfs_crypt.so
+%{_libdir}/dovecot/libfs_mail_crypt.so
+%{_libdir}/dovecot/libdcrypt_openssl.so
+%{_libdir}/dovecot/lib20_var_expand_crypt.so
+
 %dir %{_libdir}/dovecot/settings
 
 %{_libexecdir}/%{name}
 %exclude %{_libexecdir}/%{name}/managesieve*
 
-%ghost /var/run/dovecot
+%attr(0755,root,dovecot) %ghost /var/run/dovecot
+%attr(0750,root,dovenull) %ghost /var/run/dovecot/login
+%attr(0755,root,root) %ghost /var/run/dovecot/empty
 %attr(0750,dovecot,dovecot) /var/lib/dovecot
 
-%{_mandir}/man1/deliver.1.gz
-%{_mandir}/man1/doveadm*.1.gz
-%{_mandir}/man1/doveconf.1.gz
-%{_mandir}/man1/dovecot*.1.gz
-%{_mandir}/man1/dsync.1.gz
-%{_mandir}/man5/dovecot.conf.5.gz
-%{_mandir}/man7/doveadm-search-query.7.gz
+%{_datadir}/%{name}
+
+%{_mandir}/man1/deliver.1*
+%{_mandir}/man1/doveadm*.1*
+%{_mandir}/man1/doveconf.1*
+%{_mandir}/man1/dovecot*.1*
+%{_mandir}/man1/dsync.1*
+%{_mandir}/man5/dovecot.conf.5*
+%{_mandir}/man7/doveadm-search-query.7*
 
 %files pigeonhole
 %defattr(-,root,root,-)
@@ -486,21 +479,23 @@ make check
 %config(noreplace) %{_sysconfdir}/dovecot/conf.d/90-sieve.conf
 %config(noreplace) %{_sysconfdir}/dovecot/conf.d/90-sieve-extprograms.conf
 
-%{_docdir}/%{name}-2.2-pigeonhole-%{pigeonholever}
+%{_docdir}/%{name}-pigeonhole
 
 %{_libexecdir}/%{name}/managesieve
 %{_libexecdir}/%{name}/managesieve-login
 
+%{_libdir}/dovecot/doveadm/*sieve*
 %{_libdir}/dovecot/*_sieve_plugin.so
 %{_libdir}/dovecot/settings/libmanagesieve_*.so
+%{_libdir}/dovecot/settings/libpigeonhole_*.so
 %{_libdir}/dovecot/sieve/
 
-%{_mandir}/man1/sieve-dump.1.gz
-%{_mandir}/man1/sieve-filter.1.gz
-%{_mandir}/man1/sieve-test.1.gz
-%{_mandir}/man1/sievec.1.gz
-%{_mandir}/man1/sieved.1.gz
-%{_mandir}/man7/pigeonhole.7.gz
+%{_mandir}/man1/sieve-dump.1*
+%{_mandir}/man1/sieve-filter.1*
+%{_mandir}/man1/sieve-test.1*
+%{_mandir}/man1/sievec.1*
+%{_mandir}/man1/sieved.1*
+%{_mandir}/man7/pigeonhole.7*
 
 %files mysql
 %defattr(-,root,root,-)
@@ -522,6 +517,18 @@ make check
 
 
 %changelog
+* Wed Sep 19 2018 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.36-3
+- fix global ACL directory configuration search path (#1630380)
+- update first/last_valid_gid range patch (#1630409)
+
+* Mon Jul 30 2018 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.36-2
+- fix defaut permissions of gost run files
+
+* Tue Jun 12 2018 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.36-1
+- dovecot updated to 2.2.36, pigeonhole to 0.4.24
+- fixed dsync not replicating sieve scripts (#1419426)
+- fix plugins incorrectly reporting epipe errors(#1489943)
+
 * Tue Mar 21 2017 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.10-8
 - do not iterate over users outside of first/last_valid_gid range (#1280436)
 

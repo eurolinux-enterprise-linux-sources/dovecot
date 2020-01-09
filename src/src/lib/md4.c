@@ -43,8 +43,11 @@
  * doesn't work.
  */
 #if defined(__i386__) || defined(__x86_64__) || defined(__vax__)
-#define SET(n) \
-	(*(const uint_fast32_t *)&ptr[(n) * 4])
+/* uint_fast32_t might be 64 bit, and thus may read 4 more bytes
+ * beyond the end of the buffer. So only read precisely 32 bits
+ */
+#define SET(n)				\
+	(*(const uint32_t *)&ptr[(n) * 4])
 #define GET(n) \
 	SET(n)
 #else
@@ -62,7 +65,7 @@
  * This processes one or more 64-byte data blocks, but does NOT update
  * the bit counters.  There're no alignment requirements.
  */
-static const void * ATTR_NOWARN_UNUSED_RESULT
+static const void * ATTR_NOWARN_UNUSED_RESULT ATTR_UNSIGNED_WRAPS
 body(struct md4_context *ctx, const void *data, size_t size)
 {
 	const unsigned char *ptr;
@@ -205,7 +208,7 @@ void md4_update(struct md4_context *ctx, const void *data, size_t size)
 	memcpy(ctx->buffer, data, size);
 }
 
-void md4_final(struct md4_context *ctx, unsigned char result[MD4_RESULTLEN])
+void md4_final(struct md4_context *ctx, unsigned char result[STATIC_ARRAY MD4_RESULTLEN])
 {
 	/* @UNSAFE */
 	unsigned long used, free;
@@ -254,11 +257,11 @@ void md4_final(struct md4_context *ctx, unsigned char result[MD4_RESULTLEN])
 	result[14] = ctx->d >> 16;
 	result[15] = ctx->d >> 24;
 
-	safe_memset(ctx, 0, sizeof(*ctx));
+	i_zero_safe(ctx);
 }
 
 void md4_get_digest(const void *data, size_t size,
-		    unsigned char result[MD4_RESULTLEN])
+		    unsigned char result[STATIC_ARRAY MD4_RESULTLEN])
 {
 	struct md4_context ctx;
 

@@ -1,18 +1,22 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "base64.h"
 #include "str.h"
 #include "llist.h"
+#include "iostream.h"
 #include "istream.h"
 #include "ostream.h"
 #include "hostpid.h"
 #include "process-title.h"
 #include "var-expand.h"
 #include "settings-parser.h"
+#include "anvil-client.h"
 #include "master-service.h"
+#include "master-service-ssl.h"
 #include "master-service-settings.h"
+#include "iostream-ssl.h"
 #include "mail-namespace.h"
 #include "mail-storage.h"
 #include "mail-storage-service.h"
@@ -32,18 +36,32 @@
 static struct client *clients = NULL;
 unsigned int clients_count = 0;
 
-void client_state_set(struct client *client, const char *name)
+void client_state_set(struct client *client, const char *name, const char *args)
 {
+	string_t *str;
+
 	client->state.name = name;
 
 	if (!client->service_set->verbose_proctitle)
 		return;
-	if (clients_count == 0)
+
+	if (clients_count == 0) {
 		process_title_set("[idling]");
-	else if (clients_count > 1)
+		return;
+	}
+	if (clients_count > 1) {
 		process_title_set(t_strdup_printf("[%u clients]", clients_count));
-	else
-		process_title_set(t_strdup_printf("[%s]", client->state.name));
+		return;
+	}
+
+	str = t_str_new(128);
+	str_printfa(str, "[%s", client->state.name);
+	if (client->remote_ip.family != 0)
+		str_printfa(str, " %s", net_ip2addr(&client->remote_ip));
+	if (args[0] != '\0')
+		str_printfa(str, " %s", args);
+	str_append_c(str, ']');
+	process_title_set(str_c(str));
 }
 
 static void client_idle_timeout(struct client *client)
@@ -69,6 +87,9 @@ static int client_input_line(struct client *client, const char *line)
 
 	if (strcmp(cmd, "LHLO") == 0)
 		return cmd_lhlo(client, args);
+	if (strcmp(cmd, "STARTTLS") == 0 &&
+	    master_service_ssl_is_enabled(master_service))
+		return cmd_starttls(client);
 	if (strcmp(cmd, "MAIL") == 0)
 		return cmd_mail(client, args);
 	if (strcmp(cmd, "RCPT") == 0)
@@ -122,15 +143,15 @@ void client_input_handle(struct client *client)
 
 	output = client->output;
 	o_stream_ref(output);
-	o_stream_cork(output);
 	while ((line = i_stream_next_line(client->input)) != NULL) {
 		T_BEGIN {
+			o_stream_cork(output);
 			ret = client_input_line(client, line);
+			o_stream_uncork(output);
 		} T_END;
 		if (ret < 0)
 			break;
 	}
-	o_stream_uncork(output);
 	o_stream_unref(&output);
 }
 
@@ -158,7 +179,7 @@ static void client_read_settings(struct client *client)
 	struct lda_settings *lda_set;
 	const char *error;
 
-	memset(&input, 0, sizeof(input));
+	i_zero(&input);
 	input.module = input.service = "lmtp";
 	input.local_ip = client->local_ip;
 	input.remote_ip = client->remote_ip;
@@ -229,7 +250,8 @@ struct client *client_create(int fd_in, int fd_out,
 	client->fd_out = fd_out;
 	client->remote_ip = conn->remote_ip;
 	client->remote_port = conn->remote_port;
-	(void)net_getsockname(conn->fd, &client->local_ip, &client->local_port);
+	client->local_ip = conn->local_ip;
+	client->local_port = conn->local_port;
 
 	client->input = i_stream_create_fd(fd_in, CLIENT_MAX_INPUT_SIZE, FALSE);
 	client->output = o_stream_create_fd(fd_out, (size_t)-1, FALSE);
@@ -248,7 +270,7 @@ struct client *client_create(int fd_in, int fd_out,
 	DLLIST_PREPEND(&clients, client);
 	clients_count++;
 
-	client_state_set(client, "banner");
+	client_state_set(client, "banner", "");
 	client_send_line(client, "220 %s %s", client->my_domain,
 			 client->lmtp_set->login_greeting);
 	i_info("Connect from %s", client_remote_id(client));
@@ -264,7 +286,7 @@ void client_destroy(struct client *client, const char *prefix,
 	clients_count--;
 	DLLIST_REMOVE(&clients, client);
 
-	client_state_set(client, "destroyed");
+	client_state_set(client, "destroyed", "");
 
 	if (client->raw_mail_user != NULL)
 		mail_user_unref(&client->raw_mail_user);
@@ -274,13 +296,13 @@ void client_destroy(struct client *client, const char *prefix,
 		io_remove(&client->io);
 	if (client->to_idle != NULL)
 		timeout_remove(&client->to_idle);
+	if (client->ssl_iostream != NULL)
+		ssl_iostream_destroy(&client->ssl_iostream);
 	i_stream_destroy(&client->input);
 	o_stream_destroy(&client->output);
 
-	net_disconnect(client->fd_in);
-	if (client->fd_in != client->fd_out)
-		net_disconnect(client->fd_out);
-	client_state_reset(client);
+	fd_close_maybe_stdio(&client->fd_in, &client->fd_out);
+	client_state_reset(client, "destroyed");
 	i_free(client->lhlo);
 	pool_unref(&client->state_pool);
 	pool_unref(&client->pool);
@@ -290,11 +312,17 @@ void client_destroy(struct client *client, const char *prefix,
 
 static const char *client_get_disconnect_reason(struct client *client)
 {
-	errno = client->input->stream_errno != 0 ?
-		client->input->stream_errno :
-		client->output->stream_errno;
-	return errno == 0 || errno == EPIPE ? "Connection closed" :
-		t_strdup_printf("Connection closed: %m");
+	const char *err;
+
+	if (client->ssl_iostream != NULL &&
+	    !ssl_iostream_is_handshaked(client->ssl_iostream)) {
+		err = ssl_iostream_get_last_error(client->ssl_iostream);
+		if (err != NULL) {
+			return t_strdup_printf("TLS handshaking failed: %s",
+					       err);
+		}
+	}
+	return io_stream_get_disconnect_reason(client->input, client->output);
 }
 
 void client_disconnect(struct client *client, const char *prefix,
@@ -313,16 +341,33 @@ void client_disconnect(struct client *client, const char *prefix,
 	client->disconnected = TRUE;
 }
 
-void client_state_reset(struct client *client)
+void client_rcpt_anvil_disconnect(const struct mail_recipient *rcpt)
 {
-	struct mail_recipient *rcpt;
+	const struct mail_storage_service_input *input;
+
+	if (!rcpt->anvil_connect_sent)
+		return;
+
+	input = mail_storage_service_user_get_input(rcpt->service_user);
+	master_service_anvil_send(master_service, t_strconcat(
+		"DISCONNECT\t", my_pid, "\t", master_service_get_name(master_service),
+		"/", input->username, "\n", NULL));
+}
+
+void client_state_reset(struct client *client, const char *state_name)
+{
+	struct mail_recipient *const *rcptp;
 
 	if (client->proxy != NULL)
 		lmtp_proxy_deinit(&client->proxy);
 
 	if (array_is_created(&client->state.rcpt_to)) {
-		array_foreach_modifiable(&client->state.rcpt_to, rcpt)
-			mail_storage_service_user_free(&rcpt->service_user);
+		array_foreach_modifiable(&client->state.rcpt_to, rcptp) {
+			if ((*rcptp)->anvil_query != NULL)
+				anvil_client_query_abort(anvil, &(*rcptp)->anvil_query);
+			client_rcpt_anvil_disconnect(*rcptp);
+			mail_storage_service_user_unref(&(*rcptp)->service_user);
+		}
 	}
 
 	if (client->state.raw_mail != NULL) {
@@ -344,12 +389,12 @@ void client_state_reset(struct client *client)
 			i_error("close(mail data fd) failed: %m");
 	}
 
-	memset(&client->state, 0, sizeof(client->state));
+	i_zero(&client->state);
 	p_clear(client->state_pool);
 	client->state.mail_data_fd = -1;
 
 	client_generate_session_id(client);
-	client_state_set(client, "reset");
+	client_state_set(client, state_name, "");
 }
 
 void client_send_line(struct client *client, const char *fmt, ...)

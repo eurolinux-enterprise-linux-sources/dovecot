@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,11 +6,11 @@
 #include "ioloop.h"
 #include "var-expand.h"
 #include "index-storage.h"
+#include "mail-storage-service.h"
 #include "mailbox-list-private.h"
 #include "fail-mail-storage.h"
 #include "shared-storage.h"
 
-#include <stdlib.h>
 #include <ctype.h>
 
 extern struct mail_storage shared_storage;
@@ -255,7 +255,11 @@ int shared_storage_get_namespace(struct mail_namespace **_ns,
 
 	owner = mail_user_alloc(userdomain, user->set_info,
 				user->unexpanded_set);
+	owner->_service_user = user->_service_user;
+	mail_storage_service_user_ref(owner->_service_user);
+	owner->creator = user;
 	owner->autocreated = TRUE;
+	owner->session_id = p_strdup(owner->pool, user->session_id);
 	if (mail_user_init(owner, &error) < 0) {
 		if (!owner->nonexistent) {
 			mailbox_list_set_critical(list,
@@ -288,6 +292,7 @@ int shared_storage_get_namespace(struct mail_namespace **_ns,
 	new_ns->flags = (NAMESPACE_FLAG_SUBSCRIPTIONS & ns->flags) |
 		NAMESPACE_FLAG_LIST_PREFIX | NAMESPACE_FLAG_HIDDEN |
 		NAMESPACE_FLAG_AUTOCREATED | NAMESPACE_FLAG_INBOX_ANY;
+	new_ns->user_set = user->set;
 	new_ns->mail_set = _storage->set;
 	i_array_init(&new_ns->all_storages, 2);
 
@@ -356,7 +361,7 @@ int shared_storage_get_namespace(struct mail_namespace **_ns,
 }
 
 struct mail_storage shared_storage = {
-	.name = SHARED_STORAGE_NAME,
+	.name = MAIL_SHARED_STORAGE_NAME,
 	.class_flags = 0, /* unknown at this point */
 
 	.v = {
@@ -368,6 +373,7 @@ struct mail_storage shared_storage = {
 		shared_storage_get_list_settings,
 		NULL,
 		fail_mailbox_alloc,
-		NULL
+		NULL,
+		NULL,
 	}
 };

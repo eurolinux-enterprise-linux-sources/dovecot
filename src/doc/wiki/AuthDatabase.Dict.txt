@@ -2,8 +2,9 @@ Key-value authentication database (v2.1.9+)
 ===========================================
 
 Key-value databases can be used as auth backends. They probably should be used
-only for caching in front of e.g. SQL auth backends, since they don't currently
-support user iteration.
+only for caching in front of e.g. SQL auth backends. Iteration is supported if
+the underlying dict provider supports iteration. See <Dictionary.txt> for list
+of supported databases.
 
 Auth configuration
 ------------------
@@ -24,10 +25,7 @@ userdb {
 Dict configuration
 ------------------
 
-See the 'dovecot-dict-auth.conf.ext' file from example-config for full list of
-configuration options. Basically you need these:
-
-'/etc/dovecot/dovecot-dict-auth.conf.ext':
+You can use userdb: prefix for accessing userdb variables (v2.2.26+).
 
 ---%<-------------------------------------------------------------------------
 uri = redis:host=127.0.0.1:port=6379
@@ -36,6 +34,18 @@ password_key = dovecot/passdb/%u
 user_key = dovecot/userdb/%u
 iterate_disable = yes
 default_pass_scheme = plain
+
+## or the new syntax
+
+key passdb {
+  key = dovecot/passdb/%u
+  passdb_objects = passdb
+}
+
+key userdb {
+  key = dovecot/userdb/%u
+  userdb_objects = userdb
+}
 ---%<-------------------------------------------------------------------------
 
 Example values
@@ -48,6 +58,49 @@ should return something like:
 { "uid": 123, "gid": 123, "home": "/home/username" }
 ---%<-------------------------------------------------------------------------
 
+== Complete example for authenticating via the CDB dictionary This example uses
+the CDB dictionary to store the userdb and passdb.
+
+Auth configuration
+------------------
+
+'dovecot.conf':
+
+---%<-------------------------------------------------------------------------
+# Access to the CDB has to go through a dict process.
+dict {
+  auth = cdb:/etc/dovecot/auth.cdb
+}
+
+passdb {
+  driver = dict
+  args = /etc/dovecot/dovecot-cdb.conf
+}
+
+userdb {
+  driver = dict
+  args = /etc/dovecot/dovecot-cdb.conf
+}
+---%<-------------------------------------------------------------------------
+
+Dict configuration
+------------------
+
+The CDB dictionary doesn't support iteration yet.
+
+'dovecot-cdb.conf':
+
+---%<-------------------------------------------------------------------------
+uri = proxy::auth
+
+password_key = passdb/%u
+user_key = userdb/%u
+# iterate_prefix = userdb/ # no yet supported
+iterate_disable = yes
+
+default_pass_scheme = BLF-CRYPT
+---%<-------------------------------------------------------------------------
+
 Complete example for authenticating via a UNIX socket
 -----------------------------------------------------
 
@@ -58,8 +111,8 @@ a scripting language.
 
 When given a <"proxy:"> [Quota.Dict.txt] URL the Dict backend speaks a simple
 protocol over a UNIX socket. The protocol is defined in
-'src/lib-dict/dict-client.h' (Mercurial
-[http://hg.dovecot.org/dovecot-2.2/file/tip/src/lib-dict/dict-client.h]).
+'src/lib-dict/dict-client.h' (GitHub
+[https://github.com/dovecot/core/blob/master/src/lib-dict/dict-client.h]).
 
 Auth configuration
 ------------------
@@ -100,7 +153,7 @@ iterate_disable = yes
 Server process for answering Dict lookups
 -----------------------------------------
 
-The server process listening on '/var/run/lookup_proxy_dovecot/socket' can be
+The server process listening on '/var/run/auth_proxy_dovecot/socket' can be
 written in any language.Here's an example in Perl:
 
 ---%<-------------------------------------------------------------------------
@@ -132,7 +185,6 @@ sub default_values
     user              => 'root',
     group             => 'root',
 
-    no_client_stdout  => 1,
     max_spare_servers => 2,
     min_spare_servers => 1,
     min_servers       => 2,
@@ -145,7 +197,6 @@ sub default_values
 
 sub process_request {
     my $self   = shift;
-    my $socket = $self->{server}->{client};
 
     my %L_handler = (
         passdb => sub {
@@ -171,38 +222,49 @@ sub process_request {
 
     # protocol from src/lib-dict/dict-client.h
     my $json = JSON::XS->new;
+
     eval {
-        while (<$socket>) {
+        my $ret;
+        # Dict protocol is multiline... go through the lines.
+        while (<STDIN>) {
             $self->log(2, "Got request: $_");
             chomp;
             my $cmd = substr($_,0,1);
-            next if $cmd eq 'H'; # "hello"
-            my $ret;
-            if ($cmd eq 'L') {
+            next if $cmd eq 'H'; # "hello", skip this line, assume it's ok
+            die "Protocol error: Bad command $cmd" unless ($cmd eq 'L');
+            # Process request
+
                 my ($namespace,$type,$arg) = split ('/',substr($_,1),3);
-                $self->log(4,"I:$namespace, $type, $arg");
+
                 if ($namespace eq 'shared') {
                     my $f = $L_handler{$type};
 
                     if (defined $f && defined $arg) {
-                        $ret = $f->($self->{lookup}, $arg);
+                    $ret = $f->($arg);
                     }
+                else {
+                    die 'Protocol error: Bad arg';
                 }
-            }
-            if ($ret) {
-                my $json = JSON::XS->new->indent(0)->utf8->encode($ret);
-                $self->log(4,"O:$json");
-                syswrite $socket, "O".$json."\n";
-            }
+                }
             else {
-                syswrite $socket, "F\n" unless $ret;
+                die 'Protocol error: Bad namespace'
             }
+            last; # Got an "L" , now respond.
+        }
+        if ($ret) {
+            my $json = JSON::XS->new->indent(0)->utf8->encode($ret);
+            $self->log(3,"O:$json");
+            print "O".$json."\n";
+        }
+        else {
+            $self->log(3,"NOUSER");
+            print "N\n";
         }
         1;
+    } or do {
+        $self->log(2, "Error: $@");
+        print "F\n";
     };
-    if ($@) {
-        $self->log(2, "Invalid request: $@");
-    }
 }
 
 sub pre_loop_hook {
@@ -222,4 +284,4 @@ sub pre_server_close_hook {
 __END__
 ---%<-------------------------------------------------------------------------
 
-(This file was created from the wiki on 2013-12-19 04:42)
+(This file was created from the wiki on 2018-05-23 04:42)

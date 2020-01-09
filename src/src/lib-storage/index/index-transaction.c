@@ -1,10 +1,11 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "dict.h"
 #include "index-storage.h"
 #include "index-sync-private.h"
+#include "index-pop3-uidl.h"
 #include "index-mail.h"
 
 static void index_transaction_free(struct mailbox_transaction_context *t)
@@ -16,6 +17,7 @@ static void index_transaction_free(struct mailbox_transaction_context *t)
 	if (array_is_created(&t->pvt_saves))
 		array_free(&t->pvt_saves);
 	array_free(&t->module_contexts);
+	i_free(t->reason);
 	i_free(t);
 }
 
@@ -28,6 +30,7 @@ index_transaction_index_commit(struct mail_index_transaction *index_trans,
 	struct index_mailbox_sync_pvt_context *pvt_sync_ctx = NULL;
 	int ret = 0;
 
+	index_pop3_uidl_update_exists_finish(t);
 	if (t->nontransactional_changes)
 		t->changes->changed = TRUE;
 
@@ -45,6 +48,7 @@ index_transaction_index_commit(struct mail_index_transaction *index_trans,
 	}
 
 	if (t->save_ctx != NULL) {
+		mailbox_save_context_deinit(t->save_ctx);
 		if (ret < 0) {
 			t->box->v.transaction_save_rollback(t->save_ctx);
 			t->save_ctx = NULL;
@@ -74,8 +78,10 @@ index_transaction_index_commit(struct mail_index_transaction *index_trans,
 		}
 	}
 
-	if (t->save_ctx != NULL)
+	if (t->save_ctx != NULL) {
+		i_assert(t->save_ctx->dest_mail == NULL);
 		t->box->v.transaction_save_commit_post(t->save_ctx, result_r);
+	}
 
 	if (pvt_sync_ctx != NULL) {
 		if (index_mailbox_sync_pvt_newmails(pvt_sync_ctx, t) < 0) {
@@ -85,6 +91,8 @@ index_transaction_index_commit(struct mail_index_transaction *index_trans,
 		index_mailbox_sync_pvt_deinit(&pvt_sync_ctx);
 	}
 
+	if (ret < 0)
+		mail_index_set_error_nolog(t->box->index, mailbox_get_last_error(t->box, NULL));
 	index_transaction_free(t);
 	return ret;
 }
@@ -95,8 +103,15 @@ index_transaction_index_rollback(struct mail_index_transaction *index_trans)
 	struct mailbox_transaction_context *t =
 		MAIL_STORAGE_CONTEXT(index_trans);
 
-	if (t->save_ctx != NULL)
+	if (t->attr_pvt_trans != NULL)
+		dict_transaction_rollback(&t->attr_pvt_trans);
+	if (t->attr_shared_trans != NULL)
+		dict_transaction_rollback(&t->attr_shared_trans);
+
+	if (t->save_ctx != NULL) {
+		mailbox_save_context_deinit(t->save_ctx);
 		t->box->v.transaction_save_rollback(t->save_ctx);
+	}
 
 	i_assert(t->mail_ref_count == 0);
 	t->super.rollback(index_trans);
@@ -143,6 +158,7 @@ void index_transaction_init(struct mailbox_transaction_context *t,
 	if ((flags & MAILBOX_TRANSACTION_FLAG_REFRESH) != 0)
 		mail_index_refresh(box->index);
 
+	t->flags = flags;
 	t->box = box;
 	t->itrans = mail_index_transaction_begin(box->view, itrans_flags);
 	t->view = mail_index_transaction_open_updated_view(t->itrans);
@@ -183,7 +199,7 @@ int index_transaction_commit(struct mailbox_transaction_context *t,
 	struct mail_index_transaction_commit_result result;
 	int ret = 0;
 
-	memset(changes_r, 0, sizeof(*changes_r));
+	i_zero(changes_r);
 	changes_r->pool = pool_alloconly_create(MEMPOOL_GROWING
 						"transaction changes", 512);
 	p_array_init(&changes_r->saved_uids, changes_r->pool, 32);

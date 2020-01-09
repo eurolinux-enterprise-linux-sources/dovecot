@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "mbox-storage.h"
@@ -32,7 +32,7 @@ int mbox_list_index_has_changed(struct mailbox *box,
 	int ret;
 
 	ret = index_storage_list_index_has_changed(box, list_view, seq);
-	if (ret != 0)
+	if (ret != 0 || box->storage->set->mailbox_list_index_very_dirty_syncs)
 		return ret;
 
 	ext_id = mbox_list_get_ext_id(mbox, list_view);
@@ -83,7 +83,7 @@ void mbox_list_index_update_sync(struct mailbox *box,
 		return;
 	old_rec = data;
 
-	memset(&new_rec, 0, sizeof(new_rec));
+	i_zero(&new_rec);
 	new_rec.mtime = mhdr->sync_mtime;
 	new_rec.size = mhdr->sync_size & 0xffffffffU;
 

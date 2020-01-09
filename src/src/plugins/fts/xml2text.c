@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "message-parser.h"
@@ -18,21 +18,26 @@ int main(void)
 	parser = fts_parser_html.try_init(NULL, "text/html", NULL);
 	i_assert(parser != NULL);
 
-	memset(&block, 0, sizeof(block));
+	i_zero(&block);
 	while ((ret = read(STDIN_FILENO, buf, sizeof(buf))) > 0) {
 		block.data = buf;
 		block.size = ret;
 		parser->v.more(parser, &block);
-		write(STDOUT_FILENO, block.data, block.size);
+		if (write(STDOUT_FILENO, block.data, block.size) < 0)
+			i_fatal("write(stdout) failed: %m");
 	}
+	if (ret < 0)
+		i_fatal("read(stdin) failed: %m");
 
 	for (;;) {
 		block.size = 0;
 		parser->v.more(parser, &block);
 		if (block.size == 0)
 			break;
-		write(STDOUT_FILENO, block.data, block.size);
+		if (write(STDOUT_FILENO, block.data, block.size) < 0)
+			i_fatal("write(stdout) failed: %m");
 	}
 
 	lib_deinit();
+	return 0;
 }

@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -154,7 +154,8 @@ static void hdr_write(string_t *str, struct message_header_line *hdr)
 {
 	if (!hdr->continued) {
 		str_append(str, hdr->name);
-		str_append_n(str, hdr->middle, hdr->middle_len);
+		if (hdr->middle_len > 0)
+			str_append_n(str, hdr->middle, hdr->middle_len);
 	}
 	str_append_n(str, hdr->value, hdr->value_len);
 	if (!hdr->no_newline) {
@@ -202,7 +203,8 @@ test_message_header_parser_long_lines_str(const char *str,
 	struct message_header_parser_ctx *parser;
 	struct message_header_line *hdr;
 	struct istream *input;
-	unsigned int i, len = strlen(str);
+	unsigned int i;
+	size_t len = strlen(str);
 
 	input = test_istream_create(str);
 	test_istream_set_max_buffer_size(input, buffer_size);
@@ -221,7 +223,7 @@ static void test_message_header_parser_long_lines(void)
 	static const char *lf_str = "1234567890: 345\n\n";
 	static const char *crlf_str = "1234567890: 345\r\n\r\n";
 	struct message_size hdr_size;
-	unsigned int i, len;
+	size_t i, len;
 
 	test_begin("message header parser long lines");
 	len = strlen(lf_str);
@@ -239,12 +241,57 @@ static void test_message_header_parser_long_lines(void)
 	test_end();
 }
 
+static void test_message_header_parser_extra_cr_in_eoh(void)
+{
+	static const char *str = "a:b\n\r\r\n";
+	struct message_header_parser_ctx *parser;
+	struct message_header_line *hdr;
+	struct istream *input;
+
+	test_begin("message header parser extra CR in EOH");
+
+	input = test_istream_create(str);
+	parser = message_parse_header_init(input, NULL, 0);
+	test_assert(message_parse_header_next(parser, &hdr) > 0 &&
+		    strcmp(hdr->name, "a") == 0);
+	test_assert(message_parse_header_next(parser, &hdr) > 0 &&
+		    strcmp(hdr->name, "\r") == 0 && hdr->middle_len == 0 &&
+		    hdr->value_len == 0 && !hdr->eoh);
+	test_assert(message_parse_header_next(parser, &hdr) < 0);
+	message_parse_header_deinit(&parser);
+	test_assert(input->stream_errno == 0);
+	i_stream_unref(&input);
+	test_end();
+}
+
+static void test_message_header_parser_no_eoh(void)
+{
+	static const char *str = "a:b\n";
+	struct message_header_parser_ctx *parser;
+	struct message_header_line *hdr;
+	struct istream *input;
+
+	test_begin("message header parser no EOH");
+
+	input = test_istream_create(str);
+	parser = message_parse_header_init(input, NULL, 0);
+	test_assert(message_parse_header_next(parser, &hdr) > 0 &&
+		    strcmp(hdr->name, "a") == 0);
+	test_assert(message_parse_header_next(parser, &hdr) < 0);
+	message_parse_header_deinit(&parser);
+	test_assert(input->stream_errno == 0);
+	i_stream_unref(&input);
+	test_end();
+}
+
 int main(void)
 {
 	static void (*test_functions[])(void) = {
 		test_message_header_parser,
 		test_message_header_parser_partial,
 		test_message_header_parser_long_lines,
+		test_message_header_parser_extra_cr_in_eoh,
+		test_message_header_parser_no_eoh,
 		NULL
 	};
 	return test_run(test_functions);

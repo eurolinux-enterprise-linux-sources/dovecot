@@ -14,6 +14,7 @@
 #define MAILBOX_LIST_NAME_INDEX "index"
 #define MAILBOX_LIST_NAME_NONE "none"
 
+#define MAILBOX_LIST_INDEX_DEFAULT_PREFIX "dovecot.list.index"
 #define MAILBOX_LOG_FILE_NAME "dovecot.mailbox.log"
 
 #define T_MAILBOX_LIST_ERR_NOT_FOUND(list, name) \
@@ -88,6 +89,7 @@ struct mailbox_list_vfuncs {
 	void (*notify_deinit)(struct mailbox_list_notify *notify);
 	void (*notify_wait)(struct mailbox_list_notify *notify,
 			    void (*callback)(void *context), void *context);
+	void (*notify_flush)(struct mailbox_list_notify *notify);
 };
 
 struct mailbox_list_module_register {
@@ -122,17 +124,28 @@ struct mailbox_list {
 	struct mailbox_log *changelog;
 	time_t changelog_timestamp;
 
+	struct file_lock *lock;
+	int lock_refcount;
+
 	pool_t guid_cache_pool;
 	HASH_TABLE(uint8_t *, struct mailbox_guid_cache_rec *) guid_cache;
 	bool guid_cache_errors;
 
+	/* Last error set in mailbox_list_set_critical(). */
+	char *last_internal_error;
+
 	char *error_string;
 	enum mail_error error;
 	bool temporary_error;
+	ARRAY(struct mail_storage_error) error_stack;
 
 	ARRAY(union mailbox_list_module_context *) module_contexts;
 
 	unsigned int index_root_dir_created:1;
+	unsigned int list_index_root_dir_created:1;
+	unsigned int guid_cache_updated:1;
+	unsigned int guid_cache_invalidated:1;
+	unsigned int last_error_is_internal:1;
 };
 
 union mailbox_list_iterate_module_context {
@@ -144,6 +157,7 @@ struct mailbox_list_iterate_context {
 	pool_t pool;
 	enum mailbox_list_iter_flags flags;
 	bool failed;
+	bool index_iteration;
 
 	struct imap_match_glob *glob;
 	struct mailbox_list_autocreate_iterate_context *autocreate_ctx;
@@ -170,9 +184,22 @@ extern struct mailbox_list_module_register mailbox_list_module_register;
 void mailbox_lists_init(void);
 void mailbox_lists_deinit(void);
 
+void mailbox_list_settings_init_defaults(struct mailbox_list_settings *set_r);
 int mailbox_list_settings_parse(struct mail_user *user, const char *data,
 				struct mailbox_list_settings *set_r,
 				const char **error_r);
+const char *
+mailbox_list_escape_name(struct mailbox_list *list, const char *vname);
+const char *
+mailbox_list_escape_name_params(const char *vname, const char *ns_prefix,
+				char ns_sep, char list_sep, char escape_char,
+				const char *maildir_name);
+const char *
+mailbox_list_unescape_name(struct mailbox_list *list, const char *src);
+const char *
+mailbox_list_unescape_name_params(const char *src, const char *ns_prefix,
+				  char ns_sep, char list_sep, char escape_char);
+
 const char *mailbox_list_default_get_storage_name(struct mailbox_list *list,
 						  const char *vname);
 const char *mailbox_list_default_get_vname(struct mailbox_list *list,
@@ -189,14 +216,18 @@ int mailbox_list_delete_index_control(struct mailbox_list *list,
 void mailbox_list_iter_update(struct mailbox_list_iter_update_context *ctx,
 			      const char *name);
 int mailbox_list_iter_subscriptions_refresh(struct mailbox_list *list);
+const struct mailbox_info *
+mailbox_list_iter_default_next(struct mailbox_list_iterate_context *ctx);
 
-bool mailbox_list_name_is_too_large(const char *name, char sep);
 enum mailbox_list_file_type mailbox_list_get_file_type(const struct dirent *d);
 int mailbox_list_dirent_is_alias_symlink(struct mailbox_list *list,
 					 const char *dir_path,
 					 const struct dirent *d);
 bool mailbox_list_try_get_absolute_path(struct mailbox_list *list,
 					const char **name);
+void mailbox_permissions_copy(struct mailbox_permissions *dest,
+			      const struct mailbox_permissions *src,
+			      pool_t pool);
 
 void mailbox_list_add_change(struct mailbox_list *list,
 			     enum mailbox_log_record_type type,
@@ -211,8 +242,11 @@ void mailbox_list_set_critical(struct mailbox_list *list, const char *fmt, ...)
 void mailbox_list_set_internal_error(struct mailbox_list *list);
 bool mailbox_list_set_error_from_errno(struct mailbox_list *list);
 
-int mailbox_list_init_fs(struct mailbox_list *list, const char *driver,
-			 const char *args, const char *root_dir,
-			 struct fs **fs_r, const char **error_r);
+const struct mailbox_info *
+mailbox_list_iter_autocreate_filter(struct mailbox_list_iterate_context *ctx,
+				    const struct mailbox_info *_info);
+
+int mailbox_list_lock(struct mailbox_list *list);
+void mailbox_list_unlock(struct mailbox_list *list);
 
 #endif

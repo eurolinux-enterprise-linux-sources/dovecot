@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 
@@ -24,9 +24,7 @@ static void cdb_dict_deinit(struct dict *_dict);
 
 static int
 cdb_dict_init(struct dict *driver, const char *uri,
-	      enum dict_data_type value_type ATTR_UNUSED,
-	      const char *username ATTR_UNUSED,
-	      const char *base_dir ATTR_UNUSED,
+	      const struct dict_settings *set ATTR_UNUSED,
 	      struct dict **dict_r, const char **error_r)
 {
 	struct cdb_dict *dict;
@@ -122,20 +120,9 @@ static int cdb_dict_lookup(struct dict *_dict, pool_t pool,
 struct dict dict_driver_cdb = {
 	.name = "cdb",
 	{
-		cdb_dict_init,
-		cdb_dict_deinit,
-		NULL,
-		cdb_dict_lookup,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL
+		.init = cdb_dict_init,
+		.deinit = cdb_dict_deinit,
+		.lookup = cdb_dict_lookup,
 	}
 };
 #endif

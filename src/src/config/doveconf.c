@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -12,6 +12,7 @@
 #include "str.h"
 #include "strescape.h"
 #include "settings-parser.h"
+#include "master-interface.h"
 #include "master-service.h"
 #include "all-settings.h"
 #include "sysinfo-get.h"
@@ -21,7 +22,6 @@
 #include "dovecot-version.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <sysexits.h>
@@ -129,7 +129,7 @@ config_dump_human_init(const char *const *modules, enum config_dump_scope scope,
 	enum config_dump_flags flags;
 	pool_t pool;
 
-	pool = pool_alloconly_create("config human strings", 1024*32);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"config human strings", 1024*32);
 	ctx = p_new(pool, struct config_dump_human_context, 1);
 	ctx->pool = pool;
 	ctx->list_prefix = str_new(ctx->pool, 128);
@@ -155,7 +155,7 @@ static void config_dump_human_deinit(struct config_dump_human_context *ctx)
 
 static bool value_need_quote(const char *value)
 {
-	unsigned int len = strlen(value);
+	size_t len = strlen(value);
 
 	if (len == 0)
 		return FALSE;
@@ -170,15 +170,16 @@ static bool value_need_quote(const char *value)
 static int ATTR_NULL(4)
 config_dump_human_output(struct config_dump_human_context *ctx,
 			 struct ostream *output, unsigned int indent,
-			 const char *setting_name_filter)
+			 const char *setting_name_filter, bool hide_passwords)
 {
 	ARRAY_TYPE(const_string) prefixes_arr;
 	ARRAY_TYPE(prefix_stack) prefix_stack;
 	struct prefix_stack prefix;
 	const char *const *strings, *const *args, *p, *str, *const *prefixes;
 	const char *key, *key2, *value;
-	unsigned int i, j, count, len, prefix_count, skip_len;
-	unsigned int setting_name_filter_len, prefix_idx = UINT_MAX;
+	unsigned int i, j, count, prefix_count;
+	unsigned int prefix_idx = UINT_MAX;
+	size_t len, skip_len, setting_name_filter_len;
 	bool unique_key;
 	int ret = 0;
 
@@ -301,9 +302,15 @@ config_dump_human_output(struct config_dump_human_context *ctx,
 		key = strings[i] + skip_len;
 		if (unique_key) key++;
 		value = strchr(key, '=');
+		i_assert(value != NULL);
 		o_stream_nsend(output, key, value-key);
 		o_stream_nsend_str(output, " = ");
-		if (!value_need_quote(value+1))
+		if (hide_passwords && value[1] != '\0' &&
+		    ((value-key > 9 && strncmp(value-9, "_password", 9) == 0) ||
+		     (value-key > 8 && strncmp(value-8, "_api_key", 8) == 0) ||
+		     strncmp(key, "ssl_key",7) == 0)) {
+			o_stream_nsend_str(output, " # hidden, use -P to show it");
+		} else if (!value_need_quote(value+1))
 			o_stream_nsend_str(output, value+1);
 		else {
 			o_stream_nsend(output, "\"", 1);
@@ -340,7 +347,7 @@ config_dump_filter_begin(string_t *str,
 	unsigned int indent = 0;
 
 	if (filter->local_bits > 0) {
-		str_printfa(str, "local %s", filter->local_host);
+		str_printfa(str, "local %s", net_ip2addr(&filter->local_net));
 
 		if (IPADDR_IS_V4(&filter->local_net)) {
 			if (filter->local_bits != 32)
@@ -361,7 +368,7 @@ config_dump_filter_begin(string_t *str,
 
 	if (filter->remote_bits > 0) {
 		str_append_n(str, indent_str, indent*2);
-		str_printfa(str, "remote %s", filter->remote_host);
+		str_printfa(str, "remote %s", net_ip2addr(&filter->remote_net));
 
 		if (IPADDR_IS_V4(&filter->remote_net)) {
 			if (filter->remote_bits != 32)
@@ -394,7 +401,7 @@ config_dump_filter_end(struct ostream *output, unsigned int indent)
 static int
 config_dump_human_sections(struct ostream *output,
 			   const struct config_filter *filter,
-			   const char *const *modules)
+			   const char *const *modules, bool hide_passwords)
 {
 	struct config_filter_parser *const *filters;
 	static struct config_dump_human_context *ctx;
@@ -413,7 +420,7 @@ config_dump_human_sections(struct ostream *output,
 		indent = config_dump_filter_begin(ctx->list_prefix,
 						  &(*filters)->filter);
 		config_export_parsers(ctx->export_ctx, (*filters)->parsers);
-		if (config_dump_human_output(ctx, output, indent, NULL) < 0)
+		if (config_dump_human_output(ctx, output, indent, NULL, hide_passwords) < 0)
 			ret = -1;
 		if (ctx->list_prefix_sent)
 			config_dump_filter_end(output, indent);
@@ -424,7 +431,8 @@ config_dump_human_sections(struct ostream *output,
 
 static int ATTR_NULL(4)
 config_dump_human(const struct config_filter *filter, const char *const *modules,
-		  enum config_dump_scope scope, const char *setting_name_filter)
+		  enum config_dump_scope scope, const char *setting_name_filter,
+		  bool hide_passwords)
 {
 	static struct config_dump_human_context *ctx;
 	struct ostream *output;
@@ -436,11 +444,11 @@ config_dump_human(const struct config_filter *filter, const char *const *modules
 
 	ctx = config_dump_human_init(modules, scope, TRUE);
 	config_export_by_filter(ctx->export_ctx, filter);
-	ret = config_dump_human_output(ctx, output, 0, setting_name_filter);
+	ret = config_dump_human_output(ctx, output, 0, setting_name_filter, hide_passwords);
 	config_dump_human_deinit(ctx);
 
 	if (setting_name_filter == NULL)
-		ret = config_dump_human_sections(output, filter, modules);
+		ret = config_dump_human_sections(output, filter, modules, hide_passwords);
 
 	o_stream_uncork(output);
 	o_stream_destroy(&output);
@@ -449,11 +457,12 @@ config_dump_human(const struct config_filter *filter, const char *const *modules
 
 static int
 config_dump_one(const struct config_filter *filter, bool hide_key,
-		enum config_dump_scope scope, const char *setting_name_filter)
+		enum config_dump_scope scope, const char *setting_name_filter,
+		bool hide_passwords)
 {
 	static struct config_dump_human_context *ctx;
 	const char *const *str;
-	unsigned int len;
+	size_t len;
 	bool dump_section = FALSE;
 
 	ctx = config_dump_human_init(NULL, scope, FALSE);
@@ -482,7 +491,7 @@ config_dump_one(const struct config_filter *filter, bool hide_key,
 	config_dump_human_deinit(ctx);
 
 	if (dump_section)
-		(void)config_dump_human(filter, NULL, scope, setting_name_filter);
+		(void)config_dump_human(filter, NULL, scope, setting_name_filter, hide_passwords);
 	return 0;
 }
 
@@ -491,7 +500,8 @@ static void config_request_simple_stdout(const char *key, const char *value,
 					 void *context)
 {
 	char **setting_name_filters = context;
-	unsigned int i, filter_len;
+	unsigned int i;
+	size_t filter_len;
 
 	if (setting_name_filters == NULL) {
 		printf("%s=%s\n", key, value);
@@ -592,14 +602,14 @@ static void hostname_verify_format(const char *arg)
 	struct hostname_format fmt;
 	const char *p;
 	unsigned char hash[GUID_128_HOST_HASH_SIZE];
-	unsigned int len, n, limit;
+	unsigned int n, limit;
 	HASH_TABLE(void *, void *) hosts;
 	void *key, *value;
 	string_t *host;
 	const char *host2;
 	bool duplicates = FALSE;
 
-	memset(&fmt, 0, sizeof(fmt));
+	i_zero(&fmt);
 	if (arg != NULL) {
 		/* host%d, host%2d, host%02d */
 		p = strchr(arg, '%');
@@ -619,7 +629,7 @@ static void hostname_verify_format(const char *arg)
 		fmt.suffix = p;
 	} else {
 		/* detect host1[suffix] vs host01[suffix] */
-		len = strlen(my_hostname);
+		size_t len = strlen(my_hostname);
 		while (len > 0 && !i_isdigit(my_hostname[len-1]))
 			len--;
 		fmt.suffix = my_hostname + len;
@@ -707,17 +717,18 @@ int main(int argc, char *argv[])
 	bool config_path_specified, expand_vars = FALSE, hide_key = FALSE;
 	bool parse_full_config = FALSE, simple_output = FALSE;
 	bool dump_defaults = FALSE, host_verify = FALSE;
+	bool print_plugin_banner = FALSE, hide_passwords = TRUE;
 
 	if (getenv("USE_SYSEXITS") != NULL) {
 		/* we're coming from (e.g.) LDA */
 		i_set_failure_exit_callback(failure_exit_callback);
 	}
 
-	memset(&filter, 0, sizeof(filter));
+	i_zero(&filter);
 	master_service = master_service_init("config",
 					     MASTER_SERVICE_FLAG_STANDALONE,
-					     &argc, &argv, "adf:hHm:nNpexS");
-	orig_config_path = master_service_get_config_path(master_service);
+					     &argc, &argv, "adf:hHm:nNpPexS");
+	orig_config_path = t_strdup(master_service_get_config_path(master_service));
 
 	i_set_failure_prefix("doveconf: ");
 	t_array_init(&module_names, 4);
@@ -754,6 +765,9 @@ int main(int argc, char *argv[])
 		case 'p':
 			parse_full_config = TRUE;
 			break;
+		case 'P':
+			hide_passwords = FALSE;
+			break;
 		case 'S':
 			simple_output = TRUE;
 			break;
@@ -787,10 +801,22 @@ int main(int argc, char *argv[])
 		/* print the config file path before parsing it, so in case
 		   of errors it's still shown */
 		printf("# "DOVECOT_VERSION_FULL": %s\n", config_path);
+		print_plugin_banner = TRUE;
 		fflush(stdout);
 	}
 	master_service_init_finish(master_service);
 	config_parse_load_modules();
+
+	if (print_plugin_banner) {
+		struct module *m;
+
+		for (m = modules; m != NULL; m = m->next) {
+			const char **str = module_get_symbol_quiet(m,
+				t_strdup_printf("%s_doveconf_banner", m->name));
+			if (str != NULL)
+				printf("# %s\n", *str);
+		}
+	}
 
 	if ((ret = config_parse_file(dump_defaults ? NULL : config_path,
 				     expand_vars,
@@ -822,7 +848,7 @@ int main(int argc, char *argv[])
 		ret = 0;
 		for (i = 0; setting_name_filters[i] != NULL; i++) {
 			if (config_dump_one(&filter, hide_key, scope,
-					    setting_name_filters[i]) < 0)
+					    setting_name_filters[i], hide_passwords) < 0)
 				ret2 = -1;
 		}
 	} else if (exec_args == NULL) {
@@ -831,20 +857,34 @@ int main(int argc, char *argv[])
 		info = sysinfo_get(get_setting("mail", "mail_location"));
 		if (*info != '\0')
 			printf("# %s\n", info);
+		printf("# Hostname: %s\n", my_hostdomain());
 		if (!config_path_specified)
 			check_wrong_config(config_path);
 		if (scope == CONFIG_DUMP_SCOPE_ALL)
 			printf("# NOTE: Send doveconf -n output instead when asking for help.\n");
 		fflush(stdout);
-		ret2 = config_dump_human(&filter, wanted_modules, scope, NULL);
+		ret2 = config_dump_human(&filter, wanted_modules, scope, NULL, hide_passwords);
 	} else {
 		struct config_export_context *ctx;
 
-		env_put("DOVECONF_ENV=1");
 		ctx = config_export_init(wanted_modules, CONFIG_DUMP_SCOPE_SET,
 					 CONFIG_DUMP_FLAG_CHECK_SETTINGS,
 					 config_request_putenv, NULL);
 		config_export_by_filter(ctx, &filter);
+
+		if (getenv(DOVECOT_PRESERVE_ENVS_ENV) != NULL) {
+			/* Standalone binary is getting its configuration via
+			   doveconf. Clean the environment before calling it.
+			   Do this only if the environment exists, because
+			   lib-master doesn't set it if it doesn't want the
+			   environment to be cleaned (e.g. -k parameter). */
+			const char *import_environment =
+				config_export_get_import_environment(ctx);
+			master_service_import_environment(import_environment);
+			master_service_env_clean();
+		}
+
+		env_put("DOVECONF_ENV=1");
 		if (config_export_finish(&ctx) < 0)
 			i_fatal("Invalid configuration");
 		execvp(exec_args[0], exec_args);
@@ -860,6 +900,7 @@ int main(int argc, char *argv[])
 
 	config_filter_deinit(&config_filter);
 	module_dir_unload(&modules);
+	config_parser_deinit();
 	master_service_deinit(&master_service);
         return 0;
 }

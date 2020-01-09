@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,12 +7,12 @@
 #include "wildcard-match.h"
 #include "hash.h"
 #include "str.h"
+#include "strescape.h"
 #include "doveadm.h"
 #include "doveadm-print.h"
 #include "doveadm-who.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 struct who_user {
@@ -23,9 +23,28 @@ struct who_user {
 	unsigned int connection_count;
 };
 
+static void who_user_ip(const struct who_user *user, struct ip_addr *ip_r)
+{
+	if (array_count(&user->ips) == 0)
+		i_zero(ip_r);
+	else {
+		const struct ip_addr *ip = array_idx(&user->ips, 0);
+		*ip_r = *ip;
+	}
+}
+
 static unsigned int who_user_hash(const struct who_user *user)
 {
-	return str_hash(user->username) + str_hash(user->service);
+	struct ip_addr ip;
+	unsigned int hash = str_hash(user->service);
+
+	if (user->username[0] != '\0')
+		hash += str_hash(user->username);
+	else {
+		who_user_ip(user, &ip);
+		hash += net_ip_hash(&ip);
+	}
+	return hash;
 }
 
 static int who_user_cmp(const struct who_user *user1,
@@ -35,6 +54,15 @@ static int who_user_cmp(const struct who_user *user1,
 		return 1;
 	if (strcmp(user1->service, user2->service) != 0)
 		return 1;
+
+	if (user1->username[0] == '\0') {
+		/* tracking only IP addresses, not usernames */
+		struct ip_addr ip1, ip2;
+
+		who_user_ip(user1, &ip1);
+		who_user_ip(user2, &ip2);
+		return net_ip_cmp(&ip1, &ip2);
+	}
 	return 0;
 }
 
@@ -50,23 +78,35 @@ who_user_has_ip(const struct who_user *user, const struct ip_addr *ip)
 	return FALSE;
 }
 
-static void who_parse_line(const char *line, struct who_line *line_r)
+static int who_parse_line(const char *line, struct who_line *line_r)
 {
-	const char *const *args = t_strsplit_tab(line);
+	const char *const *args = t_strsplit_tabescaped(line);
 	const char *ident = args[0];
 	const char *pid_str = args[1];
 	const char *refcount_str = args[2];
 	const char *p, *ip_str;
 
-	memset(line_r, 0, sizeof(*line_r));
+	i_zero(line_r);
 
+	/* ident = service/ip/username (imap, pop3)
+	   or      service/username (lmtp) */
 	p = strchr(ident, '/');
-	line_r->pid = strtoul(pid_str, NULL, 10);
+	if (p == NULL)
+		return -1;
+	if (str_to_pid(pid_str, &line_r->pid) < 0)
+		return -1;
 	line_r->service = t_strdup_until(ident, p++);
 	line_r->username = strchr(p, '/');
-	line_r->refcount = atoi(refcount_str);
-	ip_str = t_strdup_until(p, line_r->username++);
-	(void)net_addr2ip(ip_str, &line_r->ip);
+	if (line_r->username == NULL) {
+		/* no IP */
+		line_r->username = p;
+	} else {
+		ip_str = t_strdup_until(p, line_r->username++);
+		(void)net_addr2ip(ip_str, &line_r->ip);
+	}
+	if (str_to_uint(refcount_str, &line_r->refcount) < 0)
+		return -1;
+	return 0;
 }
 
 static bool who_user_has_pid(struct who_user *user, pid_t pid)
@@ -106,24 +146,30 @@ static void who_aggregate_line(struct who_context *ctx,
 		array_append(&user->pids, &line->pid, 1);
 }
 
-void who_parse_args(struct who_context *ctx, char **args)
+int who_parse_args(struct who_context *ctx, const char *const *masks)
 {
 	struct ip_addr net_ip;
-	unsigned int net_bits;
+	unsigned int i, net_bits;
 
-	while (args[1] != NULL) {
-		if (net_parse_range(args[1], &net_ip, &net_bits) == 0) {
-			if (ctx->filter.net_bits != 0)
-				usage();
+	for (i = 0; masks[i] != NULL; i++) {
+		if (net_parse_range(masks[i], &net_ip, &net_bits) == 0) {
+			if (ctx->filter.net_bits != 0) {
+				i_error("Multiple network masks not supported");
+				doveadm_exit_code = EX_USAGE;
+				return -1;
+			}
 			ctx->filter.net_ip = net_ip;
 			ctx->filter.net_bits = net_bits;
 		} else {
-			if (ctx->filter.username != NULL)
-				usage();
-			ctx->filter.username = args[1];
+			if (ctx->filter.username != NULL) {
+				i_error("Multiple username masks not supported");
+				doveadm_exit_code = EX_USAGE;
+				return -1;
+			}
+			ctx->filter.username = masks[i];
 		}
-		args++;
 	}
+	return 0;
 }
 
 void who_lookup(struct who_context *ctx, who_callback_t *callback)
@@ -136,22 +182,26 @@ void who_lookup(struct who_context *ctx, who_callback_t *callback)
 
 	fd = doveadm_connect(ctx->anvil_path);
 	net_set_nonblock(fd, FALSE);
-
-	input = i_stream_create_fd(fd, (size_t)-1, TRUE);
 	if (write(fd, ANVIL_CMD, strlen(ANVIL_CMD)) < 0)
 		i_fatal("write(%s) failed: %m", ctx->anvil_path);
+
+	input = i_stream_create_fd_autoclose(&fd, (size_t)-1);
 	while ((line = i_stream_read_next_line(input)) != NULL) {
 		if (*line == '\0')
 			break;
 		T_BEGIN {
 			struct who_line who_line;
 
-			who_parse_line(line, &who_line);
-			callback(ctx, &who_line);
+			if (who_parse_line(line, &who_line) < 0)
+				i_error("Invalid input: %s", line);
+			else
+				callback(ctx, &who_line);
 		} T_END;
 	}
-	if (input->stream_errno != 0)
-		i_fatal("read(%s) failed: %m", ctx->anvil_path);
+	if (input->stream_errno != 0) {
+		i_fatal("read(%s) failed: %s", ctx->anvil_path,
+			i_stream_get_error(input));
+	}
 
 	i_stream_destroy(&input);
 }
@@ -260,32 +310,27 @@ static void who_print_line(struct who_context *ctx,
 	} T_END;
 }
 
-static void cmd_who(int argc, char *argv[])
+static void cmd_who(struct doveadm_cmd_context *cctx)
 {
+	const char *const *masks;
 	struct who_context ctx;
 	bool separate_connections = FALSE;
-	int c;
 
-	memset(&ctx, 0, sizeof(ctx));
-	ctx.anvil_path = t_strconcat(doveadm_settings->base_dir, "/anvil", NULL);
+	i_zero(&ctx);
+	if (!doveadm_cmd_param_str(cctx, "socket-path", &(ctx.anvil_path)))
+		ctx.anvil_path = t_strconcat(doveadm_settings->base_dir, "/anvil", NULL);
+	(void)doveadm_cmd_param_bool(cctx, "separate-connections", &separate_connections);
+
 	ctx.pool = pool_alloconly_create("who users", 10240);
 	hash_table_create(&ctx.users, ctx.pool, 0, who_user_hash, who_user_cmp);
 
-	while ((c = getopt(argc, argv, "1a:")) > 0) {
-		switch (c) {
-		case '1':
-			separate_connections = TRUE;
-			break;
-		case 'a':
-			ctx.anvil_path = optarg;
-			break;
-		default:
-			help(&doveadm_cmd_who);
+	if (doveadm_cmd_param_array(cctx, "mask", &masks)) {
+		if (who_parse_args(&ctx, masks) != 0) {
+			hash_table_destroy(&ctx.users);
+			pool_unref(&ctx.pool);
+			return;
 		}
 	}
-
-	argv += optind - 1;
-	who_parse_args(&ctx, argv);
 
 	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
 	if (!separate_connections) {
@@ -304,7 +349,13 @@ static void cmd_who(int argc, char *argv[])
 	pool_unref(&ctx.pool);
 }
 
-struct doveadm_cmd doveadm_cmd_who = {
-	cmd_who, "who",
-	"[-a <anvil socket path>] [-1] [<user mask>] [<ip/bits>]"
+struct doveadm_cmd_ver2 doveadm_cmd_who_ver2 = {
+	.name = "who",
+	.cmd = cmd_who,
+	.usage = "[-a <anvil socket path>] [-1] [<user mask>] [<ip/bits>]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_PARAM('a',"socket-path", CMD_PARAM_STR, 0)
+DOVEADM_CMD_PARAM('1',"separate-connections", CMD_PARAM_BOOL, 0)
+DOVEADM_CMD_PARAM('\0',"mask", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

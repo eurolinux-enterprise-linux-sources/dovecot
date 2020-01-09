@@ -70,6 +70,12 @@ struct mail_namespace {
 	struct mail_storage *storage; /* default storage */
 	ARRAY(struct mail_storage *) all_storages;
 
+	/* This may point to user->set, but it may also point to
+	   namespace-specific settings. When accessing namespace-specific
+	   settings it should be done through here instead of through the
+	   mail_user. */
+	struct mail_user_settings *user_set;
+
 	const struct mail_namespace_settings *set, *unexpanded_set;
 	const struct mail_storage_settings *mail_set;
 
@@ -77,13 +83,42 @@ struct mail_namespace {
 	unsigned int destroyed:1;
 };
 
+
+/* Allocate a new namespace, and fill it based on the passed in settings.
+   This is the most low-level namespace creation function. The storage isn't
+   initialized for the namespace.
+
+   user_all_settings normally points to user->set. If you want to override
+   settings for the created namespace, you can duplicate the user's settings
+   and provide a pointer to it here. Note that the pointer must contain
+   ALL the settings, including the dynamic driver-specific settings, so it
+   needs to created via settings-parser API. */
+int mail_namespace_alloc(struct mail_user *user,
+			 void *user_all_settings,
+			 struct mail_namespace_settings *ns_set,
+			 struct mail_namespace_settings *unexpanded_set,
+			 struct mail_namespace **ns_r,
+			 const char **error_r);
+
+/* Add and initialize namespaces to user based on namespace settings. */
 int mail_namespaces_init(struct mail_user *user, const char **error_r);
+/* Add and initialize INBOX namespace to user based on the given location. */
 int mail_namespaces_init_location(struct mail_user *user, const char *location,
 				  const char **error_r) ATTR_NULL(2);
+/* Add an empty namespace to user. */
 struct mail_namespace *mail_namespaces_init_empty(struct mail_user *user);
 /* Deinitialize all namespaces. mail_user_deinit() calls this automatically
    for user's namespaces. */
 void mail_namespaces_deinit(struct mail_namespace **namespaces);
+
+/* Allocate a new namespace and initialize it. This is called automatically by
+   mail_namespaces_init(). */
+int mail_namespaces_init_add(struct mail_user *user,
+			     struct mail_namespace_settings *ns_set,
+			     struct mail_namespace_settings *unexpanded_ns_set,
+			     struct mail_namespace **ns_p, const char **error_r);
+int mail_namespaces_init_finish(struct mail_namespace *namespaces,
+				const char **error_r);
 
 void mail_namespace_ref(struct mail_namespace *ns);
 void mail_namespace_unref(struct mail_namespace **ns);
@@ -134,7 +169,7 @@ mail_namespace_find_subscribable(struct mail_namespace *namespaces,
 struct mail_namespace *
 mail_namespace_find_unsubscribable(struct mail_namespace *namespaces,
 				   const char *mailbox);
-/* Returns the INBOX namespace, or NULL if there is no such  */
+/* Returns the INBOX namespace. It always exists, so NULL is never returned. */
 struct mail_namespace *
 mail_namespace_find_inbox(struct mail_namespace *namespaces);
 /* Find a namespace with given prefix. */
@@ -149,5 +184,22 @@ mail_namespace_find_prefix_nosep(struct mail_namespace *namespaces,
 /* Called internally by mailbox_list_create(). */
 void mail_namespace_finish_list_init(struct mail_namespace *ns,
 				     struct mailbox_list *list);
+
+/* Returns TRUE if this is the root of a type=shared namespace that is actually
+   used for accessing shared users' mailboxes (as opposed to marking a
+   type=public namespace "wrong"). */
+bool mail_namespace_is_shared_user_root(struct mail_namespace *ns);
+
+/* Returns TRUE if namespace includes INBOX that should be \Noinferiors.
+   This happens when the namespace has a prefix, which is not empty and not
+   "INBOX". This happens, because if storage_name=INBOX/foo it would be
+   converted to vname=prefix/INBOX/foo. */
+static inline bool
+mail_namespace_is_inbox_noinferiors(struct mail_namespace *ns)
+{
+	return (ns->flags & NAMESPACE_FLAG_INBOX_USER) != 0 &&
+		ns->prefix_len > 0 &&
+		strncmp(ns->prefix, "INBOX", ns->prefix_len-1) != 0;
+}
 
 #endif

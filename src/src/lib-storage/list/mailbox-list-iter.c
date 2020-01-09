@@ -1,12 +1,14 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
+#include "hash.h"
 #include "imap-match.h"
 #include "mail-storage.h"
 #include "mailbox-tree.h"
 #include "mailbox-list-subscriptions.h"
 #include "mailbox-list-private.h"
+#include "mailbox-list-iter-private.h"
 
 enum autocreate_match_result {
 	/* list contains the mailbox */
@@ -15,22 +17,6 @@ enum autocreate_match_result {
 	AUTOCREATE_MATCH_RESULT_CHILDREN	= 0x02,
 	/* list contains parents of the mailbox */
 	AUTOCREATE_MATCH_RESULT_PARENT		= 0x04
-};
-
-struct autocreate_box {
-	const char *name;
-	const struct mailbox_settings *set;
-	enum mailbox_info_flags flags;
-	bool child_listed;
-};
-
-ARRAY_DEFINE_TYPE(mailbox_settings, struct mailbox_settings *);
-struct mailbox_list_autocreate_iterate_context {
-	unsigned int idx;
-	struct mailbox_info new_info;
-	ARRAY(struct autocreate_box) boxes;
-	ARRAY_TYPE(mailbox_settings) box_sets;
-	ARRAY_TYPE(mailbox_settings) all_ns_box_sets;
 };
 
 struct ns_list_iterate_context {
@@ -56,6 +42,8 @@ static bool ns_match_next(struct ns_list_iterate_context *ctx,
 static int mailbox_list_match_anything(struct ns_list_iterate_context *ctx,
 				       struct mail_namespace *ns,
 				       const char *prefix);
+
+static struct mailbox_list_iterate_context mailbox_list_iter_failed;
 
 struct mailbox_list_iterate_context *
 mailbox_list_iter_init(struct mailbox_list *list, const char *pattern,
@@ -127,6 +115,8 @@ mailbox_list_iter_init_autocreate(struct mailbox_list_iterate_context *ctx)
 
 	actx = p_new(ctx->pool, struct mailbox_list_autocreate_iterate_context, 1);
 	ctx->autocreate_ctx = actx;
+	hash_table_create(&actx->duplicate_vnames, ctx->pool, 0,
+			  str_hash, strcmp);
 
 	/* build the list of mailboxes we need to consider as existing */
 	p_array_init(&actx->boxes, ctx->pool, 16);
@@ -162,18 +152,17 @@ mailbox_list_iter_init_multiple(struct mailbox_list *list,
 				enum mailbox_list_iter_flags flags)
 {
 	struct mailbox_list_iterate_context *ctx;
-	int ret = 0;
 
 	i_assert(*patterns != NULL);
 
 	if ((flags & (MAILBOX_LIST_ITER_SELECT_SUBSCRIBED |
-		      MAILBOX_LIST_ITER_RETURN_SUBSCRIBED)) != 0)
-		ret = mailbox_list_iter_subscriptions_refresh(list);
+		      MAILBOX_LIST_ITER_RETURN_SUBSCRIBED)) != 0) {
+		if (mailbox_list_iter_subscriptions_refresh(list) < 0)
+			return &mailbox_list_iter_failed;
+	}
 
 	ctx = list->v.iter_init(list, patterns, flags);
-	if (ret < 0)
-		ctx->failed = TRUE;
-	else if ((flags & MAILBOX_LIST_ITER_NO_AUTO_BOXES) == 0)
+	if ((flags & MAILBOX_LIST_ITER_NO_AUTO_BOXES) == 0)
 		mailbox_list_iter_init_autocreate(ctx);
 	return ctx;
 }
@@ -239,13 +228,22 @@ ns_is_match_within_ns(struct ns_list_iterate_context *ctx,
 	return FALSE;
 }
 
+static bool list_pattern_has_wildcards(const char *pattern)
+{
+	for (; *pattern != '\0'; pattern++) {
+		if (*pattern == '%' || *pattern == '*')
+			return TRUE;
+	}
+	return FALSE;
+}
+
 static bool ns_match_next(struct ns_list_iterate_context *ctx, 
 			  struct mail_namespace *ns, const char *pattern)
 {
 	struct imap_match_glob *glob;
 	enum imap_match_result result;
 	const char *prefix_without_sep;
-	unsigned int len;
+	size_t len;
 
 	len = ns->prefix_len;
 	if (len > 0 && ns->prefix[len-1] == mail_namespace_get_sep(ns))
@@ -256,8 +254,13 @@ static bool ns_match_next(struct ns_list_iterate_context *ctx,
 		/* non-listable namespace matches only with exact prefix */
 		if (strncmp(ns->prefix, pattern, ns->prefix_len) != 0)
 			return FALSE;
-		/* prefix="" list=no is never listed */
-		if (ns->prefix_len == 0)
+		/* with prefix="", list=no we don't want to show anything,
+		   except when the client explicitly lists a mailbox without
+		   wildcards (e.g. LIST "" mailbox). this is mainly useful
+		   for working around client bugs (and supporting a specific
+		   IMAP client behavior that's not exactly buggy but not very
+		   good IMAP behavior either). */
+		if (ns->prefix_len == 0 && list_pattern_has_wildcards(pattern))
 			return FALSE;
 	}
 
@@ -340,33 +343,38 @@ mailbox_list_ns_prefix_match(struct ns_list_iterate_context *ctx,
 	return ret;
 }
 
-static bool
+static int
 ns_prefix_is_visible(struct ns_list_iterate_context *ctx,
 		     struct mail_namespace *ns)
 {
+	int ret;
+
 	if ((ns->flags & NAMESPACE_FLAG_LIST_PREFIX) != 0)
-		return TRUE;
+		return 1;
 	if ((ns->flags & NAMESPACE_FLAG_LIST_CHILDREN) != 0) {
-		if (mailbox_list_match_anything(ctx, ns, ns->prefix))
-			return TRUE;
+		if ((ret = mailbox_list_match_anything(ctx, ns, ns->prefix)) != 0)
+			return ret;
 	}
-	return FALSE;
+	return 0;
 }
 
-static bool
+static int
 ns_prefix_has_visible_child_namespace(struct ns_list_iterate_context *ctx,
 				      const char *prefix)
 {
 	struct mail_namespace *ns;
-	unsigned int prefix_len = strlen(prefix);
+	size_t prefix_len = strlen(prefix);
+	int ret;
 
 	for (ns = ctx->namespaces; ns != NULL; ns = ns->next) {
 		if (ns->prefix_len > prefix_len &&
-		    strncmp(ns->prefix, prefix, prefix_len) == 0 &&
-		    ns_prefix_is_visible(ctx, ns))
-			return TRUE;
+		    strncmp(ns->prefix, prefix, prefix_len) == 0) {
+			ret = ns_prefix_is_visible(ctx, ns);
+			if (ret != 0)
+				return ret;
+		}
 	}
-	return FALSE;
+	return 0;
 }
 
 static bool
@@ -396,8 +404,8 @@ mailbox_list_match_anything(struct ns_list_iterate_context *ctx,
 	const char *pattern;
 	int ret;
 
-	if (ns_prefix_has_visible_child_namespace(ctx, prefix))
-		return 1;
+	if ((ret = ns_prefix_has_visible_child_namespace(ctx, prefix)) != 0)
+		return ret;
 
 	pattern = t_strconcat(prefix, "%", NULL);
 	list_iter = mailbox_list_iter_init(ns->list, pattern, list_flags);
@@ -447,7 +455,7 @@ mailbox_list_ns_prefix_return(struct ns_list_iterate_context *ctx,
 	if (ns->prefix_len == 0 || !mailbox_list_ns_prefix_match(ctx, ns))
 		return FALSE;
 
-	memset(&ctx->ns_info, 0, sizeof(ctx->ns_info));
+	i_zero(&ctx->ns_info);
 	ctx->ns_info.ns = ns;
 	ctx->ns_info.vname = p_strndup(ctx->pool, ns->prefix,
 				       ns->prefix_len-1);
@@ -487,8 +495,7 @@ mailbox_list_ns_prefix_return(struct ns_list_iterate_context *ctx,
 		}
 	}
 
-	if ((ctx->ctx.flags & MAILBOX_LIST_ITER_RETURN_NO_FLAGS) == 0 &&
-	    (ctx->ns_info.flags & MAILBOX_SELECT) == 0) {
+	if ((ctx->ns_info.flags & MAILBOX_SELECT) == 0) {
 		/* see if namespace prefix is selectable */
 		box = mailbox_alloc(ns->list, ctx->ns_info.vname, 0);
 		if (mailbox_exists(box, TRUE, &existence) == 0 &&
@@ -532,6 +539,18 @@ static void inbox_set_children_flags(struct ns_list_iterate_context *ctx)
 		ctx->inbox_info.flags |= MAILBOX_NOCHILDREN;
 }
 
+static void mailbox_list_ns_iter_failed(struct ns_list_iterate_context *ctx)
+{
+	enum mail_error error;
+	const char *errstr;
+
+	if (ctx->cur_ns->list != ctx->error_list) {
+		errstr = mailbox_list_get_last_error(ctx->cur_ns->list, &error);
+		mailbox_list_set_error(ctx->error_list, error, errstr);
+	}
+	ctx->ctx.failed = TRUE;
+}
+
 static bool
 mailbox_list_ns_iter_try_next(struct mailbox_list_iterate_context *_ctx,
 			      const struct mailbox_info **info_r)
@@ -540,12 +559,10 @@ mailbox_list_ns_iter_try_next(struct mailbox_list_iterate_context *_ctx,
 		(struct ns_list_iterate_context *)_ctx;
 	struct mail_namespace *ns;
 	const struct mailbox_info *info;
-	enum mail_error error;
-	const char *errstr;
 	bool has_children;
 
 	if (ctx->cur_ns == NULL) {
-		if (!ctx->inbox_listed && ctx->inbox_list) {
+		if (!ctx->inbox_listed && ctx->inbox_list && !_ctx->failed) {
 			/* send delayed INBOX reply */
 			ctx->inbox_listed = TRUE;
 			inbox_set_children_flags(ctx);
@@ -627,12 +644,8 @@ mailbox_list_ns_iter_try_next(struct mailbox_list_iterate_context *_ctx,
 	}
 
 	/* finished with this namespace */
-	if (mailbox_list_iter_deinit(&ctx->backend_ctx) < 0) {
-		errstr = mailbox_list_get_last_error(ctx->cur_ns->list,
-						     &error);
-		mailbox_list_set_error(ctx->error_list, error, errstr);
-		_ctx->failed = TRUE;
-	}
+	if (mailbox_list_iter_deinit(&ctx->backend_ctx) < 0)
+		mailbox_list_ns_iter_failed(ctx);
 	ctx->cur_ns = ctx->cur_ns->next;
 	return FALSE;
 }
@@ -651,17 +664,11 @@ mailbox_list_ns_iter_deinit(struct mailbox_list_iterate_context *_ctx)
 {
 	struct ns_list_iterate_context *ctx =
 		(struct ns_list_iterate_context *)_ctx;
-	enum mail_error error;
-	const char *errstr;
 	int ret;
 
 	if (ctx->backend_ctx != NULL) {
-		if (mailbox_list_iter_deinit(&ctx->backend_ctx) < 0) {
-			errstr = mailbox_list_get_last_error(ctx->cur_ns->list,
-							     &error);
-			mailbox_list_set_error(ctx->error_list, error, errstr);
-			_ctx->failed = TRUE;
-		}
+		if (mailbox_list_iter_deinit(&ctx->backend_ctx) < 0)
+			mailbox_list_ns_iter_failed(ctx);
 	}
 	ret = _ctx->failed ? -1 : 0;
 	pool_unref(&ctx->pool);
@@ -700,17 +707,19 @@ patterns_match_inbox(struct mail_namespace *namespaces,
 	return imap_match(glob, "INBOX") == IMAP_MATCH_YES;
 }
 
-static void inbox_info_init(struct ns_list_iterate_context *ctx,
-			    struct mail_namespace *namespaces)
+static int inbox_info_init(struct ns_list_iterate_context *ctx,
+			   struct mail_namespace *namespaces)
 {
 	enum mailbox_info_flags flags;
+	int ret;
 
 	ctx->inbox_info.vname = "INBOX";
 	ctx->inbox_info.ns = mail_namespace_find_inbox(namespaces);
 	i_assert(ctx->inbox_info.ns != NULL);
 
-	if (mailbox_list_mailbox(ctx->inbox_info.ns->list, "INBOX", &flags) > 0)
+	if ((ret = mailbox_list_mailbox(ctx->inbox_info.ns->list, "INBOX", &flags)) > 0)
 		ctx->inbox_info.flags = flags;
+	return ret;
 }
 
 struct mailbox_list_iterate_context *
@@ -747,7 +756,10 @@ mailbox_list_iter_init_namespaces(struct mail_namespace *namespaces,
 		   else called INBOX (e.g. namespace prefix) we can show it
 		   immediately with the proper flags. */
 		ctx->inbox_list = TRUE;
-		inbox_info_init(ctx, namespaces);
+		if (inbox_info_init(ctx, namespaces) < 0) {
+			pool_unref(&pool);
+			return &mailbox_list_iter_failed;
+		}
 	}
 
 	if ((flags & MAILBOX_LIST_ITER_STAR_WITHIN_NS) != 0) {
@@ -770,7 +782,8 @@ autocreate_box_match(const ARRAY_TYPE(mailbox_settings) *boxes,
 		     bool only_subscribed, unsigned int *idx_r)
 {
 	struct mailbox_settings *const *sets;
-	unsigned int i, count, len, name_len = strlen(name);
+	unsigned int i, count;
+	size_t len, name_len = strlen(name);
 	enum autocreate_match_result result = 0;
 	char sep = mail_namespace_get_sep(ns);
 
@@ -796,11 +809,15 @@ autocreate_box_match(const ARRAY_TYPE(mailbox_settings) *boxes,
 	return result;
 }
 
-static const struct mailbox_info *
-autocreate_iter_existing(struct mailbox_list_iterate_context *ctx)
+const struct mailbox_info *
+mailbox_list_iter_autocreate_filter(struct mailbox_list_iterate_context *ctx,
+				    const struct mailbox_info *_info)
 {
 	struct mailbox_list_autocreate_iterate_context *actx =
 		ctx->autocreate_ctx;
+	if (actx == NULL || _info == NULL)
+		return _info;
+	actx->new_info = *_info;
 	struct mailbox_info *info = &actx->new_info;
 	enum autocreate_match_result match, match2;
 	unsigned int idx;
@@ -808,11 +825,25 @@ autocreate_iter_existing(struct mailbox_list_iterate_context *ctx)
 	match = autocreate_box_match(&actx->box_sets, ctx->list->ns,
 				     info->vname, FALSE, &idx);
 
-	if ((match & AUTOCREATE_MATCH_RESULT_YES) != 0) {
-		/* we have an exact match in the list.
-		   don't list it at the end. */
-		array_delete(&actx->boxes, idx, 1);
-		array_delete(&actx->box_sets, idx, 1);
+	if (!actx->listing_autoboxes) {
+		if ((match & AUTOCREATE_MATCH_RESULT_YES) != 0) {
+			/* we have an exact match in the list.
+			   don't list it at the end. */
+			array_delete(&actx->boxes, idx, 1);
+			array_delete(&actx->box_sets, idx, 1);
+		}
+		if ((match & AUTOCREATE_MATCH_RESULT_CHILDREN) != 0 &&
+		    hash_table_lookup(actx->duplicate_vnames, info->vname) == NULL) {
+			/* Prevent autocreate-iteration from adding this
+			   mailbox as a duplicate. For example we're listing %
+			   and we're here because "foo" was found. However,
+			   there's also "foo/bar" with auto=create. We're
+			   telling here to the autocreate iteration code that
+			   "foo" was already found and it doesn't need to add
+			   it again. */
+			char *vname = p_strdup(ctx->pool, info->vname);
+			hash_table_insert(actx->duplicate_vnames, vname, vname);
+		}
 	}
 
 	if ((match & AUTOCREATE_MATCH_RESULT_CHILDREN) != 0) {
@@ -860,7 +891,7 @@ autocreate_iter_existing(struct mailbox_list_iterate_context *ctx)
 		/* there are autocreate parent boxes.
 		   set their children flag states. */
 		struct autocreate_box *autobox;
-		unsigned int name_len;
+		size_t name_len;
 		char sep = mail_namespace_get_sep(ctx->list->ns);
 
 		array_foreach_modifiable(&actx->boxes, autobox) {
@@ -886,7 +917,7 @@ static bool autocreate_iter_autobox(struct mailbox_list_iterate_context *ctx,
 		ctx->autocreate_ctx;
 	enum imap_match_result match;
 
-	memset(&actx->new_info, 0, sizeof(actx->new_info));
+	i_zero(&actx->new_info);
 	actx->new_info.ns = ctx->list->ns;
 	actx->new_info.vname = autobox->name;
 	actx->new_info.flags = autobox->flags;
@@ -894,8 +925,16 @@ static bool autocreate_iter_autobox(struct mailbox_list_iterate_context *ctx,
 	if ((ctx->flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0)
 		actx->new_info.flags |= MAILBOX_SUBSCRIBED;
 
-	if ((actx->new_info.flags & MAILBOX_CHILDREN) == 0)
-		actx->new_info.flags |= MAILBOX_NOCHILDREN;
+	if ((actx->new_info.flags & MAILBOX_CHILDREN) == 0) {
+		if ((ctx->list->flags & MAILBOX_LIST_FLAG_MAILBOX_FILES) != 0 &&
+		    ctx->list->set.maildir_name[0] == '\0') {
+			/* mailbox format using files (e.g. mbox)
+			   without DIRNAME specified */
+			actx->new_info.flags |= MAILBOX_NOINFERIORS;
+		} else {
+			actx->new_info.flags |= MAILBOX_NOCHILDREN;
+		}
+	}
 
 	match = imap_match(ctx->glob, actx->new_info.vname);
 	if (match == IMAP_MATCH_YES) {
@@ -908,6 +947,7 @@ static bool autocreate_iter_autobox(struct mailbox_list_iterate_context *ctx,
 		enum mailbox_info_flags old_flags = actx->new_info.flags;
 		char sep = mail_namespace_get_sep(ctx->list->ns);
 		const char *p;
+		char *vname;
 
 		/* e.g. autocreate=foo/bar and we're listing % */
 		actx->new_info.flags = MAILBOX_NONEXISTENT |
@@ -922,12 +962,16 @@ static bool autocreate_iter_autobox(struct mailbox_list_iterate_context *ctx,
 		do {
 			p = strrchr(actx->new_info.vname, sep);
 			i_assert(p != NULL);
-			actx->new_info.vname =
+			actx->new_info.vname = vname =
 				p_strdup_until(ctx->pool,
 					       actx->new_info.vname, p);
 			match = imap_match(ctx->glob, actx->new_info.vname);
 		} while (match != IMAP_MATCH_YES);
-		return TRUE;
+
+		if (hash_table_lookup(actx->duplicate_vnames, vname) == NULL) {
+			hash_table_insert(actx->duplicate_vnames, vname, vname);
+			return TRUE;
+		}
 	}
 	return FALSE;
 }
@@ -944,7 +988,7 @@ mailbox_list_iter_next_call(struct mailbox_list_iterate_context *ctx)
 
 	ctx->list->ns->flags |= NAMESPACE_FLAG_USABLE;
 	if ((ctx->flags & MAILBOX_LIST_ITER_RETURN_SPECIALUSE) != 0) {
-		set = mailbox_settings_find(ctx->list->ns->user, info->vname);
+		set = mailbox_settings_find(ctx->list->ns, info->vname);
 		if (set != NULL && *set->special_use != '\0') {
 			ctx->specialuse_info = *info;
 			ctx->specialuse_info.special_use =
@@ -953,25 +997,23 @@ mailbox_list_iter_next_call(struct mailbox_list_iterate_context *ctx)
 			info = &ctx->specialuse_info;
 		}
 	}
-	return info;
+
+	return mailbox_list_iter_autocreate_filter(ctx, info);
 }
 
-static const struct mailbox_info *
-autocreate_iter_next(struct mailbox_list_iterate_context *ctx)
+const struct mailbox_info *
+mailbox_list_iter_default_next(struct mailbox_list_iterate_context *ctx)
 {
 	struct mailbox_list_autocreate_iterate_context *actx =
-		ctx->autocreate_ctx;
-	const struct mailbox_info *info;
+        	ctx->autocreate_ctx;
 	const struct autocreate_box *autoboxes, *autobox;
 	unsigned int count;
 
-	if (actx->idx == 0) {
-		info = mailbox_list_iter_next_call(ctx);
-		if (info != NULL) {
-			actx->new_info = *info;
-			return autocreate_iter_existing(ctx);
-		}
-	}
+	if (actx == NULL)
+		return NULL;
+
+	/* do not drop boxes anymore */
+	actx->listing_autoboxes = TRUE;
 
 	/* list missing mailboxes */
 	autoboxes = array_get(&actx->boxes, &count);
@@ -1004,12 +1046,11 @@ mailbox_list_iter_next(struct mailbox_list_iterate_context *ctx)
 {
 	const struct mailbox_info *info;
 
+	if (ctx == &mailbox_list_iter_failed)
+		return NULL;
 	do {
 		T_BEGIN {
-			if (ctx->autocreate_ctx != NULL)
-				info = autocreate_iter_next(ctx);
-			else
-				info = mailbox_list_iter_next_call(ctx);
+			info = mailbox_list_iter_next_call(ctx);
 		} T_END;
 	} while (info != NULL && !special_use_selection(ctx, info));
 	return info;
@@ -1021,6 +1062,10 @@ int mailbox_list_iter_deinit(struct mailbox_list_iterate_context **_ctx)
 
 	*_ctx = NULL;
 
+	if (ctx == &mailbox_list_iter_failed)
+		return -1;
+	if (ctx->autocreate_ctx != NULL)
+		hash_table_destroy(&ctx->autocreate_ctx->duplicate_vnames);
 	return ctx->list->v.iter_deinit(ctx);
 }
 

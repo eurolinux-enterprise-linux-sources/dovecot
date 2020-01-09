@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -18,7 +18,7 @@ void mail_transaction_log_append_add(struct mail_transaction_log_append_ctx *ctx
 	if (size == 0)
 		return;
 
-	memset(&hdr, 0, sizeof(hdr));
+	i_zero(&hdr);
 	hdr.type = type | ctx->trans_flags;
 	if (type == MAIL_TRANSACTION_EXPUNGE ||
 	    type == MAIL_TRANSACTION_EXPUNGE_GUID)
@@ -31,7 +31,8 @@ void mail_transaction_log_append_add(struct mail_transaction_log_append_ctx *ctx
 	buffer_append(ctx->output, &hdr, sizeof(hdr));
 	buffer_append(ctx->output, data, size);
 
-	mail_transaction_update_modseq(&hdr, data, &ctx->new_highest_modseq);
+	mail_transaction_update_modseq(&hdr, data, &ctx->new_highest_modseq,
+		MAIL_TRANSACTION_LOG_HDR_VERSION(&ctx->log->head->hdr));
 	ctx->transaction_count++;
 }
 
@@ -122,9 +123,22 @@ log_append_sync_offset_if_needed(struct mail_transaction_log_append_ctx *ctx)
 	buffer_t buf;
 	unsigned char update_data[sizeof(*u) + sizeof(offset)];
 
-	if (file->max_tail_offset == file->sync_offset) {
-		if (ctx->output->used == 0 &&
-		    file->saved_tail_offset == file->max_tail_offset) {
+	if (!ctx->index_sync_transaction) {
+		/* this is a non-syncing transaction. update the tail offset
+		   only if we're already writing something else to transaction
+		   log anyway. */
+		i_assert(!ctx->tail_offset_changed);
+		/* FIXME: For now we never do this update, because it would
+		   cause errors about shrinking tail offsets with old Dovecot
+		   versions. This is anyway just an optimization, so it doesn't
+		   matter all that much if we don't do it here. Finish this
+		   in v2.3. */
+		/*if (ctx->output->used == 0)*/
+			return;
+	} else if (file->max_tail_offset == file->sync_offset) {
+		/* we're synced all the way to tail offset, so this sync
+		   transaction can also be included in the same tail offset. */
+		if (ctx->output->used == 0 && !ctx->tail_offset_changed) {
 			/* nothing to write here after all (e.g. all unchanged
 			   flag updates were dropped by export) */
 			return;
@@ -137,6 +151,10 @@ log_append_sync_offset_if_needed(struct mail_transaction_log_append_ctx *ctx)
 		file->max_tail_offset += ctx->output->used +
 			sizeof(*hdr) + sizeof(*u) + sizeof(offset);
 		ctx->sync_includes_this = TRUE;
+	} else {
+		/* This is a syncing transaction. Since we're finishing a sync,
+		   we may need to update the tail offset even if we don't have
+		   anything else to do. */
 	}
 	offset = file->max_tail_offset;
 
@@ -189,9 +207,7 @@ mail_transaction_log_append_locked(struct mail_transaction_log_append_ctx *ctx)
 		buffer_delete(ctx->output, 0, boundary_size);
 	}
 
-	if (ctx->append_sync_offset)
-		log_append_sync_offset_if_needed(ctx);
-
+	log_append_sync_offset_if_needed(ctx);
 	if (log_buffer_write(ctx) < 0)
 		return -1;
 	file->sync_highest_modseq = ctx->new_highest_modseq;
@@ -206,7 +222,7 @@ int mail_transaction_log_append_begin(struct mail_index *index,
 	struct mail_transaction_boundary boundary;
 
 	if (!index->log_sync_locked) {
-		if (mail_transaction_log_lock_head(index->log) < 0)
+		if (mail_transaction_log_lock_head(index->log, "appending") < 0)
 			return -1;
 	}
 	ctx = i_new(struct mail_transaction_log_append_ctx, 1);
@@ -214,7 +230,7 @@ int mail_transaction_log_append_begin(struct mail_index *index,
 	ctx->output = buffer_create_dynamic(default_pool, 1024);
 	ctx->trans_flags = flags;
 
-	memset(&boundary, 0, sizeof(boundary));
+	i_zero(&boundary);
 	mail_transaction_log_append_add(ctx, MAIL_TRANSACTION_BOUNDARY,
 					&boundary, sizeof(boundary));
 
@@ -232,7 +248,7 @@ int mail_transaction_log_append_commit(struct mail_transaction_log_append_ctx **
 
 	ret = mail_transaction_log_append_locked(ctx);
 	if (!index->log_sync_locked)
-		mail_transaction_log_file_unlock(index->log->head);
+		mail_transaction_log_file_unlock(index->log->head, "appending");
 
 	buffer_free(&ctx->output);
 	i_free(ctx);

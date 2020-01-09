@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 
@@ -99,7 +99,7 @@ o_stream_bzlib_send_chunk(struct bzlib_ostream *zstream,
 static int o_stream_bzlib_send_flush(struct bzlib_ostream *zstream)
 {
 	bz_stream *zs = &zstream->zs;
-	unsigned int len;
+	size_t len;
 	bool done = FALSE;
 	int ret;
 
@@ -113,6 +113,8 @@ static int o_stream_bzlib_send_flush(struct bzlib_ostream *zstream)
 	if (zstream->flushed)
 		return 0;
 
+	if ((ret = o_stream_flush_parent_if_needed(&zstream->ostream)) <= 0)
+		return ret;
 	if ((ret = o_stream_zlib_send_outbuf(zstream)) <= 0)
 		return ret;
 

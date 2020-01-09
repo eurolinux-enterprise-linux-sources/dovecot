@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -16,24 +16,27 @@ static int director_host_cmp(const struct director_host *b1,
 	return (int)b1->port - (int)b2->port;
 }
 
-static int director_host_cmp_p(struct director_host *const *host1,
-			       struct director_host *const *host2)
+int director_host_cmp_p(struct director_host *const *host1,
+			struct director_host *const *host2)
 {
 	return director_host_cmp(*host1, *host2);
 }
 
 struct director_host *
 director_host_add(struct director *dir,
-		  const struct ip_addr *ip, unsigned int port)
+		  const struct ip_addr *ip, in_port_t port)
 {
 	struct director_host *host;
+
+	i_assert(director_host_lookup(dir, ip, port) == NULL);
 
 	host = i_new(struct director_host, 1);
 	host->dir = dir;
 	host->refcount = 1;
 	host->ip = *ip;
+	host->ip_str = i_strdup(net_ip2addr(&host->ip));
 	host->port = port;
-	host->name = i_strdup_printf("%s:%u", net_ip2addr(ip), port);
+	host->name = i_strdup_printf("%s:%u", host->ip_str, port);
 
 	array_append(&dir->dir_hosts, &host, 1);
 
@@ -77,6 +80,7 @@ void director_host_unref(struct director_host *host)
 		}
 	}
 	i_free(host->name);
+	i_free(host->ip_str);
 	i_free(host);
 }
 
@@ -90,7 +94,7 @@ void director_host_restarted(struct director_host *host)
 
 struct director_host *
 director_host_get(struct director *dir, const struct ip_addr *ip,
-		  unsigned int port)
+		  in_port_t port)
 {
 	struct director_host *host;
 
@@ -102,7 +106,7 @@ director_host_get(struct director *dir, const struct ip_addr *ip,
 
 struct director_host *
 director_host_lookup(struct director *dir, const struct ip_addr *ip,
-		     unsigned int port)
+		     in_port_t port)
 {
 	struct director_host *const *hostp;
 
@@ -150,23 +154,19 @@ int director_host_cmp_to_self(const struct director_host *b1,
 static void director_host_add_string(struct director *dir, const char *host)
 {
 	struct ip_addr *ips;
-	unsigned int i, port, ips_count;
-	const char *p;
+	in_port_t port;
+	unsigned int i, ips_count;
 
-	p = strrchr(host, ':');
-	if (p != NULL) {
-		if (str_to_uint(p + 1, &port) < 0 || port == 0 || port > 65535)
-			i_fatal("Invalid director port in %s", host);
-		host = t_strdup_until(host, p);
-	} else {
-		port = dir->self_port;
-	}
+	if (net_str2hostport(host, dir->self_port, &host, &port) < 0)
+		i_fatal("Invalid director host:port in '%s'", host);
 
 	if (net_gethostbyname(host, &ips, &ips_count) < 0)
 		i_fatal("Unknown director host: %s", host);
 
-	for (i = 0; i < ips_count; i++)
-		(void)director_host_add(dir, &ips[i], port);
+	for (i = 0; i < ips_count; i++) {
+		if (director_host_lookup(dir, &ips[i], port) == NULL)
+			(void)director_host_add(dir, &ips[i], port);
+	}
 }
 
 void director_host_add_from_string(struct director *dir, const char *hosts)

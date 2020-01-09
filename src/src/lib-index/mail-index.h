@@ -12,6 +12,10 @@
 
 #define MAIL_INDEX_HEADER_MIN_SIZE 120
 
+/* Log a warning when transaction log has been locked for this many seconds.
+   This lock is held also between mail_index_sync_begin()..commit(). */
+#define MAIL_TRANSACTION_LOG_LOCK_WARN_SECS 30
+
 enum mail_index_open_flags {
 	/* Create index if it doesn't exist */
 	MAIL_INDEX_OPEN_FLAG_CREATE		= 0x01,
@@ -30,7 +34,12 @@ enum mail_index_open_flags {
 	MAIL_INDEX_OPEN_FLAG_NEVER_IN_MEMORY	= 0x200,
 	/* We're only going to save new messages to the index.
 	   Avoid unnecessary reads. */
-	MAIL_INDEX_OPEN_FLAG_SAVEONLY		= 0x400
+	MAIL_INDEX_OPEN_FLAG_SAVEONLY		= 0x400,
+	/* Enable debug logging */
+	MAIL_INDEX_OPEN_FLAG_DEBUG		= 0x800,
+	/* MAIL_INDEX_MAIL_FLAG_DIRTY can be used as a backend-specific flag.
+	   All special handling of the flag is disabled by this. */
+	MAIL_INDEX_OPEN_FLAG_NO_DIRTY		= 0x1000,
 };
 
 enum mail_index_header_compat_flags {
@@ -40,13 +49,18 @@ enum mail_index_header_compat_flags {
 enum mail_index_header_flag {
 	/* Index file is corrupted, reopen or recreate it. */
 	MAIL_INDEX_HDR_FLAG_CORRUPTED		= 0x0001,
-	MAIL_INDEX_HDR_FLAG_HAVE_DIRTY		= 0x0002
+	MAIL_INDEX_HDR_FLAG_HAVE_DIRTY		= 0x0002,
+	/* Index has been fsck'd. The caller may want to resync the index
+	   to make sure it's valid and drop this flag. */
+	MAIL_INDEX_HDR_FLAG_FSCKD		= 0x0004,
 };
 
 enum mail_index_mail_flags {
 	/* For private use by backend. Replacing flags doesn't change this. */
 	MAIL_INDEX_MAIL_FLAG_BACKEND		= 0x40,
-	/* Message flags haven't been written to backend */
+	/* Message flags haven't been written to backend. If
+	   MAIL_INDEX_OPEN_FLAG_NO_DIRTY is set, this is treated as a
+	   backend-specific flag with no special internal handling. */
 	MAIL_INDEX_MAIL_FLAG_DIRTY		= 0x80,
 	/* Force updating this message's modseq via a flag update record */
 	MAIL_INDEX_MAIL_FLAG_UPDATE_MODSEQ	= 0x100
@@ -91,14 +105,19 @@ struct mail_index_header {
 	uint32_t log_file_tail_offset;
 	uint32_t log_file_head_offset;
 
-	uint64_t unused_old_sync_size;
-	uint32_t unused_old_sync_stamp;
+	uint32_t unused_old_sync_size_part1;
+	/* Timestamp of when .log was rotated into .log.2. This can be used to
+	   optimize checking when it's time to unlink it without stat()ing it.
+	   0 = unknown, -1 = .log.2 doesn't exists. */
+	uint32_t log2_rotate_time;
+	uint32_t last_temp_file_scan;
 
 	/* daily first UIDs that have been added to index. */
 	uint32_t day_stamp;
 	uint32_t day_first_uid[8];
 };
 
+#define MAIL_INDEX_RECORD_MIN_SIZE (sizeof(uint32_t) + sizeof(uint8_t))
 struct mail_index_record {
 	uint32_t uid;
 	uint8_t flags; /* enum mail_flags | enum mail_index_mail_flags */
@@ -159,7 +178,14 @@ enum mail_index_sync_flags {
 	MAIL_INDEX_SYNC_FLAG_FSYNC		= 0x10,
 	/* If we see "delete index" request transaction, finish it.
 	   This flag also allows committing more changes to a deleted index. */
-	MAIL_INDEX_SYNC_FLAG_DELETING_INDEX	= 0x20
+	MAIL_INDEX_SYNC_FLAG_DELETING_INDEX	= 0x20,
+	/* Same as MAIL_INDEX_SYNC_FLAG_DELETING_INDEX, but finish index
+	   deletion only once and fail the rest (= avoid race conditions when
+	   multiple processes try to mark the index deleted) */
+	MAIL_INDEX_SYNC_FLAG_TRY_DELETING_INDEX	= 0x40,
+	/* Update header's tail_offset to head_offset, even if it's the only
+	   thing we do and there's no strict need for it. */
+	MAIL_INDEX_SYNC_FLAG_UPDATE_TAIL_OFFSET	= 0x80
 };
 
 enum mail_index_view_sync_flags {
@@ -211,6 +237,50 @@ struct mail_index_transaction_commit_result {
 	unsigned int ignored_modseq_changes;
 };
 
+struct mail_index_base_optimization_settings {
+	/* Rewrite the index when the number of bytes that needs to be read
+	   from the .log on refresh is between these min/max values. */
+	uoff_t rewrite_min_log_bytes;
+	uoff_t rewrite_max_log_bytes;
+};
+
+struct mail_index_log_optimization_settings {
+	/* Rotate transaction log after it's a) min_size or larger and it was
+	   created at least min_age_secs or b) larger than max_size. */
+	uoff_t min_size;
+	uoff_t max_size;
+	unsigned int min_age_secs;
+
+	/* Delete .log.2 when it's older than log2_stale_secs. Don't be too
+	   eager, because older files are useful for QRESYNC and dsync. */
+	unsigned int log2_max_age_secs;
+};
+
+struct mail_index_cache_optimization_settings {
+	/* Drop fields that haven't been accessed for n seconds */
+	unsigned int unaccessed_field_drop_secs;
+	/* If cache record becomes larger than this, don't add it. */
+	unsigned int record_max_size;
+
+	/* Never compress the file if it's smaller than this */
+	uoff_t compress_min_size;
+	/* Compress the file when n% of records are deleted */
+	unsigned int compress_delete_percentage;
+	/* Compress the file when n% of rows contain continued rows.
+	   For example 200% means that the record has 2 continued rows, i.e.
+	   it exists in 3 separate segments in the cache file. */
+	unsigned int compress_continued_percentage;
+	/* Compress the file when we need to follow more than n next_offsets to
+	   find the latest cache header. */
+	unsigned int compress_header_continue_count;
+};
+
+struct mail_index_optimization_settings {
+	struct mail_index_base_optimization_settings index;
+	struct mail_index_log_optimization_settings log;
+	struct mail_index_cache_optimization_settings cache;
+};
+
 struct mail_index;
 struct mail_index_map;
 struct mail_index_view;
@@ -225,6 +295,10 @@ void mail_index_free(struct mail_index **index);
    can be used to specify which transaction types to fsync. */
 void mail_index_set_fsync_mode(struct mail_index *index, enum fsync_mode mode,
 			       enum mail_index_fsync_mask mask);
+/* Try to set the index's permissions based on its index directory. Returns
+   TRUE if successful (directory existed), FALSE if mail_index_set_permissions()
+   should be called. */
+bool mail_index_use_existing_permissions(struct mail_index *index);
 void mail_index_set_permissions(struct mail_index *index,
 				mode_t mode, gid_t gid, const char *gid_origin);
 /* Set locking method and maximum time to wait for a lock
@@ -232,6 +306,10 @@ void mail_index_set_permissions(struct mail_index *index,
 void mail_index_set_lock_method(struct mail_index *index,
 				enum file_lock_method lock_method,
 				unsigned int max_timeout_secs);
+/* Override the default optimization-related settings. Anything set to 0 will
+   use the default. */
+void mail_index_set_optimization_settings(struct mail_index *index,
+	const struct mail_index_optimization_settings *set);
 /* When creating a new index file or reseting an existing one, add the given
    extension header data immediately to it. */
 void mail_index_set_ext_init_data(struct mail_index *index, uint32_t ext_id,
@@ -295,6 +373,11 @@ void mail_index_transaction_reset(struct mail_index_transaction *t);
 void mail_index_transaction_set_max_modseq(struct mail_index_transaction *t,
 					   uint64_t max_modseq,
 					   ARRAY_TYPE(seq_range) *seqs);
+/* Returns the resulting highest-modseq after this commit. This can be called
+   only if transaction log is locked, which normally means only during mail
+   index syncing. If there are any appends, they all must have been assigned
+   UIDs before calling this. */
+uint64_t mail_index_transaction_get_highest_modseq(struct mail_index_transaction *t);
 
 /* Returns the view transaction was created for. */
 struct mail_index_view *
@@ -352,6 +435,8 @@ int mail_index_sync_begin_to(struct mail_index *index,
 /* Returns TRUE if it currently looks like syncing would return changes. */
 bool mail_index_sync_have_any(struct mail_index *index,
 			      enum mail_index_sync_flags flags);
+/* Returns TRUE if it currently looks like syncing would return expunges. */
+bool mail_index_sync_have_any_expunges(struct mail_index *index);
 /* Returns the log file seq+offsets for the area which this sync is handling. */
 void mail_index_sync_get_offsets(struct mail_index_sync_ctx *ctx,
 				 uint32_t *seq1_r, uoff_t *offset1_r,
@@ -369,6 +454,15 @@ void mail_index_sync_reset(struct mail_index_sync_ctx *ctx);
 /* Update result when refreshing index at the end of sync. */
 void mail_index_sync_set_commit_result(struct mail_index_sync_ctx *ctx,
 				       struct mail_index_transaction_commit_result *result);
+/* Don't log a warning even if syncing took over
+   MAIL_TRANSACTION_LOG_LOCK_WARN_SECS seconds. Usually this is called because
+   the caller itself already logged a warning about it. */
+void mail_index_sync_no_warning(struct mail_index_sync_ctx *ctx);
+/* If a warning is logged because syncing took over
+   MAIL_TRANSACTION_LOG_LOCK_WARN_SECS seconds, log this as the reason for the
+   syncing. */
+void mail_index_sync_set_reason(struct mail_index_sync_ctx *ctx,
+				const char *reason);
 /* Commit synchronization by writing all changes to mail index file. */
 int mail_index_sync_commit(struct mail_index_sync_ctx **ctx);
 /* Rollback synchronization - none of the changes listed by sync_next() are
@@ -456,6 +550,8 @@ void mail_index_expunge(struct mail_index_transaction *t, uint32_t seq);
 /* Like mail_index_expunge(), but also write message GUID to transaction log. */
 void mail_index_expunge_guid(struct mail_index_transaction *t, uint32_t seq,
 			     const guid_128_t guid_128);
+/* Revert all changes done in this transaction to the given existing mail. */
+void mail_index_revert_changes(struct mail_index_transaction *t, uint32_t seq);
 /* Update flags in index. */
 void mail_index_update_flags(struct mail_index_transaction *t, uint32_t seq,
 			     enum modify_type modify_type,
@@ -482,6 +578,9 @@ void mail_index_update_highest_modseq(struct mail_index_transaction *t,
 /* Reset the index before committing this transaction. This is usually done
    only when UIDVALIDITY changes. */
 void mail_index_reset(struct mail_index_transaction *t);
+/* Remove MAIL_INDEX_HDR_FLAG_FSCKD from header if it exists. This must be
+   called only during syncing so that the mailbox is locked. */
+void mail_index_unset_fscked(struct mail_index_transaction *t);
 /* Mark index deleted. No further changes will be possible after the
    transaction has been committed. */
 void mail_index_set_deleted(struct mail_index_transaction *t);
@@ -490,7 +589,8 @@ void mail_index_set_undeleted(struct mail_index_transaction *t);
 /* Returns TRUE if index has been set deleted. This gets set only after
    index has been opened/refreshed and the transaction has been seen. */
 bool mail_index_is_deleted(struct mail_index *index);
-/* Returns the last time mailbox was modified. */
+/* Returns the last time the index was modified. This can be called even if the
+   index isn't open. If the index doesn't exist, sets mtime to 0. */
 int mail_index_get_modification_time(struct mail_index *index, time_t *mtime_r);
 
 /* Lookup a keyword, returns TRUE if found, FALSE if not. */
@@ -547,6 +647,12 @@ uint32_t mail_index_ext_register(struct mail_index *index, const char *name,
 				 uint32_t default_hdr_size,
 				 uint16_t default_record_size,
 				 uint16_t default_record_align);
+/* Change an already registered extension's default sizes. */
+void mail_index_ext_register_resize_defaults(struct mail_index *index,
+					     uint32_t ext_id,
+					     uint32_t default_hdr_size,
+					     uint16_t default_record_size,
+					     uint16_t default_record_align);
 /* Returns TRUE and sets ext_id_r if extension with given name is registered. */
 bool mail_index_ext_lookup(struct mail_index *index, const char *name,
 			   uint32_t *ext_id_r);

@@ -20,6 +20,7 @@ struct passwd_file {
 	pool_t pool;
 	int refcount;
 
+	time_t last_sync_time;
 	char *path;
 	time_t stamp;
 	off_t size;
@@ -43,9 +44,10 @@ struct db_passwd_file {
 	unsigned int debug:1;
 };
 
-struct passwd_user *
-db_passwd_file_lookup(struct db_passwd_file *db, struct auth_request *request,
-		      const char *username_format);
+int db_passwd_file_lookup(struct db_passwd_file *db,
+			  struct auth_request *request,
+			  const char *username_format,
+			  struct passwd_user **user_r);
 
 struct db_passwd_file *
 db_passwd_file_init(const char *path, bool userdb, bool debug);

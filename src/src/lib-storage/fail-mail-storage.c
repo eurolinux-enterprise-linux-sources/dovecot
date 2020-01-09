@@ -1,11 +1,9 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "mail-storage-private.h"
 #include "fail-mail-storage.h"
-
-extern struct mail_storage fail_storage;
 
 static struct mail_storage *fail_storage_alloc(void)
 {
@@ -46,7 +44,8 @@ struct mail_storage fail_storage = {
 		fail_storage_get_list_settings,
 		NULL,
 		fail_mailbox_alloc,
-		NULL
+		NULL,
+		NULL,
 	}
 };
 

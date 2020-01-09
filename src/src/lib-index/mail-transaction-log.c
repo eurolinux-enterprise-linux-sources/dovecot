@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -39,30 +39,43 @@ mail_transaction_log_alloc(struct mail_index *index)
 static void mail_transaction_log_2_unlink_old(struct mail_transaction_log *log)
 {
 	struct stat st;
+	uint32_t log2_rotate_time = log->index->map->hdr.log2_rotate_time;
 
 	if (MAIL_INDEX_IS_IN_MEMORY(log->index))
 		return;
 
-	if (stat(log->filepath2, &st) < 0) {
-		if (errno != ENOENT && errno != ESTALE) {
+	if (log2_rotate_time == 0) {
+		if (nfs_safe_stat(log->filepath2, &st) == 0)
+			log2_rotate_time = st.st_mtime;
+		else if (errno == ENOENT)
+			log2_rotate_time = (uint32_t)-1;
+		else {
 			mail_index_set_error(log->index,
 				"stat(%s) failed: %m", log->filepath2);
+			return;
 		}
-		return;
 	}
 
-	if (st.st_mtime + MAIL_TRANSACTION_LOG2_STALE_SECS <= ioloop_time &&
+	if (log2_rotate_time != (uint32_t)-1 &&
+	    ioloop_time - (time_t)log2_rotate_time >= (time_t)log->index->optimization_set.log.log2_max_age_secs &&
 	    !log->index->readonly) {
-		if (unlink(log->filepath2) < 0 && errno != ENOENT) {
-			mail_index_set_error(log->index,
-				"unlink(%s) failed: %m", log->filepath2);
-		}
+		i_unlink_if_exists(log->filepath2);
+		log2_rotate_time = (uint32_t)-1;
+	}
+
+	if (log2_rotate_time != log->index->map->hdr.log2_rotate_time) {
+		/* Write this as part of the next sync's transaction. We're
+		   here because we're already opening a sync lock, so it'll
+		   always happen. It's also required especially with mdbox map
+		   index, which doesn't like changes done outside syncing. */
+		log->index->pending_log2_rotate_time = log2_rotate_time;
 	}
 }
 
 int mail_transaction_log_open(struct mail_transaction_log *log)
 {
 	struct mail_transaction_log_file *file;
+	const char *reason;
 	int ret;
 
 	i_free(log->filepath);
@@ -83,7 +96,7 @@ int mail_transaction_log_open(struct mail_transaction_log *log)
 		return 0;
 
 	file = mail_transaction_log_file_alloc(log, log->filepath);
-	if ((ret = mail_transaction_log_file_open(file)) <= 0) {
+	if ((ret = mail_transaction_log_file_open(file, &reason)) <= 0) {
 		/* leave the file for _create() */
 		log->open_file = file;
 		return ret;
@@ -210,23 +223,38 @@ void mail_transaction_logs_clean(struct mail_transaction_log *log)
 
 		mail_transaction_log_file_free(&file);
 	}
-	/* if we still have locked files with refcount=0, unlock them */
+	/* sanity check: we shouldn't have locked refcount=0 files */
 	for (; file != NULL; file = file->next) {
-		if (file->locked && file->refcount == 0)
-			mail_transaction_log_file_unlock(file);
+		i_assert(!file->locked || file->refcount > 0);
 	}
 	i_assert(log->head == NULL || log->files != NULL);
 }
 
-#define LOG_WANT_ROTATE(file) \
-	(((file)->sync_offset > MAIL_TRANSACTION_LOG_ROTATE_MIN_SIZE && \
-	  (time_t)(file)->hdr.create_stamp < \
-	   ioloop_time - MAIL_TRANSACTION_LOG_ROTATE_TIME) || \
-	 ((file)->sync_offset > MAIL_TRANSACTION_LOG_ROTATE_MAX_SIZE))
-
 bool mail_transaction_log_want_rotate(struct mail_transaction_log *log)
 {
-	return LOG_WANT_ROTATE(log->head);
+	struct mail_transaction_log_file *file = log->head;
+
+	if (file->need_rotate)
+		return TRUE;
+
+	if (file->hdr.major_version < MAIL_TRANSACTION_LOG_MAJOR_VERSION ||
+	    (file->hdr.major_version == MAIL_TRANSACTION_LOG_MAJOR_VERSION &&
+	     file->hdr.minor_version < MAIL_TRANSACTION_LOG_MINOR_VERSION)) {
+		/* upgrade immediately to a new log file format */
+		return TRUE;
+	}
+
+	if (file->sync_offset > log->index->optimization_set.log.max_size) {
+		/* file is too large, definitely rotate */
+		return TRUE;
+	}
+	if (file->sync_offset < log->index->optimization_set.log.min_size) {
+		/* file is still too small */
+		return FALSE;
+	}
+	/* rotate if the timestamp is old enough */
+	return file->hdr.create_stamp <
+		ioloop_time - log->index->optimization_set.log.min_age_secs;
 }
 
 int mail_transaction_log_rotate(struct mail_transaction_log *log, bool reset)
@@ -234,6 +262,7 @@ int mail_transaction_log_rotate(struct mail_transaction_log *log, bool reset)
 	struct mail_transaction_log_file *file;
 	const char *path = log->head->filepath;
 	struct stat st;
+	int ret;
 
 	i_assert(log->head->locked);
 
@@ -259,30 +288,46 @@ int mail_transaction_log_rotate(struct mail_transaction_log *log, bool reset)
 		file->last_mtime = st.st_mtime;
 		file->last_size = st.st_size;
 
-		if (mail_transaction_log_file_create(file, reset) < 0) {
+		if ((ret = mail_transaction_log_file_create(file, reset)) < 0) {
 			mail_transaction_log_file_free(&file);
 			return -1;
 		}
+		if (ret == 0) {
+			mail_index_set_error(log->index,
+				"Transaction log %s was recreated while we had it locked - "
+				"locking is broken (lock_method=%s)", path,
+				file_lock_method_to_str(log->index->lock_method));
+			mail_transaction_log_file_free(&file);
+			return -1;
+		}
+		i_assert(file->locked);
 	}
 
 	if (--log->head->refcount == 0)
 		mail_transaction_logs_clean(log);
-	else
-		mail_transaction_log_file_unlock(log->head);
+	else {
+		/* the newly created log file is already locked */
+		mail_transaction_log_file_unlock(log->head,
+			!log->index->log_sync_locked ? "rotating" :
+			"rotating while syncing");
+	}
 	mail_transaction_log_set_head(log, file);
 	return 0;
 }
 
 static int
-mail_transaction_log_refresh(struct mail_transaction_log *log, bool nfs_flush)
+mail_transaction_log_refresh(struct mail_transaction_log *log, bool nfs_flush,
+			     const char **reason_r)
 {
         struct mail_transaction_log_file *file;
 	struct stat st;
 
 	i_assert(log->head != NULL);
 
-	if (MAIL_TRANSACTION_LOG_FILE_IN_MEMORY(log->head))
+	if (MAIL_TRANSACTION_LOG_FILE_IN_MEMORY(log->head)) {
+		*reason_r = "Log is in memory";
 		return 0;
+	}
 
 	if (nfs_flush && log->nfs_flush)
 		nfs_flush_file_handle_cache(log->filepath);
@@ -291,25 +336,18 @@ mail_transaction_log_refresh(struct mail_transaction_log *log, bool nfs_flush)
 			mail_index_file_set_syscall_error(log->index,
 							  log->filepath,
 							  "stat()");
+			*reason_r = t_strdup_printf("stat(%s) failed: %m", log->filepath);
 			return -1;
 		}
-		/* see if the whole directory got deleted */
-		if (nfs_safe_stat(log->index->dir, &st) < 0 &&
-		    errno == ENOENT) {
-			log->index->index_deleted = TRUE;
-			return -1;
-		}
-
-		/* the file should always exist at this point. if it doesn't,
-		   someone deleted it manually while the index was open. try to
-		   handle this nicely by creating a new log file. */
-		file = log->head;
-		if (mail_transaction_log_create(log, FALSE) < 0)
-			return -1;
-		i_assert(file->refcount > 0);
-		file->refcount--;
-		log->index->need_recreate = TRUE;
-		return 0;
+		/* We shouldn't lose dovecot.index.log unless the mailbox was
+		   deleted or renamed. Just fail this and let the mailbox
+		   opening code figure out whether to create a new log file
+		   or not. Anything else can cause unwanted behavior (e.g.
+		   mailbox deletion not fully finishing due to .nfs* files and
+		   an IDLEing IMAP process creating the index back here). */
+		log->index->index_deleted = TRUE;
+		*reason_r = "Trasnaction log lost while it was open";
+		return -1;
 	} else if (log->head->st_ino == st.st_ino &&
 		   CMP_DEV_T(log->head->st_dev, st.st_dev)) {
 		/* NFS: log files get rotated to .log.2 files instead
@@ -317,11 +355,12 @@ mail_transaction_log_refresh(struct mail_transaction_log *log, bool nfs_flush)
 		   the existing file has already been unlinked here
 		   (in which case inodes could match but point to
 		   different files) */
+		*reason_r = "Log inode is unchanged";
 		return 0;
 	}
 
 	file = mail_transaction_log_file_alloc(log, log->filepath);
-	if (mail_transaction_log_file_open(file) <= 0) {
+	if (mail_transaction_log_file_open(file, reason_r) <= 0) {
 		mail_transaction_log_file_free(&file);
 		return -1;
 	}
@@ -331,6 +370,7 @@ mail_transaction_log_refresh(struct mail_transaction_log *log, bool nfs_flush)
 	if (--log->head->refcount == 0)
 		mail_transaction_logs_clean(log);
 	mail_transaction_log_set_head(log, file);
+	*reason_r = "Log reopened";
 	return 0;
 }
 
@@ -355,9 +395,11 @@ void mail_transaction_log_set_mailbox_sync_pos(struct mail_transaction_log *log,
 
 int mail_transaction_log_find_file(struct mail_transaction_log *log,
 				   uint32_t file_seq, bool nfs_flush,
-				   struct mail_transaction_log_file **file_r)
+				   struct mail_transaction_log_file **file_r,
+				   const char **reason_r)
 {
 	struct mail_transaction_log_file *file;
+	const char *reason;
 	int ret;
 
 	if (file_seq > log->head->hdr.file_seq) {
@@ -365,25 +407,32 @@ int mail_transaction_log_find_file(struct mail_transaction_log *log,
 		if (log->head->locked) {
 			/* transaction log is locked. there's no way a newer
 			   file exists. */
-			return 0;
-		}
-		if (log->index->open_count == 0) {
-			/* we're opening the index and we just opened the
-			   log file. don't waste time checking if there's a
-			   newer one. */
+			*reason_r = "Log is locked - newer log can't exist";
 			return 0;
 		}
 
-		if (mail_transaction_log_refresh(log, FALSE) < 0)
+		if (mail_transaction_log_refresh(log, FALSE, &reason) < 0) {
+			*reason_r = reason;
 			return -1;
+		}
 		if (file_seq > log->head->hdr.file_seq) {
-			if (!nfs_flush || !log->nfs_flush)
+			if (!nfs_flush || !log->nfs_flush) {
+				*reason_r = t_strdup_printf(
+					"Requested newer log than exists: %s", reason);
 				return 0;
+			}
 			/* try again, this time flush attribute cache */
-			if (mail_transaction_log_refresh(log, TRUE) < 0)
+			if (mail_transaction_log_refresh(log, TRUE, &reason) < 0) {
+				*reason_r = t_strdup_printf(
+					"Log refresh with NFS flush failed: %s", reason);
 				return -1;
-			if (file_seq > log->head->hdr.file_seq)
+			}
+			if (file_seq > log->head->hdr.file_seq) {
+				*reason_r = t_strdup_printf(
+					"Requested newer log than exists - "
+					"still after NFS flush: %s", reason);
 				return 0;
+			}
 		}
 	}
 
@@ -392,42 +441,45 @@ int mail_transaction_log_find_file(struct mail_transaction_log *log,
 			*file_r = file;
 			return 1;
 		}
+		if (file->hdr.file_seq > file_seq &&
+		    file->hdr.prev_file_seq == 0) {
+			/* Fail here mainly to avoid unnecessarily trying to
+			   open .log.2 that most likely doesn't even exist. */
+			*reason_r = "Log was reset after requested file_seq";
+			return 0;
+		}
 	}
 
-	if (MAIL_INDEX_IS_IN_MEMORY(log->index))
+	if (MAIL_INDEX_IS_IN_MEMORY(log->index)) {
+		*reason_r = "Logs are only in memory";
 		return 0;
+	}
 
 	/* see if we have it in log.2 file */
 	file = mail_transaction_log_file_alloc(log, log->filepath2);
-	if ((ret = mail_transaction_log_file_open(file)) <= 0) {
+	if ((ret = mail_transaction_log_file_open(file, reason_r)) <= 0) {
 		mail_transaction_log_file_free(&file);
 		return ret;
 	}
 
 	/* but is it what we expected? */
-	if (file->hdr.file_seq != file_seq)
+	if (file->hdr.file_seq != file_seq) {
+		*reason_r = t_strdup_printf(".log.2 contains file_seq=%u",
+					    file->hdr.file_seq);
 		return 0;
+	}
 
 	*file_r = file;
 	return 1;
 }
 
-int mail_transaction_log_lock_head(struct mail_transaction_log *log)
+int mail_transaction_log_lock_head(struct mail_transaction_log *log,
+				   const char *lock_reason)
 {
 	struct mail_transaction_log_file *file;
 	time_t lock_wait_started, lock_secs = 0;
+	const char *reason;
 	int ret = 0;
-
-	if (!log->log_2_unlink_checked) {
-		/* we need to check once in a while if .log.2 should be deleted
-		   to avoid wasting space on such old files. but we also don't
-		   want to waste time on checking it when the same mailbox
-		   gets opened over and over again rapidly (e.g. pop3). so
-		   do this only when there have actually been some changes
-		   to mailbox (i.e. when it's being locked here) */
-		log->log_2_unlink_checked = TRUE;
-		mail_transaction_log_2_unlink_old(log);
-	}
 
 	/* we want to get the head file locked. this is a bit racy,
 	   since by the time we have it locked a new log file may have been
@@ -444,8 +496,10 @@ int mail_transaction_log_lock_head(struct mail_transaction_log *log)
 			return -1;
 
 		file->refcount++;
-		ret = mail_transaction_log_refresh(log, TRUE);
+		ret = mail_transaction_log_refresh(log, TRUE, &reason);
 		if (--file->refcount == 0) {
+			mail_transaction_log_file_unlock(file, t_strdup_printf(
+				"trying to lock head for %s", lock_reason));
 			mail_transaction_logs_clean(log);
 			file = NULL;
 		}
@@ -457,17 +511,18 @@ int mail_transaction_log_lock_head(struct mail_transaction_log *log)
 			break;
 		}
 
-		if (file != NULL)
-			mail_transaction_log_file_unlock(file);
-
+		if (file != NULL) {
+			mail_transaction_log_file_unlock(file, t_strdup_printf(
+				"trying to lock head for %s", lock_reason));
+		}
 		if (ret < 0)
 			break;
 
 		/* try again */
 	}
 	if (lock_secs > MAIL_TRANSACTION_LOG_LOCK_WARN_SECS) {
-		i_warning("Locking transaction log file %s took %ld seconds",
-			  log->head->filepath, (long)lock_secs);
+		i_warning("Locking transaction log file %s took %ld seconds (%s)",
+			  log->head->filepath, (long)lock_secs, lock_reason);
 	}
 
 	i_assert(ret < 0 || log->head != NULL);
@@ -475,17 +530,36 @@ int mail_transaction_log_lock_head(struct mail_transaction_log *log)
 }
 
 int mail_transaction_log_sync_lock(struct mail_transaction_log *log,
+				   const char *lock_reason,
 				   uint32_t *file_seq_r, uoff_t *file_offset_r)
 {
+	const char *reason;
+
 	i_assert(!log->index->log_sync_locked);
 
-	if (mail_transaction_log_lock_head(log) < 0)
+	if (!log->log_2_unlink_checked) {
+		/* we need to check once in a while if .log.2 should be deleted
+		   to avoid wasting space on such old files. but we also don't
+		   want to waste time on checking it when the same mailbox
+		   gets opened over and over again rapidly (e.g. pop3). so
+		   do this only when there have actually been some changes
+		   to mailbox (i.e. when it's being locked here) */
+		log->log_2_unlink_checked = TRUE;
+		mail_transaction_log_2_unlink_old(log);
+	}
+
+	if (mail_transaction_log_lock_head(log, lock_reason) < 0)
 		return -1;
 
 	/* update sync_offset */
 	if (mail_transaction_log_file_map(log->head, log->head->sync_offset,
-					  (uoff_t)-1) <= 0) {
-		mail_transaction_log_file_unlock(log->head);
+					  (uoff_t)-1, &reason) <= 0) {
+		mail_index_set_error(log->index,
+			"Failed to map transaction log %s at "
+			"sync_offset=%"PRIuUOFF_T" after locking: %s",
+			log->head->filepath, log->head->sync_offset, reason);
+		mail_transaction_log_file_unlock(log->head, t_strdup_printf(
+			"%s - map failed", lock_reason));
 		return -1;
 	}
 
@@ -495,12 +569,13 @@ int mail_transaction_log_sync_lock(struct mail_transaction_log *log,
 	return 0;
 }
 
-void mail_transaction_log_sync_unlock(struct mail_transaction_log *log)
+void mail_transaction_log_sync_unlock(struct mail_transaction_log *log,
+				      const char *lock_reason)
 {
 	i_assert(log->index->log_sync_locked);
 
 	log->index->log_sync_locked = FALSE;
-	mail_transaction_log_file_unlock(log->head);
+	mail_transaction_log_file_unlock(log->head, lock_reason);
 }
 
 void mail_transaction_log_get_head(struct mail_transaction_log *log,
@@ -529,24 +604,6 @@ bool mail_transaction_log_is_head_prev(struct mail_transaction_log *log,
 		log->head->hdr.prev_file_offset == file_offset;
 }
 
-int mail_transaction_log_get_mtime(struct mail_transaction_log *log,
-				   time_t *mtime_r)
-{
-	struct stat st;
-
-	*mtime_r = 0;
-	if (stat(log->filepath, &st) < 0) {
-		if (errno == ENOENT)
-			return 0;
-
-		mail_index_file_set_syscall_error(log->index, log->filepath,
-						  "stat()");
-		return -1;
-	}
-	*mtime_r = st.st_mtime;
-	return 0;
-}
-
 int mail_transaction_log_unlink(struct mail_transaction_log *log)
 {
 	if (unlink(log->filepath) < 0 &&
@@ -563,7 +620,7 @@ void mail_transaction_log_get_dotlock_set(struct mail_transaction_log *log,
 {
 	struct mail_index *index = log->index;
 
-	memset(set_r, 0, sizeof(*set_r));
+	i_zero(set_r);
 	set_r->timeout = I_MIN(MAIL_TRANSACTION_LOG_LOCK_TIMEOUT,
 			       index->max_lock_timeout_secs);
 	set_r->stale_timeout = MAIL_TRANSACTION_LOG_LOCK_CHANGE_TIMEOUT;

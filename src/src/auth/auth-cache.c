@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "lib-signals.h"
@@ -271,7 +271,7 @@ static bool auth_cache_node_is_user(struct auth_cache_node *node,
 				    const char *username)
 {
 	const char *data = node->data;
-	unsigned int username_len;
+	size_t username_len;
 
 	/* The cache nodes begin with "P"/"U", passdb/userdb ID, optional
 	   "+" master user, "\t" and then usually followed by the username.
@@ -340,18 +340,13 @@ static const char *
 auth_request_expand_cache_key(const struct auth_request *request,
 			      const char *key)
 {
-	string_t *str;
-
 	/* Uniquely identify the request's passdb/userdb with the P/U prefix
 	   and by "%!", which expands to the passdb/userdb ID number. */
 	key = t_strconcat(request->userdb_lookup ? "U" : "P", "%!",
 			  request->master_user == NULL ? "" : "+%{master_user}",
 			  "\t", key, NULL);
 
-	str = t_str_new(256);
-	var_expand(str, key,
-		   auth_request_get_var_expand_table(request, auth_cache_escape));
-	return str_c(str);
+	return t_auth_request_var_expand(key, request, auth_cache_escape);
 }
 
 const char *
@@ -373,7 +368,6 @@ auth_cache_lookup(struct auth_cache *cache, const struct auth_request *request,
 		cache->miss_count++;
 		return NULL;
 	}
-	cache->hit_count++;
 
 	value = node->data + strlen(node->data) + 1;
 	ttl_secs = *value == '\0' ? cache->neg_ttl_secs : cache->ttl_secs;
@@ -381,6 +375,7 @@ auth_cache_lookup(struct auth_cache *cache, const struct auth_request *request,
 	now = time(NULL);
 	if (node->created < now - (time_t)ttl_secs) {
 		/* TTL expired */
+		cache->miss_count++;
 		*expired_r = TRUE;
 	} else {
 		/* move to head */
@@ -388,6 +383,7 @@ auth_cache_lookup(struct auth_cache *cache, const struct auth_request *request,
 			auth_cache_node_unlink(cache, node);
 			auth_cache_node_link_head(cache, node);
 		}
+		cache->hit_count++;
 	}
 	if (node->created < now - (time_t)cache->neg_ttl_secs)
 		*neg_expired_r = TRUE;

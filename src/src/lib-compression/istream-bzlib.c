@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 
@@ -86,8 +86,7 @@ static ssize_t i_stream_bzlib_read(struct istream_private *stream)
 			   have a seek mark. */
 			i_stream_compress(stream);
 		}
-		if (stream->max_buffer_size == 0 ||
-		    stream->buffer_size < stream->max_buffer_size)
+		if (stream->buffer_size < i_stream_get_max_buffer_size(&stream->istream))
 			i_stream_grow_buffer(stream, CHUNK_SIZE);
 
 		if (stream->pos == stream->buffer_size) {
@@ -227,6 +226,8 @@ i_stream_bzlib_seek(struct istream_private *stream, uoff_t v_offset, bool mark)
 		stream->pos = stream->skip;
 	} else {
 		/* read and cache forward */
+		ssize_t ret;
+
 		do {
 			size_t avail = stream->pos - stream->skip;
 
@@ -234,11 +235,13 @@ i_stream_bzlib_seek(struct istream_private *stream, uoff_t v_offset, bool mark)
 				i_stream_skip(&stream->istream,
 					      v_offset -
 					      stream->istream.v_offset);
+				ret = -1;
 				break;
 			}
 
 			i_stream_skip(&stream->istream, avail);
-		} while (i_stream_read(&stream->istream) >= 0);
+		} while ((ret = i_stream_read(&stream->istream)) > 0);
+		i_assert(ret == -1);
 
 		if (stream->istream.v_offset != v_offset) {
 			/* some failure, we've broken it */
@@ -266,8 +269,10 @@ i_stream_bzlib_stat(struct istream_private *stream, bool exact)
 	const struct stat *st;
 	size_t size;
 
-	if (i_stream_stat(stream->parent, exact, &st) < 0)
+	if (i_stream_stat(stream->parent, exact, &st) < 0) {
+		stream->istream.stream_errno = stream->parent->stream_errno;
 		return -1;
+	}
 	stream->statbuf = *st;
 
 	/* when exact=FALSE always return the parent stat's size, even if we
@@ -279,11 +284,13 @@ i_stream_bzlib_stat(struct istream_private *stream, bool exact)
 
 	if (zstream->stream_size == (uoff_t)-1) {
 		uoff_t old_offset = stream->istream.v_offset;
+		ssize_t ret;
 
 		do {
 			size = i_stream_get_data_size(&stream->istream);
 			i_stream_skip(&stream->istream, size);
-		} while (i_stream_read(&stream->istream) > 0);
+		} while ((ret = i_stream_read(&stream->istream)) > 0);
+		i_assert(ret == -1);
 
 		i_stream_seek(&stream->istream, old_offset);
 		if (zstream->stream_size == (uoff_t)-1)

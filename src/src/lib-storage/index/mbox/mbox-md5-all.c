@@ -1,11 +1,10 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "md5.h"
 #include "message-parser.h"
 #include "mbox-md5.h"
 
-#include <stdlib.h>
 
 struct mbox_md5_context {
 	struct md5_context hdr_md5_ctx;
@@ -27,7 +26,7 @@ static void mbox_md5_all_more(struct mbox_md5_context *ctx,
 }
 
 static void mbox_md5_all_finish(struct mbox_md5_context *ctx,
-				unsigned char result[16])
+				unsigned char result[STATIC_ARRAY 16])
 {
 	md5_final(&ctx->hdr_md5_ctx, result);
 	i_free(ctx);

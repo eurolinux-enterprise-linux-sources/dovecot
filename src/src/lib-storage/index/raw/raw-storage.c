@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -47,6 +47,8 @@ raw_storage_create_from_set(const struct setting_parser_info *set_info,
 
 	if (mail_storage_create(ns, "raw", 0, &error) < 0)
 		i_fatal("Couldn't create internal raw storage: %s", error);
+	if (mail_namespaces_init_finish(ns, &error) < 0)
+		i_fatal("Couldn't create internal raw namespace: %s", error);
 	return user;
 }
 
@@ -168,7 +170,7 @@ static int raw_mailbox_open(struct mailbox *box)
 		}
 		return -1;
 	}
-	box->input = i_stream_create_fd(fd, MAIL_READ_FULL_BLOCK_SIZE, TRUE);
+	box->input = i_stream_create_fd_autoclose(&fd, MAIL_READ_FULL_BLOCK_SIZE);
 	i_stream_set_name(box->input, path);
 	i_stream_set_init_buffer_size(box->input, MAIL_READ_FULL_BLOCK_SIZE);
 	return index_storage_mailbox_open(box, FALSE);
@@ -212,7 +214,8 @@ struct mail_storage raw_storage = {
 		raw_storage_get_list_settings,
 		NULL,
 		raw_mailbox_alloc,
-		NULL
+		NULL,
+		NULL,
 	}
 };
 

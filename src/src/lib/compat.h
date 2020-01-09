@@ -1,14 +1,24 @@
 #ifndef COMPAT_H
 #define COMPAT_H
 
-#if defined (HAVE_INTTYPES_H) && (defined(__osf__) || defined(_HPUX_SOURCE))
-#  include <inttypes.h>
-#endif
-
 /* well, this is obviously wrong since it assumes it's 64bit, but older
    GCCs don't define it and we really want it. */
 #ifndef LLONG_MAX
 #  define LLONG_MAX 9223372036854775807LL
+#endif
+
+#if ((__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 3)) && \
+	defined(HAVE_TYPEOF)) && !defined(__cplusplus)
+#  define HAVE_TYPE_CHECKS
+#endif
+
+/* We really want NULL to be a pointer, since we have various type-checks
+   that may result in compiler warnings/errors if it's not. Do this only when
+   type checking is used - it's not otherwise needed and causes compiling
+   problems with e.g. Sun C compiler. */
+#ifdef HAVE_TYPE_CHECKS
+#  undef NULL
+#  define NULL ((void *)0)
 #endif
 
 #ifndef __cplusplus
@@ -49,6 +59,11 @@ typedef unsigned long uint_fast32_t;
 
 #ifndef HAVE_SOCKLEN_T
 typedef int socklen_t;
+#endif
+
+/* WORDS_BIGENDIAN needs to be undefined if not enabled */
+#if defined(WORDS_BIGENDIAN) && WORDS_BIGENDIAN == 0
+#  undef WORDS_BIGENDIAN
 #endif
 
 #ifdef HAVE_SYS_SYSMACROS_H
@@ -184,15 +199,6 @@ int i_my_setegid(gid_t egid);
 char *i_my_basename(char *path);
 #endif
 
-#ifndef HAVE_STRTOULL
-#  define strtoull i_my_strtoull
-unsigned long long int i_my_strtoull(const char *nptr, char **endptr, int base);
-#endif
-#ifndef HAVE_STRTOLL
-#  define strtoll i_my_strtoll
-unsigned long long int i_my_strtoll(const char *nptr, char **endptr, int base);
-#endif
-
 #ifdef HAVE_OLD_VSNPRINTF
 #  include <stdio.h>
 #  define vsnprintf i_my_vsnprintf
@@ -231,8 +237,12 @@ int i_my_clock_gettime(int clk_id, struct timespec *tp);
 
 #ifdef EDQUOT
 #  define ENOSPACE(errno) ((errno) == ENOSPC || (errno) == EDQUOT)
+#  define ENOQUOTA(errno) ((errno) == EDQUOT)
 #else
+/* probably all modern OSes have EDQUOT, but just in case one doesn't assume
+   that ENOSPC is the same as "over quota". */
 #  define ENOSPACE(errno) ((errno) == ENOSPC)
+#  define ENOQUOTA(errno) ((errno) == ENOSPC)
 #endif
 
 /* EPERM is returned sometimes if device doesn't support such modification */
@@ -249,6 +259,11 @@ int i_my_clock_gettime(int clk_id, struct timespec *tp);
 
 #define ECANTLINK(errno) \
 	((errno) == EXDEV || (errno) == EMLINK || (errno) == EPERM)
+
+/* Returns TRUE if unlink() failed because it attempted to delete a directory */
+#define UNLINK_EISDIR(errno) \
+	((errno) == EPERM || /* POSIX */ \
+	 (errno) == EISDIR) /* Linux */
 
 /* EBUSY is given by some NFS implementations */
 #define EDESTDIREXISTS(errno) \

@@ -1,39 +1,42 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
 #include "array.h"
 #include "hash.h"
 #include "llist.h"
-#include "mail-user-hash.h"
 #include "mail-host.h"
-#include "user-directory.h"
 
 /* n% of timeout_secs */
 #define USER_NEAR_EXPIRING_PERCENTAGE 10
 /* but min/max. of this many secs */
 #define USER_NEAR_EXPIRING_MIN 3
 #define USER_NEAR_EXPIRING_MAX 30
+/* This shouldn't matter what it is exactly, just try it sometimes later. */
+#define USER_BEING_KILLED_EXPIRE_RETRY_SECS 60
 
 struct user_directory_iter {
 	struct user_directory *dir;
-	struct user *pos;
+	struct user *pos, *stop_after_tail;
 };
 
 struct user_directory {
 	/* unsigned int username_hash => user */
 	HASH_TABLE(void *, struct user *) hash;
-	/* sorted by time */
+	/* sorted by time. may be unsorted while handshakes are going on. */
 	struct user *head, *tail;
-	struct user *prev_insert_pos;
 
 	ARRAY(struct user_directory_iter *) iters;
+	user_free_hook_t *user_free_hook;
 
-	char *username_hash_fmt;
 	unsigned int timeout_secs;
 	/* If user's expire time is less than this many seconds away,
 	   don't assume that other directors haven't yet expired it */
 	unsigned int user_near_expiring_secs;
+	struct timeout *to_expire;
+	time_t to_expire_timestamp;
+
+	bool sort_pending;
 };
 
 static void user_move_iters(struct user_directory *dir, struct user *user)
@@ -43,10 +46,11 @@ static void user_move_iters(struct user_directory *dir, struct user *user)
 	array_foreach(&dir->iters, iterp) {
 		if ((*iterp)->pos == user)
 			(*iterp)->pos = user->next;
+		if ((*iterp)->stop_after_tail == user) {
+			(*iterp)->stop_after_tail =
+				user->prev != NULL ? user->prev : user->next;
+		}
 	}
-
-	if (dir->prev_insert_pos == user)
-		dir->prev_insert_pos = user->next;
 }
 
 static void user_free(struct user_directory *dir, struct user *user)
@@ -54,6 +58,8 @@ static void user_free(struct user_directory *dir, struct user *user)
 	i_assert(user->host->user_count > 0);
 	user->host->user_count--;
 
+	if (dir->user_free_hook != NULL)
+		dir->user_free_hook(user);
 	user_move_iters(dir, user);
 
 	hash_table_remove(dir->hash, POINTER_CAST(user->username_hash));
@@ -62,21 +68,29 @@ static void user_free(struct user_directory *dir, struct user *user)
 }
 
 static bool user_directory_user_has_connections(struct user_directory *dir,
-						struct user *user)
+						struct user *user,
+						time_t *expire_timestamp_r)
 {
 	time_t expire_timestamp = user->timestamp + dir->timeout_secs;
 
-	if (expire_timestamp > ioloop_time)
+	if (expire_timestamp > ioloop_time) {
+		*expire_timestamp_r = expire_timestamp;
 		return TRUE;
+	}
 
-	if (user->kill_state != USER_KILL_STATE_NONE) {
+	if (USER_IS_BEING_KILLED(user)) {
 		/* don't free this user until the kill is finished */
+		*expire_timestamp_r = ioloop_time +
+			USER_BEING_KILLED_EXPIRE_RETRY_SECS;
 		return TRUE;
 	}
 
 	if (user->weak) {
-		if (expire_timestamp + USER_NEAR_EXPIRING_MAX >= ioloop_time)
+		if (expire_timestamp + USER_NEAR_EXPIRING_MAX > ioloop_time) {
+			*expire_timestamp_r = expire_timestamp +
+				USER_NEAR_EXPIRING_MAX;
 			return TRUE;
+		}
 
 		i_warning("User %u weakness appears to be stuck, removing it",
 			  user->username_hash);
@@ -86,65 +100,45 @@ static bool user_directory_user_has_connections(struct user_directory *dir,
 
 static void user_directory_drop_expired(struct user_directory *dir)
 {
+	time_t expire_timestamp = 0;
+
 	while (dir->head != NULL &&
-	       !user_directory_user_has_connections(dir, dir->head))
+	       !user_directory_user_has_connections(dir, dir->head, &expire_timestamp)) {
 		user_free(dir, dir->head);
+		expire_timestamp = 0;
+	}
+	i_assert(expire_timestamp > ioloop_time || expire_timestamp == 0);
+
+	if (expire_timestamp != dir->to_expire_timestamp) {
+		if (dir->to_expire != NULL)
+			timeout_remove(&dir->to_expire);
+		if (expire_timestamp != 0) {
+			struct timeval tv = { .tv_sec = expire_timestamp };
+			dir->to_expire_timestamp = tv.tv_sec;
+			dir->to_expire = timeout_add_absolute(&tv,
+				user_directory_drop_expired, dir);
+		}
+	}
+}
+
+unsigned int user_directory_count(struct user_directory *dir)
+{
+	return hash_table_count(dir->hash);
 }
 
 struct user *user_directory_lookup(struct user_directory *dir,
 				   unsigned int username_hash)
 {
 	struct user *user;
+	time_t expire_timestamp;
 
 	user_directory_drop_expired(dir);
 	user = hash_table_lookup(dir->hash, POINTER_CAST(username_hash));
-	if (user != NULL && !user_directory_user_has_connections(dir, user)) {
+	if (user != NULL && !user_directory_user_has_connections(dir, user, &expire_timestamp)) {
 		user_free(dir, user);
 		user = NULL;
 	}
 	return user;
-}
-
-static void
-user_directory_insert_backwards(struct user_directory *dir,
-				struct user *pos, struct user *user)
-{
-	for (; pos != NULL; pos = pos->prev) {
-		if (pos->timestamp <= user->timestamp)
-			break;
-	}
-	if (pos == NULL)
-		DLLIST2_PREPEND(&dir->head, &dir->tail, user);
-	else {
-		user->prev = pos;
-		user->next = pos->next;
-		user->prev->next = user;
-		if (user->next != NULL)
-			user->next->prev = user;
-		else
-			dir->tail = user;
-	}
-}
-
-static void
-user_directory_insert_forwards(struct user_directory *dir,
-			       struct user *pos, struct user *user)
-{
-	for (; pos != NULL; pos = pos->next) {
-		if (pos->timestamp >= user->timestamp)
-			break;
-	}
-	if (pos == NULL)
-		DLLIST2_APPEND(&dir->head, &dir->tail, user);
-	else {
-		user->prev = pos->prev;
-		user->next = pos;
-		if (user->prev != NULL)
-			user->prev->next = user;
-		else
-			dir->head = user;
-		user->next->prev = user;
-	}
 }
 
 struct user *
@@ -162,28 +156,13 @@ user_directory_add(struct user_directory *dir, unsigned int username_hash,
 	user->host = host;
 	user->host->user_count++;
 	user->timestamp = timestamp;
+	DLLIST2_APPEND(&dir->head, &dir->tail, user);
 
-	if (dir->tail == NULL || (time_t)dir->tail->timestamp <= timestamp)
-		DLLIST2_APPEND(&dir->head, &dir->tail, user);
-	else {
-		/* need to insert to correct position. we should get here
-		   only when handshaking. the handshaking USER requests should
-		   come sorted by timestamp. so keep track of the previous
-		   insert position, the next USER should be inserted after
-		   it. */
-		if (dir->prev_insert_pos == NULL) {
-			/* find the position starting from tail */
-			user_directory_insert_backwards(dir, dir->tail, user);
-		} else if (timestamp < (time_t)dir->prev_insert_pos->timestamp) {
-			user_directory_insert_backwards(dir, dir->prev_insert_pos,
-							user);
-		} else {
-			user_directory_insert_forwards(dir, dir->prev_insert_pos,
-						       user);
-		}
+	if (dir->to_expire == NULL) {
+		struct timeval tv = { .tv_sec = ioloop_time + dir->timeout_secs };
+		dir->to_expire_timestamp = tv.tv_sec;
+		dir->to_expire = timeout_add_absolute(&tv, user_directory_drop_expired, dir);
 	}
-
-	dir->prev_insert_pos = user;
 	hash_table_insert(dir->hash, POINTER_CAST(user->username_hash), user);
 	return user;
 }
@@ -226,8 +205,18 @@ void user_directory_sort(struct user_directory *dir)
 	struct user *user, *const *userp;
 	unsigned int i, users_count = hash_table_count(dir->hash);
 
+	dir->sort_pending = FALSE;
+
 	if (users_count == 0) {
 		i_assert(dir->head == NULL);
+		return;
+	}
+
+	if (array_count(&dir->iters) > 0) {
+		/* We can't sort the directory while there are iterators
+		   or they'll skip users. Do the sort after there are no more
+		   iterators. */
+		dir->sort_pending = TRUE;
 		return;
 	}
 
@@ -248,12 +237,6 @@ void user_directory_sort(struct user_directory *dir)
 	array_free(&users);
 }
 
-unsigned int user_directory_get_username_hash(struct user_directory *dir,
-					      const char *username)
-{
-	return mail_user_hash(username, dir->username_hash_fmt);
-}
-
 bool user_directory_user_is_recently_updated(struct user_directory *dir,
 					     struct user *user)
 {
@@ -271,7 +254,8 @@ bool user_directory_user_is_near_expiring(struct user_directory *dir,
 }
 
 struct user_directory *
-user_directory_init(unsigned int timeout_secs, const char *username_hash_fmt)
+user_directory_init(unsigned int timeout_secs,
+		    user_free_hook_t *user_free_hook)
 {
 	struct user_directory *dir;
 
@@ -287,7 +271,7 @@ user_directory_init(unsigned int timeout_secs, const char *username_hash_fmt)
 		I_MAX(dir->user_near_expiring_secs, USER_NEAR_EXPIRING_MIN);
 	i_assert(dir->timeout_secs/2 > dir->user_near_expiring_secs);
 
-	dir->username_hash_fmt = i_strdup(username_hash_fmt);
+	dir->user_free_hook = user_free_hook;
 	hash_table_create_direct(&dir->hash, default_pool, 0);
 	i_array_init(&dir->iters, 8);
 	return dir;
@@ -303,20 +287,23 @@ void user_directory_deinit(struct user_directory **_dir)
 
 	while (dir->head != NULL)
 		user_free(dir, dir->head);
+	if (dir->to_expire != NULL)
+		timeout_remove(&dir->to_expire);
 	hash_table_destroy(&dir->hash);
 	array_free(&dir->iters);
-	i_free(dir->username_hash_fmt);
 	i_free(dir);
 }
 
 struct user_directory_iter *
-user_directory_iter_init(struct user_directory *dir)
+user_directory_iter_init(struct user_directory *dir,
+			 bool iter_until_current_tail)
 {
 	struct user_directory_iter *iter;
 
 	iter = i_new(struct user_directory_iter, 1);
 	iter->dir = dir;
 	iter->pos = dir->head;
+	iter->stop_after_tail = iter_until_current_tail ? dir->tail : NULL;
 	array_append(&dir->iters, &iter, 1);
 	user_directory_drop_expired(dir);
 	return iter;
@@ -328,9 +315,13 @@ struct user *user_directory_iter_next(struct user_directory_iter *iter)
 
 	user = iter->pos;
 	if (user == NULL)
-		return FALSE;
+		return NULL;
 
 	iter->pos = user->next;
+	if (user == iter->stop_after_tail) {
+		/* this is the last user we want to iterate */
+		iter->pos = NULL;
+	}
 	return user;
 }
 
@@ -349,5 +340,7 @@ void user_directory_iter_deinit(struct user_directory_iter **_iter)
 			break;
 		}
 	}
+	if (array_count(&iter->dir->iters) == 0 && iter->dir->sort_pending)
+		user_directory_sort(iter->dir);
 	i_free(iter);
 }

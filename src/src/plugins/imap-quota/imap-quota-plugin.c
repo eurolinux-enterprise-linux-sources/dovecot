@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "str.h"
@@ -10,7 +10,6 @@
 #include "quota-plugin.h"
 #include "imap-quota-plugin.h"
 
-#include <stdlib.h>
 
 #define QUOTA_USER_SEPARATOR ':'
 
@@ -32,13 +31,14 @@ imap_quota_root_get_name(struct mail_user *user, struct mail_user *owner,
 			       QUOTA_USER_SEPARATOR, name);
 }
 
-static void
+static int
 quota_reply_write(string_t *str, struct mail_user *user,
 		  struct mail_user *owner, struct quota_root *root)
 {
         const char *name, *const *list;
 	unsigned int i;
 	uint64_t value, limit;
+	size_t prefix_len, orig_len = str_len(str);
 	int ret = 0;
 
 	str_append(str, "* QUOTA ");
@@ -46,6 +46,7 @@ quota_reply_write(string_t *str, struct mail_user *user,
 	imap_append_astring(str, name);
 
 	str_append(str, " (");
+	prefix_len = str_len(str);
 	list = quota_root_get_resources(root);
 	for (i = 0; *list != NULL; list++) {
 		ret = quota_get_resource(root, "", *list, &value, &limit);
@@ -60,10 +61,13 @@ quota_reply_write(string_t *str, struct mail_user *user,
 			i++;
 		}
 	}
+	if (ret <= 0 && str_len(str) == prefix_len) {
+		/* this quota root doesn't have any quota actually enabled. */
+		str_truncate(str, orig_len);
+		return ret;
+	}
 	str_append(str, ")\r\n");
-
-	if (ret < 0)
-		str_append(str, "* BAD Internal quota calculation error\r\n");
+	return 1;
 }
 
 static bool cmd_getquotaroot(struct client_command_context *cmd)
@@ -76,6 +80,7 @@ static bool cmd_getquotaroot(struct client_command_context *cmd)
         struct quota_root *root;
 	const char *mailbox, *orig_mailbox, *name;
 	string_t *quotaroot_reply, *quota_reply;
+	int ret;
 
 	/* <mailbox> */
 	if (!client_read_string_args(cmd, 1, &mailbox))
@@ -103,19 +108,25 @@ static bool cmd_getquotaroot(struct client_command_context *cmd)
 	str_append(quotaroot_reply, "* QUOTAROOT ");
 	imap_append_astring(quotaroot_reply, orig_mailbox);
 
+	ret = 0;
 	iter = quota_root_iter_init(box);
 	while ((root = quota_root_iter_next(iter)) != NULL) {
+		if (quota_root_is_hidden(root))
+			continue;
 		str_append_c(quotaroot_reply, ' ');
 		name = imap_quota_root_get_name(client->user, ns->owner, root);
 		imap_append_astring(quotaroot_reply, name);
 
-		quota_reply_write(quota_reply, client->user, ns->owner, root);
+		if (quota_reply_write(quota_reply, client->user, ns->owner, root) < 0)
+			ret = -1;
 	}
 	quota_root_iter_deinit(&iter);
 	mailbox_free(&box);
 
 	/* send replies */
-	if (str_len(quota_reply) == 0)
+	if (ret < 0)
+		client_send_tagline(cmd, "NO Internal quota calculation error.");
+	else if (str_len(quota_reply) == 0)
 		client_send_tagline(cmd, "OK No quota.");
 	else {
 		client_send_line(client, str_c(quotaroot_reply));
@@ -164,11 +175,13 @@ static bool cmd_getquota(struct client_command_context *cmd)
 	}
 
 	quota_reply = t_str_new(128);
-	quota_reply_write(quota_reply, cmd->client->user, owner, root);
-	o_stream_nsend(cmd->client->output, str_data(quota_reply),
-		       str_len(quota_reply));
-
-	client_send_tagline(cmd, "OK Getquota completed.");
+	if (quota_reply_write(quota_reply, cmd->client->user, owner, root) < 0)
+		client_send_tagline(cmd, "NO Internal quota calculation error.");
+	else {
+		o_stream_nsend(cmd->client->output, str_data(quota_reply),
+			       str_len(quota_reply));
+		client_send_tagline(cmd, "OK Getquota completed.");
+	}
 	return TRUE;
 }
 
@@ -221,7 +234,7 @@ static bool cmd_setquota(struct client_command_context *cmd)
 static void imap_quota_client_created(struct client **client)
 {
 	if (mail_user_is_plugin_loaded((*client)->user, imap_quota_module))
-		str_append((*client)->capability_string, " QUOTA");
+		client_add_capability(*client, "QUOTA");
 
 	if (next_hook_client_created != NULL)
 		next_hook_client_created(client);

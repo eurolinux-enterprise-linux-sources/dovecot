@@ -62,7 +62,7 @@ void *ucs2be_str(pool_t pool, const char *str, size_t *size);
  * Compute client -> server authentication response.
  */
 static void rpa_user_response(struct rpa_auth_request *request,
-			      unsigned char digest[MD5_RESULTLEN])
+			      unsigned char digest[STATIC_ARRAY MD5_RESULTLEN])
 {
 	struct md5_context ctx;
 	unsigned char z[48];
@@ -86,7 +86,7 @@ static void rpa_user_response(struct rpa_auth_request *request,
  * Compute server -> client authentication response.
  */
 static void rpa_server_response(struct rpa_auth_request *request,
-				unsigned char digest[MD5_RESULTLEN])
+				unsigned char digest[STATIC_ARRAY MD5_RESULTLEN])
 {
 	struct md5_context ctx;
 	unsigned char tmp[MD5_RESULTLEN];
@@ -424,14 +424,14 @@ static bool verify_credentials(struct rpa_auth_request *request,
 	unsigned char response[MD5_RESULTLEN];
 
 	if (size != sizeof(request->pwd_md5)) {
-                auth_request_log_error(&request->auth_request, "rpa",
+                auth_request_log_error(&request->auth_request, AUTH_SUBSYS_MECH,
 				       "invalid credentials length");
 		return FALSE;
 	}
 
 	memcpy(request->pwd_md5, credentials, sizeof(request->pwd_md5));
 	rpa_user_response(request, response);
-	return memcmp(response, request->user_response, sizeof(response)) == 0;
+	return mem_equals_timing_safe(response, request->user_response, sizeof(response));
 }
 
 static void
@@ -476,7 +476,7 @@ mech_rpa_auth_phase1(struct auth_request *auth_request,
 	const char *service, *error;
 
 	if (!rpa_parse_token1(data, data_size, &error)) {
-		auth_request_log_info(auth_request, "rpa",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
 			"invalid token 1: %s", error);
 		auth_request_fail(auth_request);
 		return;
@@ -502,7 +502,7 @@ mech_rpa_auth_phase2(struct auth_request *auth_request,
 	const char *error;
 
 	if (!rpa_parse_token3(request, data, data_size, &error)) {
-		auth_request_log_info(auth_request, "rpa",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
 			"invalid token 3: %s", error);
 		auth_request_fail(auth_request);
 		return;
@@ -520,7 +520,7 @@ mech_rpa_auth_phase3(struct auth_request *auth_request,
 
 	if ((data_size != sizeof(client_ack)) ||
 	    (memcmp(data, client_ack, sizeof(client_ack)) != 0)) {
-		auth_request_log_info(auth_request, "rpa",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
 			"invalid token 5 or client rejects us");
 		auth_request_fail(auth_request);
 	} else {
@@ -557,8 +557,7 @@ mech_rpa_auth_free(struct auth_request *auth_request)
 	struct rpa_auth_request *request =
 		(struct rpa_auth_request *)auth_request;
 
-	if (request->pwd_md5 != NULL)
-		safe_memset(request->pwd_md5, 0, sizeof(request->pwd_md5));
+	safe_memset(request->pwd_md5, 0, sizeof(request->pwd_md5));
 
 	pool_unref(&auth_request->pool);
 }
@@ -568,7 +567,7 @@ static struct auth_request *mech_rpa_auth_new(void)
 	struct rpa_auth_request *request;
 	pool_t pool;
 
-	pool = pool_alloconly_create("rpa_auth_request", 1024);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"rpa_auth_request", 2048);
 	request = p_new(pool, struct rpa_auth_request, 1);
 	request->pool = pool;
 	request->phase = 0;

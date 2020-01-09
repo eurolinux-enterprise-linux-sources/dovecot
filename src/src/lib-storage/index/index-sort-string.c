@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 /* The idea is that we use 32bit integers for string sort IDs which specifiy
    the sort order for primary sort condition. The whole 32bit integer space is
@@ -14,7 +14,6 @@
 #include "index-storage.h"
 #include "index-sort-private.h"
 
-#include <stdlib.h>
 
 struct mail_sort_node {
 	uint32_t seq:29;
@@ -43,12 +42,13 @@ struct sort_string_context {
 	unsigned int reverse:1;
 	unsigned int seqs_nonsorted:1;
 	unsigned int broken:1;
+	unsigned int failed:1;
 };
 
-static char expunged_msg;
 static struct sort_string_context *static_zero_cmp_context;
 
-static void index_sort_list_reset_broken(struct sort_string_context *ctx);
+static void index_sort_list_reset_broken(struct sort_string_context *ctx,
+					 const char *reason);
 static void index_sort_node_add(struct sort_string_context *ctx,
 				struct mail_sort_node *node);
 
@@ -145,7 +145,7 @@ static void index_sort_reget_sort_ids(struct sort_string_context *ctx)
 	array_clear(&ctx->zero_nodes);
 	array_clear(&ctx->nonzero_nodes);
 
-	memset(&node, 0, sizeof(node));
+	i_zero(&node);
 	node.wanted = TRUE;
 	seqs = array_get(&ctx->program->seqs, &count);
 	for (i = 0; i < count; i++) {
@@ -184,7 +184,16 @@ static void index_sort_node_add(struct sort_string_context *ctx,
 				ctx->lowest_nonexpunged_zero = node->seq;
 		} else if (ctx->lowest_nonexpunged_zero != 0 &&
 			   ctx->lowest_nonexpunged_zero <= node->seq) {
-			index_sort_list_reset_broken(ctx);
+			uint32_t nonzero_uid, zero_uid;
+
+			mail_index_lookup_uid(ctx->program->t->view,
+					      node->seq, &nonzero_uid);
+			mail_index_lookup_uid(ctx->program->t->view,
+				ctx->lowest_nonexpunged_zero, &zero_uid);
+			index_sort_list_reset_broken(ctx, t_strdup_printf(
+				"sort_id=0 found in the middle "
+				"(uid=%u has sort_id, uid=%u doesn't)",
+				nonzero_uid, zero_uid));
 			ctx->broken = TRUE;
 			node->sort_id = 0;
 		}
@@ -227,7 +236,7 @@ void index_sort_list_add_string(struct mail_search_sort_program *program,
 	struct sort_string_context *ctx = program->context;
 	struct mail_sort_node node;
 
-	memset(&node, 0, sizeof(node));
+	i_zero(&node);
 	node.seq = mail->seq;
 	node.wanted = TRUE;
 
@@ -248,14 +257,13 @@ static int sort_node_zero_string_cmp(const struct mail_sort_node *n1,
 	if (ret != 0)
 		return !ctx->reverse ? ret : -ret;
 
-	return index_sort_node_cmp_type(ctx->program->temp_mail,
+	return index_sort_node_cmp_type(ctx->program,
 					ctx->program->sort_program + 1,
 					n1->seq, n2->seq);
 }
 
 static void index_sort_zeroes(struct sort_string_context *ctx)
 {
-	struct mail *mail = ctx->program->temp_mail;
 	enum mail_sort_type sort_type = ctx->program->sort_program[0];
 	string_t *str;
 	pool_t pool;
@@ -274,8 +282,11 @@ static void index_sort_zeroes(struct sort_string_context *ctx)
 		i_assert(nodes[i].seq <= ctx->last_seq);
 
 		T_BEGIN {
-			(void)index_sort_header_get(mail, nodes[i].seq,
-						    sort_type, str);
+			if (index_sort_header_get(ctx->program, nodes[i].seq,
+						  sort_type, str) < 0) {
+				nodes[i].no_update = TRUE;
+				ctx->failed = TRUE;
+			}
 			ctx->sort_strings[nodes[i].seq] =
 				str_len(str) == 0 ? "" :
 				p_strdup(pool, str_c(str));
@@ -288,11 +299,10 @@ static void index_sort_zeroes(struct sort_string_context *ctx)
 	array_sort(&ctx->zero_nodes, sort_node_zero_string_cmp);
 }
 
-static const char *
+static bool
 index_sort_get_expunged_string(struct sort_string_context *ctx, uint32_t idx,
-			       string_t *str)
+			       string_t *str, const char **result_r)
 {
-	struct mail *mail = ctx->program->temp_mail;
 	enum mail_sort_type sort_type = ctx->program->sort_program[0];
 	const struct mail_sort_node *nodes;
 	const char *result = NULL;
@@ -308,8 +318,10 @@ index_sort_get_expunged_string(struct sort_string_context *ctx, uint32_t idx,
 	   trust it. If it's expunged, we already verified that there are no
 	   non-expunged messages. */
 	if (idx > 0 && nodes[idx-1].sort_id == sort_id &&
-	    ctx->sort_strings[nodes[idx].seq] != NULL)
-		return ctx->sort_strings[nodes[idx].seq];
+	    ctx->sort_strings[nodes[idx].seq] != NULL) {
+		*result_r = ctx->sort_strings[nodes[idx].seq];
+		return TRUE;
+	}
 
 	/* Go forwards as long as there are identical sort IDs. If we find one
 	   that's not expunged, update string table for all messages with
@@ -325,8 +337,8 @@ index_sort_get_expunged_string(struct sort_string_context *ctx, uint32_t idx,
 			result = ctx->sort_strings[nodes[i].seq];
 			break;
 		}
-		if (index_sort_header_get(mail, nodes[i].seq,
-					  sort_type, str) >= 0) {
+		if (index_sort_header_get(ctx->program, nodes[i].seq,
+					  sort_type, str) > 0) {
 			result = str_len(str) == 0 ? "" :
 				p_strdup(ctx->sort_string_pool, str_c(str));
 			break;
@@ -334,41 +346,58 @@ index_sort_get_expunged_string(struct sort_string_context *ctx, uint32_t idx,
 	}
 	if (result == NULL) {
 		/* unknown */
-		return &expunged_msg;
+		return FALSE;
 	}
 
 	/* fill all identical sort_ids with the same value */
 	for (i = idx; i > 0 && nodes[i-1].sort_id == sort_id; i--) ;
 	for (i = idx; i < count && nodes[i].sort_id == sort_id; i++)
 		ctx->sort_strings[nodes[i].seq] = result;
-	return result;
+	*result_r = result;
+	return TRUE;
 }
 
-static const char *
+static bool
 index_sort_get_string(struct sort_string_context *ctx,
-		      uint32_t idx, uint32_t seq)
+		      uint32_t idx, struct mail_sort_node *node,
+		      const char **str_r)
 {
-	struct mail *mail = ctx->program->temp_mail;
-	int ret;
+	uint32_t seq = node->seq;
+	int ret = 1;
+
+	if (node->no_update) {
+		/* we've already determined that we can't do this lookup */
+		*str_r = ctx->sort_strings[seq];
+		return FALSE;
+	}
 
 	if (ctx->sort_strings[seq] == NULL) T_BEGIN {
 		string_t *str;
+		const char *result;
 
 		str = t_str_new(256);
-		ret = index_sort_header_get(mail, seq,
+		ret = index_sort_header_get(ctx->program, seq,
 					    ctx->program->sort_program[0], str);
-		if (str_len(str) > 0) {
-			ctx->sort_strings[seq] =
-				p_strdup(ctx->sort_string_pool, str_c(str));
-		} else if (ret >= 0) {
-			ctx->sort_strings[seq] = "";
+		if (ret < 0)
+			ctx->failed = TRUE;
+		else if (ret == 0) {
+			if (!index_sort_get_expunged_string(ctx, idx, str, &result))
+				ctx->sort_strings[seq] = "";
+			else {
+				/* found the expunged string - return success */
+				ctx->sort_strings[seq] = result;
+				ret = 1;
+			}
 		} else {
-			ctx->sort_strings[seq] = 
-				index_sort_get_expunged_string(ctx, idx, str);
+			ctx->sort_strings[seq] = str_len(str) == 0 ? "" :
+				p_strdup(ctx->sort_string_pool, str_c(str));
 		}
 	} T_END;
 
-	return ctx->sort_strings[seq];
+	if (ret <= 0)
+		node->no_update = TRUE;
+	*str_r = ctx->sort_strings[seq];
+	return ret > 0;
 }
 
 static void
@@ -376,7 +405,7 @@ index_sort_bsearch(struct sort_string_context *ctx, const char *key,
 		   unsigned int start_idx, unsigned int *idx_r,
 		   const char **prev_str_r)
 {
-	const struct mail_sort_node *nodes;
+	struct mail_sort_node *nodes;
 	const char *str, *str2;
 	unsigned int idx, left_idx, right_idx, prev;
 	int ret;
@@ -386,17 +415,16 @@ index_sort_bsearch(struct sort_string_context *ctx, const char *key,
 	idx = left_idx = start_idx;
 	while (left_idx < right_idx) {
 		idx = (left_idx + right_idx) / 2;
-		str = index_sort_get_string(ctx, idx, nodes[idx].seq);
-		if (str != &expunged_msg)
+		if (index_sort_get_string(ctx, idx, &nodes[idx], &str))
 			ret = strcmp(key, str);
 		else {
-			/* put expunged messages first */
+			/* put expunged (and otherwise failed) messages first */
 			ret = 1;
 			for (prev = idx; prev > 0; ) {
 				prev--;
-				str2 = index_sort_get_string(ctx, prev,
-							     nodes[prev].seq);
-				if (str2 != &expunged_msg) {
+				if (index_sort_get_string(ctx, prev,
+							  &nodes[prev],
+							  &str2)) {
 					ret = strcmp(key, str2);
 					if (ret <= 0) {
 						idx = prev;
@@ -422,12 +450,14 @@ index_sort_bsearch(struct sort_string_context *ctx, const char *key,
 
 	*idx_r = idx;
 	if (idx > start_idx) {
+		bool success;
+
 		prev = idx;
 		do {
 			prev--;
-			str2 = index_sort_get_string(ctx, prev,
-						     nodes[prev].seq);
-		} while (str2 == &expunged_msg && prev > 0 &&
+			success = index_sort_get_string(ctx, prev,
+							&nodes[prev], &str2);
+		} while (!success && prev > 0 &&
 			 nodes[prev-1].sort_id == nodes[prev].sort_id);
 		*prev_str_r = str2;
 	}
@@ -451,9 +481,7 @@ static void index_sort_merge(struct sort_string_context *ctx)
 	prev_str = NULL;
 	for (zpos = nzpos = 0; zpos < zcount && nzpos < nzcount; ) {
 		zstr = ctx->sort_strings[znodes[zpos].seq];
-		nzstr = index_sort_get_string(ctx, nzpos, nznodes[nzpos].seq);
-
-		if (nzstr != &expunged_msg)
+		if (index_sort_get_string(ctx, nzpos, &nznodes[nzpos], &nzstr))
 			ret = strcmp(zstr, nzstr);
 		else if (prev_str != NULL && strcmp(zstr, prev_str) == 0) {
 			/* identical to previous message, must keep them
@@ -468,6 +496,11 @@ static void index_sort_merge(struct sort_string_context *ctx)
 			ret = 1;
 		}
 
+		if (ret == 0) {
+			ret = index_sort_node_cmp_type(ctx->program,
+					ctx->program->sort_program + 1,
+					znodes[zpos].seq, nznodes[nzpos].seq);
+		}
 		if (ret <= 0) {
 			array_append(&ctx->sorted_nodes, &znodes[zpos], 1);
 			prev_str = zstr;
@@ -505,13 +538,14 @@ static void index_sort_merge(struct sort_string_context *ctx)
 
 static int
 index_sort_add_ids_range(struct sort_string_context *ctx,
-			 unsigned int left_idx, unsigned int right_idx)
+			 unsigned int left_idx, unsigned int right_idx,
+			 const char **reason_r)
 {
 
 	struct mail_sort_node *nodes;
 	unsigned int i, count, rightmost_idx, skip;
 	const char *left_str = NULL, *right_str = NULL, *str = NULL;
-	uint32_t left_sort_id, right_sort_id, diff;
+	uint32_t left_sort_id, right_sort_id, diff, left_str_idx = 0;
 	bool no_left_str = FALSE, no_right_str = FALSE;
 	int ret;
 
@@ -587,18 +621,18 @@ index_sort_add_ids_range(struct sort_string_context *ctx,
 	}
 
 	if (nodes[left_idx].sort_id != 0 && !no_left_str) {
-		left_str = index_sort_get_string(ctx, left_idx,
-						 nodes[left_idx].seq);
-		if (left_str == &expunged_msg) {
+		if (!index_sort_get_string(ctx, left_idx,
+					   &nodes[left_idx], &left_str)) {
 			/* not equivalent with any message */
 			left_str = NULL;
+		} else {
+			left_str_idx = left_idx;
 		}
 		left_idx++;
 	}
 	if (nodes[right_idx].sort_id != 0 && !no_right_str) {
-		right_str = index_sort_get_string(ctx, right_idx,
-						  nodes[right_idx].seq);
-		if (right_str == &expunged_msg) {
+		if (!index_sort_get_string(ctx, right_idx,
+					   &nodes[right_idx], &right_str)) {
 			/* not equivalent with any message */
 			right_str = NULL;
 		}
@@ -611,8 +645,7 @@ index_sort_add_ids_range(struct sort_string_context *ctx,
 	   share. some messages' sort strings may be equivalent, so give them
 	   the same sort IDs. */
 	for (i = left_idx; i <= right_idx; i++) {
-		str = index_sort_get_string(ctx, i, nodes[i].seq);
-		if (str == &expunged_msg) {
+		if (!index_sort_get_string(ctx, i, &nodes[i], &str)) {
 			/* it doesn't really matter what we give to this
 			   message, since it's only temporary and we don't
 			   know its correct position anyway. so let's assume
@@ -625,6 +658,16 @@ index_sort_add_ids_range(struct sort_string_context *ctx,
 		if (ret <= 0) {
 			if (ret < 0) {
 				/* broken sort_ids */
+				uint32_t str_uid, left_str_uid;
+
+				mail_index_lookup_uid(ctx->program->t->view,
+						      nodes[i].seq, &str_uid);
+				mail_index_lookup_uid(ctx->program->t->view,
+					nodes[left_str_idx].seq, &left_str_uid);
+				*reason_r = t_strdup_printf(
+					"(idx=%u, seq=%u, uid=%u) '%s' < left string (idx=%u, seq=%u, uid=%u) '%s'",
+					i, nodes[i].seq, str_uid, str,
+					left_str_idx, nodes[left_str_idx].seq, left_str_uid, left_str);
 				return -1;
 			}
 			nodes[i].sort_id = left_sort_id;
@@ -641,6 +684,11 @@ index_sort_add_ids_range(struct sort_string_context *ctx,
 			if (skip == 0) {
 				/* broken sort IDs (we previously assigned
 				   left_sort_id=right_sort_id) */
+				uint32_t uid;
+				mail_index_lookup_uid(ctx->program->t->view,
+						      nodes[i].seq, &uid);
+				*reason_r = t_strdup_printf(
+					"no sort_id space for uid=%u", uid);
 				return -1;
 			}
 			left_sort_id += skip;
@@ -648,18 +696,24 @@ index_sort_add_ids_range(struct sort_string_context *ctx,
 
 			nodes[i].sort_id = left_sort_id;
 			left_str = str;
+			left_str_idx = i;
 		}
 		nodes[i].sort_id_changed = TRUE;
 	}
 	i_assert(str != NULL);
 
-	return right_str == NULL || strcmp(str, right_str) < 0 ||
-		(strcmp(str, right_str) == 0 &&
-		 nodes[i-1].sort_id == right_sort_id) ? 0 : -1;
+	if (right_str == NULL || strcmp(str, right_str) < 0 ||
+	    (strcmp(str, right_str) == 0 &&
+	     nodes[i-1].sort_id == right_sort_id))
+		return 0;
+
+	*reason_r = t_strdup_printf("Invalid sort_id order ('%s' > '%s')",
+				    str, right_str);
+	return -1;
 }
 
 static int
-index_sort_add_sort_ids(struct sort_string_context *ctx)
+index_sort_add_sort_ids(struct sort_string_context *ctx, const char **reason_r)
 {
 	const struct mail_sort_node *nodes;
 	unsigned int i, left_idx, right_idx, count;
@@ -678,7 +732,7 @@ index_sort_add_sort_ids(struct sort_string_context *ctx)
 		if (right_idx == count)
 			right_idx--;
 		left_idx = i == 0 ? 0 : i - 1;
-		if (index_sort_add_ids_range(ctx, left_idx, right_idx) < 0)
+		if (index_sort_add_ids_range(ctx, left_idx, right_idx, reason_r) < 0)
 			return -1;
 	}
 	return 0;
@@ -690,6 +744,7 @@ static void index_sort_write_changed_sort_ids(struct sort_string_context *ctx)
 	uint32_t ext_id = ctx->ext_id;
 	const struct mail_sort_node *nodes;
 	unsigned int i, count;
+	uint32_t lowest_failed_seq;
 
 	if (ctx->no_writing) {
 		/* our reset_id is already stale - don't even bother
@@ -700,11 +755,30 @@ static void index_sort_write_changed_sort_ids(struct sort_string_context *ctx)
 	mail_index_ext_reset_inc(itrans, ext_id,
 				 ctx->highest_reset_id, FALSE);
 
-	/* add the missing sort IDs to index */
+	/* We require that there aren't sort_id=0 gaps in the middle of the
+	   mails. At this point they could exist though, because some of the
+	   mail lookups may have failed. Failures due to expunges don't matter,
+	   because on the next lookup those mails will be lost anyway.
+	   Otherwise, make sure we don't write those gaps out
+
+	   First find the lowest non-expunged mail that has no_update set. */
+	nodes = array_get_modifiable(&ctx->sorted_nodes, &count);
+	lowest_failed_seq = (uint32_t)-1;
+	for (i = 0; i < count; i++) {
+		uint32_t seq = nodes[i].seq;
+
+		if (nodes[i].no_update && lowest_failed_seq > seq &&
+		    !mail_index_is_expunged(ctx->program->t->view, seq))
+			lowest_failed_seq = seq;
+	}
+
+	/* add the missing sort IDs to index, but only for those sequences
+	   that are below lowest_failed_seq */
 	nodes = array_get_modifiable(&ctx->sorted_nodes, &count);
 	for (i = 0; i < count; i++) {
 		i_assert(nodes[i].sort_id != 0);
-		if (!nodes[i].sort_id_changed || nodes[i].no_update)
+		if (!nodes[i].sort_id_changed || nodes[i].no_update ||
+		    nodes[i].seq >= lowest_failed_seq)
 			continue;
 
 		mail_index_update_ext(itrans, nodes[i].seq, ext_id,
@@ -722,7 +796,7 @@ static int sort_node_cmp(const struct mail_sort_node *n1,
 	if (n1->sort_id > n2->sort_id)
 		return !ctx->reverse ? 1 : -1;
 
-	return index_sort_node_cmp_type(ctx->program->temp_mail,
+	return index_sort_node_cmp_type(ctx->program,
 					ctx->program->sort_program + 1,
 					n1->seq, n2->seq);
 }
@@ -743,7 +817,7 @@ static void index_sort_add_missing(struct sort_string_context *ctx)
 		else {
 			i_assert(next_seq < seqs[i]);
 			for (seq = next_seq; seq < seqs[i]; seq++) {
-				memset(&node, 0, sizeof(node));
+				i_zero(&node);
 				node.seq = seq;
 				index_sort_node_add(ctx, &node);
 			}
@@ -758,14 +832,15 @@ static void index_sort_add_missing(struct sort_string_context *ctx)
 	}
 }
 
-static void index_sort_list_reset_broken(struct sort_string_context *ctx)
+static void index_sort_list_reset_broken(struct sort_string_context *ctx,
+					 const char *reason)
 {
 	struct mailbox *box = ctx->program->t->box;
 	struct mail_sort_node *node;
 
 	mail_storage_set_critical(box->storage,
-				  "%s: Broken %s indexes, resetting",
-				  box->name, ctx->primary_sort_name);
+				  "%s: Broken %s indexes, resetting: %s",
+				  box->name, ctx->primary_sort_name, reason);
 
 	array_clear(&ctx->zero_nodes);
 	array_append_array(&ctx->zero_nodes,
@@ -781,6 +856,7 @@ void index_sort_list_finish_string(struct mail_search_sort_program *program)
 	struct sort_string_context *ctx = program->context;
 	const struct mail_sort_node *nodes;
 	unsigned int i, count;
+	const char *reason;
 	uint32_t seq;
 
 	static_zero_cmp_context = ctx;
@@ -833,11 +909,11 @@ void index_sort_list_finish_string(struct mail_search_sort_program *program)
 			/* merge zero and non-zero arrays into sorted_nodes */
 			index_sort_merge(ctx);
 			/* give sort IDs to messages missing them */
-			if (index_sort_add_sort_ids(ctx) == 0)
+			if (index_sort_add_sort_ids(ctx, &reason) == 0)
 				break;
 
 			/* broken, try again with sort IDs reset */
-			index_sort_list_reset_broken(ctx);
+			index_sort_list_reset_broken(ctx, reason);
 		}
 		index_sort_write_changed_sort_ids(ctx);
 
@@ -860,6 +936,8 @@ void index_sort_list_finish_string(struct mail_search_sort_program *program)
 		/* NOTE: we already freed nonzero_nodes and made it point to
 		   sorted_nodes. */
 	}
+	if (ctx->failed)
+		program->failed = TRUE;
 
 	array_free(&ctx->zero_nodes);
 	i_free(ctx);

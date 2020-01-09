@@ -25,6 +25,7 @@ struct password_scheme {
 ARRAY_DEFINE_TYPE(password_scheme_p, const struct password_scheme *);
 
 extern ARRAY_TYPE(password_scheme_p) password_schemes;
+extern unsigned int password_scheme_encryption_rounds;
 
 /* Returns 1 = matched, 0 = didn't match, -1 = unknown scheme or invalid
    raw_password */
@@ -94,6 +95,11 @@ int scram_sha1_verify(const char *plaintext, const char *user ATTR_UNUSED,
 		      const char **error_r ATTR_UNUSED);
 void scram_sha1_generate(const char *plaintext, const char *user ATTR_UNUSED,
 			 const unsigned char **raw_password_r, size_t *size_r);
+void pbkdf2_generate(const char *plaintext, const char *user ATTR_UNUSED,
+		     const unsigned char **raw_password_r, size_t *size_r);
+int pbkdf2_verify(const char *plaintext, const char *user ATTR_UNUSED,
+		  const unsigned char *raw_password, size_t size,
+		  const char **error_r);
 
 /* check wich of the algorithms Blowfisch, SHA-256 and SHA-512 are
    supported by the used libc's/glibc's crypt() */

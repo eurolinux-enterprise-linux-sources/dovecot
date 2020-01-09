@@ -2,6 +2,7 @@
 #define SETTINGS_PARSER_H
 
 struct var_expand_table;
+struct var_expand_func_table;
 
 #define SETTINGS_SEPARATOR '/'
 #define SETTINGS_SEPARATOR_S "/"
@@ -22,6 +23,7 @@ enum setting_type {
 	SET_UINT_OCT,
 	SET_TIME,
 	SET_SIZE,
+	SET_IN_PORT, /* internet port */
 	SET_STR,
 	SET_STR_VARS, /* string with %variables */
 	SET_ENUM,
@@ -62,6 +64,10 @@ struct setting_define {
 #define SETTING_DEFINE_STRUCT_STR(name, struct_name) \
 	{ SET_STR + COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE( \
 		((struct struct_name *)0)->name, const char *), \
+	  #name, offsetof(struct struct_name, name), NULL }
+#define SETTING_DEFINE_STRUCT_IN_PORT(name, struct_name) \
+	{ SET_IN_PORT + COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE( \
+		((struct struct_name *)0)->name, in_port_t), \
 	  #name, offsetof(struct struct_name, name), NULL }
 
 struct setting_parser_info {
@@ -140,6 +146,9 @@ bool settings_parse_is_changed(struct setting_parser_context *ctx,
 			       const char *key);
 /* Parse a single line. Returns 1 if OK, 0 if key is unknown, -1 if error. */
 int settings_parse_line(struct setting_parser_context *ctx, const char *line);
+/* Parse key/value pair. Returns 1 if OK, 0 if key is unknown, -1 if error. */
+int settings_parse_keyvalue(struct setting_parser_context *ctx,
+			    const char *key, const char *value);
 /* Parse data already read in input stream. */
 int settings_parse_stream(struct setting_parser_context *ctx,
 			  struct istream *input);
@@ -178,6 +187,11 @@ void settings_parse_var_skip(struct setting_parser_context *ctx);
 void settings_var_expand(const struct setting_parser_info *info,
 			 void *set, pool_t pool,
 			 const struct var_expand_table *table);
+void settings_var_expand_with_funcs(const struct setting_parser_info *info,
+				    void *set, pool_t pool,
+				    const struct var_expand_table *table,
+				    const struct var_expand_func_table *func_table,
+				    void *func_context);
 /* Go through all the settings and return the first one that has an unexpanded
    setting containing the given %key. */
 bool settings_vars_have_key(const struct setting_parser_info *info, void *set,
@@ -186,6 +200,10 @@ bool settings_vars_have_key(const struct setting_parser_info *info, void *set,
 /* Duplicate the entire settings structure. */
 void *settings_dup(const struct setting_parser_info *info,
 		   const void *set, pool_t pool);
+/* Same as settings_dup(), but assume that the old pointers can still be safely
+   used. This saves memory since strings don't have to be duplicated. */
+void *settings_dup_with_pointers(const struct setting_parser_info *info,
+				 const void *set, pool_t pool);
 /* Duplicate the entire setting parser. */
 struct setting_parser_context *
 settings_parser_dup(const struct setting_parser_context *old_ctx,
@@ -222,6 +240,9 @@ const char *settings_section_escape(const char *name);
 /* Parse time interval string, return as seconds. */
 int settings_get_time(const char *str, unsigned int *secs_r,
 		      const char **error_r);
+/* Parse time interval string, return as milliseconds. */
+int settings_get_time_msecs(const char *str, unsigned int *msecs_r,
+			    const char **error_r);
 /* Parse size string, return as bytes. */
 int settings_get_size(const char *str, uoff_t *bytes_r,
 		      const char **error_r);

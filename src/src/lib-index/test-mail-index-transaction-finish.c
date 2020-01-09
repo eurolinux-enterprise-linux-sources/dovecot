@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,7 +7,6 @@
 #include "mail-index-modseq.h"
 #include "mail-index-transaction-private.h"
 
-#include <stdlib.h>
 
 static struct mail_index_record recs[20];
 static uint64_t modseqs[N_ELEMENTS(recs)];
@@ -19,7 +18,7 @@ void mail_index_ext_set_reset_id(struct mail_index_transaction *t ATTR_UNUSED,
 				 uint32_t ext_id ATTR_UNUSED,
 				 uint32_t reset_id ATTR_UNUSED) { }
 void mail_index_transaction_set_log_updates(struct mail_index_transaction *t ATTR_UNUSED) { }
-void mail_index_update_day_headers(struct mail_index_transaction *t ATTR_UNUSED) {}
+void mail_index_update_day_headers(struct mail_index_transaction *t ATTR_UNUSED, time_t day_stamp ATTR_UNUSED) {}
 bool mail_index_cancel_flag_updates(struct mail_index_transaction *t ATTR_UNUSED,
 				    uint32_t seq ATTR_UNUSED) { return TRUE; }
 bool mail_index_cancel_keyword_updates(struct mail_index_transaction *t ATTR_UNUSED,
@@ -57,7 +56,13 @@ uint64_t mail_index_modseq_get_highest(struct mail_index_view *view ATTR_UNUSED)
 	return modseqs[0];
 }
 
-static void test_mail_index_transaction_finish_flag_updates(void)
+#define MAIL_INDEX_TRANSACTION_FINISH(t, n_so_far) \
+	for (unsigned int sofar = 0; sofar < n_so_far; sofar++) \
+		mail_index_transaction_finish_so_far(t); \
+	mail_index_transaction_finish(t);
+
+static void
+test_mail_index_transaction_finish_flag_updates(unsigned int n_so_far)
 {
 	struct mail_index_transaction *t;
 	const struct mail_index_flag_update *updates;
@@ -67,10 +72,10 @@ static void test_mail_index_transaction_finish_flag_updates(void)
 	t = t_new(struct mail_index_transaction, 1);
 	t->drop_unnecessary_flag_updates = TRUE;
 
-	memset(&u, 0, sizeof(u));
+	i_zero(&u);
 	u.add_flags = MAIL_SEEN; u.remove_flags = MAIL_DRAFT;
 
-	test_begin("mail index transaction finish flag updates");
+	test_begin(t_strdup_printf("mail index transaction finish flag updates n_so_far=%u", n_so_far));
 
 	/* test fast path: all changed */
 	t_array_init(&t->updates, 10);
@@ -78,7 +83,7 @@ static void test_mail_index_transaction_finish_flag_updates(void)
 	array_append(&t->updates, &u, 1);
 	u.uid1 = 4; u.uid2 = 5;
 	array_append(&t->updates, &u, 1);
-	mail_index_transaction_finish(t);
+	MAIL_INDEX_TRANSACTION_FINISH(t, n_so_far);
 
 	updates = array_get(&t->updates, &count);
 	test_assert(count == 4);
@@ -97,7 +102,7 @@ static void test_mail_index_transaction_finish_flag_updates(void)
 	recs[2].flags = MAIL_SEEN;
 	recs[4].flags = MAIL_SEEN;
 	recs[5].flags = MAIL_SEEN;
-	mail_index_transaction_finish(t);
+	MAIL_INDEX_TRANSACTION_FINISH(t, n_so_far);
 	test_assert(!array_is_created(&t->updates));
 
 	/* some changes */
@@ -106,7 +111,7 @@ static void test_mail_index_transaction_finish_flag_updates(void)
 	array_append(&t->updates, &u, 1);
 	u.uid1 = 5; u.uid2 = 6;
 	array_append(&t->updates, &u, 1);
-	mail_index_transaction_finish(t);
+	MAIL_INDEX_TRANSACTION_FINISH(t, n_so_far);
 
 	updates = array_get(&t->updates, &count);
 	test_assert(count == 2);
@@ -116,7 +121,8 @@ static void test_mail_index_transaction_finish_flag_updates(void)
 	test_end();
 }
 
-static void test_mail_index_transaction_finish_check_conflicts(void)
+static void
+test_mail_index_transaction_finish_check_conflicts(unsigned int n_so_far)
 {
 	struct mail_index_transaction *t;
 	const struct seq_range *conflicts;
@@ -135,16 +141,18 @@ static void test_mail_index_transaction_finish_check_conflicts(void)
 	modseqs[7] = 6;
 	modseqs[8] = 7;
 
-	test_begin("mail index transaction finish check conflicts");
+	test_begin(t_strdup_printf("mail index transaction finish check conflicts n_so_far=%u", n_so_far));
 
 	/* fast path: no conflicts */
 	t->max_modseq = 1234;
-	mail_index_transaction_finish(t);
+	MAIL_INDEX_TRANSACTION_FINISH(t, n_so_far);
 	test_assert(!array_is_created(&conflict_seqs));
 
 	/* try some conflicts */
 	t->max_modseq = 6;
-	mail_index_transaction_finish(t);
+	MAIL_INDEX_TRANSACTION_FINISH(t, n_so_far);
+
+	i_assert(array_is_created(&conflict_seqs));
 
 	conflicts = array_get(&conflict_seqs, &count);
 	test_assert(count == 2);
@@ -152,9 +160,11 @@ static void test_mail_index_transaction_finish_check_conflicts(void)
 	test_assert(conflicts[1].seq1 == 8 && conflicts[1].seq2 == 8);
 
 	test_end();
+	array_free(t->conflict_seqs);
 }
 
-static void test_mail_index_transaction_finish_modseq_updates(void)
+static void
+test_mail_index_transaction_finish_modseq_updates(unsigned int n_so_far)
 {
 	struct mail_index_transaction *t;
 	const struct mail_transaction_modseq_update *ups;
@@ -163,7 +173,7 @@ static void test_mail_index_transaction_finish_modseq_updates(void)
 
 	t = t_new(struct mail_index_transaction, 1);
 
-	test_begin("mail index transaction finish modseq updates");
+	test_begin(t_strdup_printf("mail index transaction finish modseq updates n_so_far=%u", n_so_far));
 
 	t_array_init(&t->modseq_updates, 10);
 	u.modseq_low32 = 1234567890;
@@ -179,7 +189,7 @@ static void test_mail_index_transaction_finish_modseq_updates(void)
 	u.modseq_high32 = 0;
 	u.uid = 2; array_append(&t->modseq_updates, &u, 1);
 
-	mail_index_transaction_finish(t);
+	MAIL_INDEX_TRANSACTION_FINISH(t, n_so_far);
 
 	ups = array_get(&t->modseq_updates, &count);
 	test_assert(count == 4);
@@ -199,7 +209,8 @@ static void test_mail_index_transaction_finish_modseq_updates(void)
 	test_end();
 }
 
-static void test_mail_index_transaction_finish_expunges(void)
+static void
+test_mail_index_transaction_finish_expunges(unsigned int n_so_far)
 {
 	struct mail_index_transaction *t;
 	guid_128_t guid1, guid2, guid3;
@@ -220,7 +231,7 @@ static void test_mail_index_transaction_finish_expunges(void)
 	t = t_new(struct mail_index_transaction, 1);
 	t->expunges_nonsorted = TRUE;
 
-	test_begin("mail index transaction finish expunges");
+	test_begin(t_strdup_printf("mail index transaction finish expunges n_so_far=%u", n_so_far));
 
 	t_array_init(&t->expunges, 3);
 	expunge.uid = 2;
@@ -236,7 +247,7 @@ static void test_mail_index_transaction_finish_expunges(void)
 	array_append(&t->expunges, &expunge, 1);
 	array_append(&t->expunges, &expunge, 1);
 
-	mail_index_transaction_finish(t);
+	MAIL_INDEX_TRANSACTION_FINISH(t, n_so_far);
 
 	expunges = array_get(&t->expunges, &count);
 	test_assert(count == 3);
@@ -249,18 +260,38 @@ static void test_mail_index_transaction_finish_expunges(void)
 	test_end();
 }
 
-int main(void)
+static void test_state_reset(void)
 {
-	static void (*test_functions[])(void) = {
+	memset(recs, 0, sizeof(recs));
+	memset(modseqs, 0, sizeof(modseqs));
+	for (unsigned int n = 1; n < N_ELEMENTS(recs); n++)
+		recs[n].uid = n*2;
+}
+
+static void test_mail_index_transaction_finish(void)
+{
+	void (*const test_finish_functions[])(unsigned int) = {
 		test_mail_index_transaction_finish_flag_updates,
 		test_mail_index_transaction_finish_check_conflicts,
 		test_mail_index_transaction_finish_modseq_updates,
 		test_mail_index_transaction_finish_expunges,
+	};
+	unsigned int i, j;
+
+	for (i = 0; i < N_ELEMENTS(test_finish_functions); i++) {
+		for (j = 0; j < 3; j++) {
+			test_state_reset();
+			test_finish_functions[i](j);
+		}
+	}
+}
+
+int main(void)
+{
+	static void (*test_functions[])(void) = {
+		test_mail_index_transaction_finish,
 		NULL
 	};
-	unsigned int i;
 
-	for (i = 1; i < N_ELEMENTS(recs); i++)
-		recs[i].uid = i*2;
 	return test_run(test_functions);
 }

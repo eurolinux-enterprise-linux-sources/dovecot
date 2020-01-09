@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -12,6 +12,11 @@
 
 #include <unistd.h>
 
+const char *imapc_command_state_names[] = {
+	"OK", "NO", "BAD", "(auth failed)", "(disconnected)"
+
+};
+
 const struct imapc_capability_name imapc_capability_names[] = {
 	{ "SASL-IR", IMAPC_CAPABILITY_SASL_IR },
 	{ "LITERAL+", IMAPC_CAPABILITY_LITERALPLUS },
@@ -24,10 +29,15 @@ const struct imapc_capability_name imapc_capability_names[] = {
 	{ "CONDSTORE", IMAPC_CAPABILITY_CONDSTORE },
 	{ "NAMESPACE", IMAPC_CAPABILITY_NAMESPACE },
 	{ "UNSELECT", IMAPC_CAPABILITY_UNSELECT },
+	{ "ESEARCH", IMAPC_CAPABILITY_ESEARCH },
+	{ "WITHIN", IMAPC_CAPABILITY_WITHIN },
+	{ "QUOTA", IMAPC_CAPABILITY_QUOTA },
 
 	{ "IMAP4REV1", IMAPC_CAPABILITY_IMAP4REV1 },
 	{ NULL, 0 }
 };
+
+unsigned int imapc_client_cmd_tag_counter = 0;
 
 static void
 default_untagged_callback(const struct imapc_untagged_reply *reply ATTR_UNUSED,
@@ -43,6 +53,9 @@ imapc_client_init(const struct imapc_client_settings *set)
 	const char *error;
 	pool_t pool;
 
+	i_assert(set->connect_retry_count == 0 ||
+		 set->connect_retry_interval_msecs > 0);
+
 	pool = pool_alloconly_create("imapc client", 1024);
 	client = p_new(pool, struct imapc_client, 1);
 	client->pool = pool;
@@ -54,6 +67,8 @@ imapc_client_init(const struct imapc_client_settings *set)
 	client->set.master_user = p_strdup_empty(pool, set->master_user);
 	client->set.username = p_strdup(pool, set->username);
 	client->set.password = p_strdup(pool, set->password);
+	client->set.sasl_mechanisms = p_strdup(pool, set->sasl_mechanisms);
+	client->set.use_proxyauth = set->use_proxyauth;
 	client->set.dns_client_socket_path =
 		p_strdup(pool, set->dns_client_socket_path);
 	client->set.temp_path_prefix =
@@ -63,8 +78,20 @@ imapc_client_init(const struct imapc_client_settings *set)
 	client->set.connect_timeout_msecs = set->connect_timeout_msecs != 0 ?
 		set->connect_timeout_msecs :
 		IMAPC_DEFAULT_CONNECT_TIMEOUT_MSECS;
+	client->set.connect_retry_count = set->connect_retry_count;
+	client->set.connect_retry_interval_msecs = set->connect_retry_interval_msecs;
 	client->set.cmd_timeout_msecs = set->cmd_timeout_msecs != 0 ?
 		set->cmd_timeout_msecs : IMAPC_DEFAULT_COMMAND_TIMEOUT_MSECS;
+	client->set.max_line_length = set->max_line_length != 0 ?
+		set->max_line_length : IMAPC_DEFAULT_MAX_LINE_LENGTH;
+	client->set.throttle_set = set->throttle_set;
+
+	if (client->set.throttle_set.init_msecs == 0)
+		client->set.throttle_set.init_msecs = IMAPC_THROTTLE_DEFAULT_INIT_MSECS;
+	if (client->set.throttle_set.max_msecs == 0)
+		client->set.throttle_set.max_msecs = IMAPC_THROTTLE_DEFAULT_MAX_MSECS;
+	if (client->set.throttle_set.shrink_min_msecs == 0)
+		client->set.throttle_set.shrink_min_msecs = IMAPC_THROTTLE_DEFAULT_SHRINK_MIN_MSECS;
 
 	if (set->ssl_mode != IMAPC_CLIENT_SSL_MODE_NONE) {
 		client->set.ssl_mode = set->ssl_mode;
@@ -72,7 +99,7 @@ imapc_client_init(const struct imapc_client_settings *set)
 		client->set.ssl_ca_file = p_strdup(pool, set->ssl_ca_file);
 		client->set.ssl_verify = set->ssl_verify;
 
-		memset(&ssl_set, 0, sizeof(ssl_set));
+		i_zero(&ssl_set);
 		ssl_set.ca_dir = set->ssl_ca_dir;
 		ssl_set.ca_file = set->ssl_ca_file;
 		ssl_set.verify_remote_cert = set->ssl_verify;
@@ -100,6 +127,8 @@ void imapc_client_ref(struct imapc_client *client)
 void imapc_client_unref(struct imapc_client **_client)
 {
 	struct imapc_client *client = *_client;
+
+	*_client = NULL;
 
 	i_assert(client->refcount > 0);
 	if (--client->refcount > 0)
@@ -154,7 +183,8 @@ static void imapc_client_run_pre(struct imapc_client *client)
 
 	array_foreach(&client->conns, connp) {
 		imapc_connection_ioloop_changed((*connp)->conn);
-		imapc_connection_connect((*connp)->conn, NULL, NULL);
+		if (imapc_connection_get_state((*connp)->conn) == IMAPC_CONNECTION_STATE_DISCONNECTED)
+			imapc_connection_connect((*connp)->conn);
 	}
 
 	if (io_loop_is_running(client->ioloop))
@@ -187,9 +217,47 @@ void imapc_client_stop(struct imapc_client *client)
 		io_loop_stop(client->ioloop);
 }
 
+void imapc_client_try_stop(struct imapc_client *client)
+{
+	struct imapc_client_connection *const *connp;
+	array_foreach(&client->conns, connp)
+		if (imapc_connection_get_state((*connp)->conn) != IMAPC_CONNECTION_STATE_DISCONNECTED)
+			return;
+	imapc_client_stop(client);
+}
+
 bool imapc_client_is_running(struct imapc_client *client)
 {
 	return client->ioloop != NULL;
+}
+
+static void imapc_client_login_callback(const struct imapc_command_reply *reply,
+					void *context)
+{
+	struct imapc_client_connection *conn = context;
+	struct imapc_client *client = conn->client;
+	struct imapc_client_mailbox *box = conn->box;
+
+	if (box != NULL && box->reconnecting) {
+		box->reconnecting = FALSE;
+
+		if (reply->state == IMAPC_COMMAND_STATE_OK) {
+			/* reopen the mailbox */
+			box->reopen_callback(box->reopen_context);
+		} else {
+			imapc_connection_abort_commands(box->conn, NULL, FALSE);
+		}
+	}
+
+	/* call the login callback only once */
+	if (client->login_callback != NULL) {
+		imapc_command_callback_t *callback = client->login_callback;
+		void *context = client->login_context;
+
+		client->login_callback = NULL;
+		client->login_context = NULL;
+		callback(reply, context);
+	}
 }
 
 static struct imapc_client_connection *
@@ -198,7 +266,9 @@ imapc_client_add_connection(struct imapc_client *client)
 	struct imapc_client_connection *conn;
 
 	conn = i_new(struct imapc_client_connection, 1);
-	conn->conn = imapc_connection_init(client);
+	conn->client = client;
+	conn->conn = imapc_connection_init(client, imapc_client_login_callback,
+					   conn);
 	array_append(&client->conns, &conn, 1);
 	return conn;
 }
@@ -240,15 +310,62 @@ imapc_client_get_unboxed_connection(struct imapc_client *client)
 }
 
 
-void imapc_client_login(struct imapc_client *client,
-			imapc_command_callback_t *callback, void *context)
+void imapc_client_login(struct imapc_client *client)
 {
 	struct imapc_client_connection *conn;
 
+	i_assert(client->login_callback);
 	i_assert(array_count(&client->conns) == 0);
 
 	conn = imapc_client_add_connection(client);
-	imapc_connection_connect(conn->conn, callback, context);
+	imapc_connection_connect(conn->conn);
+}
+
+struct imapc_logout_ctx {
+	struct imapc_client *client;
+	unsigned int logout_count;
+};
+
+static void
+imapc_client_logout_callback(const struct imapc_command_reply *reply ATTR_UNUSED,
+			     void *context)
+{
+	struct imapc_logout_ctx *ctx = context;
+
+	i_assert(ctx->logout_count > 0);
+
+	if (--ctx->logout_count == 0)
+		imapc_client_stop(ctx->client);
+}
+
+void imapc_client_logout(struct imapc_client *client)
+{
+	struct imapc_logout_ctx ctx = { .client = client };
+	struct imapc_client_connection *const *connp;
+	struct imapc_command *cmd;
+
+	client->logging_out = TRUE;
+
+	/* send LOGOUT to all connections */
+	array_foreach(&client->conns, connp) {
+		if (imapc_connection_get_state((*connp)->conn) == IMAPC_CONNECTION_STATE_DISCONNECTED)
+			continue;
+		imapc_connection_set_no_reconnect((*connp)->conn);
+		ctx.logout_count++;
+		cmd = imapc_connection_cmd((*connp)->conn,
+			imapc_client_logout_callback, &ctx);
+		imapc_command_set_flags(cmd, IMAPC_COMMAND_FLAG_PRELOGIN |
+					IMAPC_COMMAND_FLAG_LOGOUT);
+		imapc_command_send(cmd, "LOGOUT");
+	}
+
+	/* wait for LOGOUT to finish */
+	while (ctx.logout_count > 0)
+		imapc_client_run(client);
+
+	/* we should have disconnected all clients already, but if there were
+	   any timeouts there may be some clients left. */
+	imapc_client_disconnect(client);
 }
 
 struct imapc_client_mailbox *
@@ -265,6 +382,9 @@ imapc_client_mailbox_open(struct imapc_client *client,
 	conn->box = box;
 	box->conn = conn->conn;
 	box->msgmap = imapc_msgmap_init();
+	/* if we get disconnected before the SELECT is finished, allow
+	   one reconnect retry. */
+	box->reconnect_ok = TRUE;
 	return box;
 }
 
@@ -276,37 +396,20 @@ void imapc_client_mailbox_set_reopen_cb(struct imapc_client_mailbox *box,
 	box->reopen_context = context;
 }
 
-static void
-imapc_client_reconnect_cb(const struct imapc_command_reply *reply,
-			  void *context)
+bool imapc_client_mailbox_can_reconnect(struct imapc_client_mailbox *box)
 {
-	struct imapc_client_mailbox *box = context;
-
-	i_assert(box->reconnecting);
-	box->reconnecting = FALSE;
-
-	if (reply->state == IMAPC_COMMAND_STATE_OK) {
-		/* reopen the mailbox */
-		box->reopen_callback(box->reopen_context);
-	} else {
-		imapc_connection_abort_commands(box->conn, NULL, FALSE);
-	}
+	/* the reconnect_ok flag attempts to avoid infinite reconnection loops
+	   to a server that keeps disconnecting us (e.g. some of the commands
+	   we send keeps crashing it always) */
+	return box->reopen_callback != NULL && box->reconnect_ok;
 }
 
-void imapc_client_mailbox_reconnect(struct imapc_client_mailbox *box)
+void imapc_client_mailbox_reconnect(struct imapc_client_mailbox *box,
+				    const char *errmsg)
 {
-	bool reconnect = box->reopen_callback != NULL && box->reconnect_ok;
+	i_assert(!box->reconnecting);
 
-	if (reconnect) {
-		i_assert(!box->reconnecting);
-		box->reconnecting = TRUE;
-	}
-	imapc_connection_disconnect(box->conn);
-	if (reconnect) {
-		imapc_connection_connect(box->conn,
-					 imapc_client_reconnect_cb, box);
-	}
-	box->reconnect_ok = FALSE;
+	imapc_connection_try_reconnect(box->conn, errmsg, 0, FALSE);
 }
 
 void imapc_client_mailbox_close(struct imapc_client_mailbox **_box)
@@ -377,6 +480,7 @@ void imapc_client_mailbox_idle(struct imapc_client_mailbox *box)
 			timeout_add_short(IMAPC_CLIENT_IDLE_SEND_DELAY_MSECS,
 					  imapc_client_mailbox_idle_send, box);
 	}
+	/* we're done with all work at this point. */
 	box->reconnect_ok = TRUE;
 }
 
@@ -397,21 +501,43 @@ bool imapc_client_mailbox_is_opened(struct imapc_client_mailbox *box)
 	return TRUE;
 }
 
-enum imapc_capability
-imapc_client_get_capabilities(struct imapc_client *client)
+static bool
+imapc_client_get_any_capabilities(struct imapc_client *client,
+				  enum imapc_capability *capabilities_r)
 {
 	struct imapc_client_connection *const *connp;
 	struct imapc_connection *conn = NULL;
 
-	/* try to find a connection that is already logged in */
 	array_foreach(&client->conns, connp) {
 		conn = (*connp)->conn;
-		if (imapc_connection_get_state(conn) == IMAPC_CONNECTION_STATE_DONE)
-			return imapc_connection_get_capabilities(conn);
+		if (imapc_connection_get_state(conn) == IMAPC_CONNECTION_STATE_DONE) {
+			*capabilities_r = imapc_connection_get_capabilities(conn);
+			return TRUE;
+		}
 	}
+	return FALSE;
+}
 
-	/* fallback to whatever exists (there always exists one) */
-	return imapc_connection_get_capabilities(conn);
+int imapc_client_get_capabilities(struct imapc_client *client,
+				  enum imapc_capability *capabilities_r)
+{
+	/* try to find a connection that is already logged in */
+	if (imapc_client_get_any_capabilities(client, capabilities_r))
+		return 0;
+
+	/* if there are no connections yet, create one */
+	if (array_count(&client->conns) == 0)
+		(void)imapc_client_add_connection(client);
+
+	/* wait for any of the connections to login */
+	client->stop_on_state_finish = TRUE;
+	imapc_client_run(client);
+	client->stop_on_state_finish = FALSE;
+	if (imapc_client_get_any_capabilities(client, capabilities_r))
+		return 0;
+
+	/* failed */
+	return -1;
 }
 
 int imapc_client_create_temp_fd(struct imapc_client *client,
@@ -435,12 +561,31 @@ int imapc_client_create_temp_fd(struct imapc_client *client,
 	}
 
 	/* we just want the fd, unlink it */
-	if (unlink(str_c(path)) < 0) {
+	if (i_unlink(str_c(path)) < 0) {
 		/* shouldn't happen.. */
-		i_error("unlink(%s) failed: %m", str_c(path));
 		i_close_fd(&fd);
 		return -1;
 	}
 	*path_r = str_c(path);
 	return fd;
 }
+
+void imapc_client_register_state_change_callback(struct imapc_client *client,
+						 imapc_state_change_callback_t *cb,
+						 void *context)
+{
+	i_assert(client->state_change_callback == NULL);
+	i_assert(client->state_change_context == NULL);
+
+	client->state_change_callback = cb;
+	client->state_change_context = context;
+}
+
+void
+imapc_client_set_login_callback(struct imapc_client *client,
+				imapc_command_callback_t *callback, void *context)
+{
+	client->login_callback = callback;
+	client->login_context  = context;
+}
+

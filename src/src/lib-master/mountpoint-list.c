@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -112,7 +112,7 @@ static int mountpoint_list_load(struct mountpoint_list *list)
 	unsigned int len;
 	int fd, ret = 0;
 
-	memset(&rec, 0, sizeof(rec));
+	i_zero(&rec);
 
 	fd = open(list->state_path, O_RDONLY);
 	if (fd == -1) {
@@ -138,7 +138,7 @@ static int mountpoint_list_load(struct mountpoint_list *list)
 	}
 	if (fstat(fd, &list->load_st) < 0)
 		i_error("fstat(%s) failed: %m", list->state_path);
-	input = i_stream_create_fd(fd, (size_t)-1, TRUE);
+	input = i_stream_create_fd_autoclose(&fd, (size_t)-1);
 	while ((line = i_stream_read_next_line(input)) != NULL) {
 		p = strchr(line, ' ');
 		if (p == NULL) {
@@ -223,7 +223,7 @@ mountpoint_list_save_to(struct mountpoint_list *list, const char *path)
 	} else {
 		return 0;
 	}
-	(void)unlink(str_c(temp_path));
+	i_unlink(str_c(temp_path));
 	return -1;
 }
 
@@ -294,7 +294,7 @@ int mountpoint_list_add_missing(struct mountpoint_list *list,
 	struct mountpoint_iter *iter;
 	const struct mountpoint *mnt;
 
-	memset(&new_rec, 0, sizeof(new_rec));
+	i_zero(&new_rec);
 	new_rec.state = default_state;
 	new_rec.mounted = TRUE;
 

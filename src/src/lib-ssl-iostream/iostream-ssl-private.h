@@ -4,7 +4,6 @@
 #include "iostream-ssl.h"
 
 struct iostream_ssl_vfuncs {
-	void (*global_deinit)(void);
 	int (*context_init_client)(const struct ssl_iostream_settings *set,
 				   struct ssl_iostream_context **ctx_r,
 				   const char **error_r);
@@ -13,7 +12,8 @@ struct iostream_ssl_vfuncs {
 				   const char **error_r);
 	void (*context_deinit)(struct ssl_iostream_context *ctx);
 
-	int (*generate_params)(buffer_t *output, const char **error_r);
+	int (*generate_params)(buffer_t *output, unsigned int dh_length,
+			       const char **error_r);
 	int (*context_import_params)(struct ssl_iostream_context *ctx,
 				     const buffer_t *input);
 
@@ -40,5 +40,7 @@ struct iostream_ssl_vfuncs {
 	const char *(*get_security_string)(struct ssl_iostream *ssl_io);
 	const char *(*get_last_error)(struct ssl_iostream *ssl_io);
 };
+
+void iostream_ssl_module_init(const struct iostream_ssl_vfuncs *vfuncs);
 
 #endif

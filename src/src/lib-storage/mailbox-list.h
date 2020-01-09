@@ -9,6 +9,7 @@
 #  define MAILBOX_LIST_NAME_MAX_LENGTH 4096
 #endif
 
+struct fs;
 struct mail_namespace;
 struct mail_storage;
 struct mailbox_list;
@@ -22,7 +23,9 @@ enum mailbox_list_properties {
 	MAILBOX_LIST_PROP_NO_NOSELECT		= 0x04,
 	/* mail root directory isn't required */
 	MAILBOX_LIST_PROP_NO_ROOT		= 0x08,
-	/* Automatically create mailbox directories when needed */
+	/* Automatically create mailbox directories when needed. Normally it's
+	   assumed that if a mailbox directory doesn't exist, the mailbox
+	   doesn't exist either. */
 	MAILBOX_LIST_PROP_AUTOCREATE_DIRS	= 0x10
 };
 
@@ -33,7 +36,9 @@ enum mailbox_list_flags {
 	   mailbox list to it. */
 	MAILBOX_LIST_FLAG_SECONDARY		= 0x02,
 	/* There are no mail files, only index and/or control files. */
-	MAILBOX_LIST_FLAG_NO_MAIL_FILES		= 0x04
+	MAILBOX_LIST_FLAG_NO_MAIL_FILES		= 0x04,
+	/* LAYOUT=index: Don't delete any files in delete_mailbox(). */
+	MAILBOX_LIST_FLAG_NO_DELETES		= 0x08
 };
 
 enum mailbox_info_flags {
@@ -58,6 +63,7 @@ enum mailbox_info_flags {
 	MAILBOX_SPECIALUSE_SENT		= 0x00200000,
 	MAILBOX_SPECIALUSE_TRASH	= 0x00400000,
 	MAILBOX_SPECIALUSE_IMPORTANT	= 0x00800000,
+#define MAILBOX_SPECIALUSE_MASK		  0x00ff0000
 
 	/* Internally used by lib-storage: */
 	MAILBOX_SELECT			= 0x20000000,
@@ -76,7 +82,10 @@ enum mailbox_list_path_type {
 	/* Return index directory ("" for in-memory) */
 	MAILBOX_LIST_PATH_TYPE_INDEX,
 	/* Return the private index directory (NULL if none) */
-	MAILBOX_LIST_PATH_TYPE_INDEX_PRIVATE
+	MAILBOX_LIST_PATH_TYPE_INDEX_PRIVATE,
+	/* Return mailbox list index directory (usually same as
+	   MAILBOX_LIST_PATH_TYPE_INDEX) */
+	MAILBOX_LIST_PATH_TYPE_LIST_INDEX,
 };
 
 enum mailbox_list_file_type {
@@ -94,9 +103,18 @@ struct mailbox_list_settings {
 	const char *index_pvt_dir;
 	const char *control_dir;
 	const char *alt_dir; /* FIXME: dbox-specific.. */
+	/* Backend-local directory where volatile data, such as lock files,
+	   can be temporarily created. This setting allows specifying a
+	   separate directory for them to reduce disk I/O on the real storage.
+	   The volatile_dir can point to an in-memory filesystem. */
+	const char *volatile_dir;
 
 	const char *inbox_path;
 	const char *subscription_fname;
+	const char *list_index_fname;
+	/* Mailbox list index directory. NULL defaults to index directory.
+	   The path may be relative to the index directory. */
+	const char *list_index_dir;
 	/* If non-empty, it means that mails exist in a maildir_name
 	   subdirectory. eg. if you have a directory containing directories:
 
@@ -129,6 +147,13 @@ struct mailbox_list_settings {
 	   have been the default since the beginning, but for backwards
 	   compatibility it had to be made an option. */
 	bool index_control_use_maildir_name;
+	/* Perform mailbox iteration using the index directory instead of the
+	   mail root directory. This can be helpful if the indexes are on a
+	   faster storage. This could perhaps be made the default at some point,
+	   but for now since it's less tested it's optional. */
+	bool iter_from_index_dir;
+	/* Avoid creating or listing \NoSelect mailboxes. */
+	bool no_noselect;
 };
 
 struct mailbox_permissions {
@@ -200,6 +225,9 @@ int mailbox_list_try_mkdir_root(struct mailbox_list *list, const char *path,
    same as mailbox root. Returns 1 if ok, 0 if there are no indexes, -1 if
    error. Calling this multiple times does the check only once. */
 int mailbox_list_mkdir_missing_index_root(struct mailbox_list *list);
+/* Like mailbox_list_mkdir_missing_index_root(), but for mailbox list
+   index root. */
+int mailbox_list_mkdir_missing_list_index_root(struct mailbox_list *list);
 
 /* Returns TRUE if name is ok, FALSE if it can't be safely passed to
    mailbox_list_*() functions */
@@ -256,5 +284,25 @@ int mailbox_list_delete_symlink(struct mailbox_list *list, const char *name);
 const char * ATTR_NOWARN_UNUSED_RESULT
 mailbox_list_get_last_error(struct mailbox_list *list,
 			    enum mail_error *error_r);
+/* Wrapper for mailbox_list_get_last_error() */
+enum mail_error mailbox_list_get_last_mail_error(struct mailbox_list *list);
+
+const char * ATTR_NOWARN_UNUSED_RESULT
+mailbox_list_get_last_internal_error(struct mailbox_list *list,
+				     enum mail_error *error_r);
+
+/* Save the last error until it's popped. This is useful for cases where the
+   list operation has already failed, but the cleanup code path changes the
+   error to something else unwanted. */
+void mailbox_list_last_error_push(struct mailbox_list *list);
+void mailbox_list_last_error_pop(struct mailbox_list *list);
+
+/* Create a fs based on the settings in the given mailbox_list. */
+int mailbox_list_init_fs(struct mailbox_list *list, const char *driver,
+			 const char *args, const char *root_dir,
+			 struct fs **fs_r, const char **error_r);
+/* Return mailbox_list that was used to create the fs via
+   mailbox_list_init_fs(). */
+struct mailbox_list *mailbox_list_fs_get_list(struct fs *fs);
 
 #endif

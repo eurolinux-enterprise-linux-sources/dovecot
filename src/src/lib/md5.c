@@ -48,7 +48,7 @@
  */
 #if defined(__i386__) || defined(__x86_64__) || defined(__vax__)
 #define SET(n) \
-	(*(const uint_fast32_t *)&ptr[(n) * 4])
+	(*(const uint32_t *)&ptr[(n) * 4])
 #define GET(n) \
 	SET(n)
 #else
@@ -66,7 +66,7 @@
  * This processes one or more 64-byte data blocks, but does NOT update
  * the bit counters.  There're no alignment requirements.
  */
-static const void * ATTR_NOWARN_UNUSED_RESULT
+static const void * ATTR_NOWARN_UNUSED_RESULT ATTR_UNSIGNED_WRAPS
 body(struct md5_context *ctx, const void *data, size_t size)
 {
 	const unsigned char *ptr;
@@ -183,9 +183,11 @@ void md5_init(struct md5_context *ctx)
 
 	ctx->lo = 0;
 	ctx->hi = 0;
+	memset(ctx->block, 0, sizeof(ctx->block));
 }
 
-void md5_update(struct md5_context *ctx, const void *data, size_t size)
+void ATTR_UNSIGNED_WRAPS
+md5_update(struct md5_context *ctx, const void *data, size_t size)
 {
 	/* @UNSAFE */
 	uint_fast32_t saved_lo;
@@ -220,7 +222,8 @@ void md5_update(struct md5_context *ctx, const void *data, size_t size)
 	memcpy(ctx->buffer, data, size);
 }
 
-void md5_final(struct md5_context *ctx, unsigned char result[MD5_RESULTLEN])
+void ATTR_UNSIGNED_WRAPS
+md5_final(struct md5_context *ctx, unsigned char result[STATIC_ARRAY MD5_RESULTLEN])
 {
 	/* @UNSAFE */
 	unsigned long used, free;
@@ -269,11 +272,11 @@ void md5_final(struct md5_context *ctx, unsigned char result[MD5_RESULTLEN])
 	result[14] = ctx->d >> 16;
 	result[15] = ctx->d >> 24;
 
-	safe_memset(ctx, 0, sizeof(*ctx));
+	i_zero_safe(ctx);
 }
 
 void md5_get_digest(const void *data, size_t size,
-		    unsigned char result[MD5_RESULTLEN])
+		    unsigned char result[STATIC_ARRAY MD5_RESULTLEN])
 {
 	struct md5_context ctx;
 

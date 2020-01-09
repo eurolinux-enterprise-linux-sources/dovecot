@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -9,6 +9,7 @@ static int raw_sync(struct raw_mailbox *mbox)
 {
         struct mail_index_sync_ctx *index_sync_ctx;
 	struct mail_index_view *sync_view;
+	struct mail_index_sync_rec sync_rec;
 	struct mail_index_transaction *trans;
 	uint32_t seq, uid_validity = ioloop_time;
 	enum mail_index_sync_flags sync_flags;
@@ -19,6 +20,12 @@ static int raw_sync(struct raw_mailbox *mbox)
 	sync_flags = index_storage_get_sync_flags(&mbox->box) |
 		MAIL_INDEX_SYNC_FLAG_FLUSH_DIRTY |
 		MAIL_INDEX_SYNC_FLAG_REQUIRE_CHANGES;
+
+	if (mail_index_view_get_messages_count(mbox->box.view) > 0) {
+		/* already-synced index was opened via
+		   mail-index-alloc-cache. */
+		return 0;
+	}
 
 	ret = mail_index_sync_begin(mbox->box.index, &index_sync_ctx,
 				    &sync_view, &trans, sync_flags);
@@ -35,8 +42,9 @@ static int raw_sync(struct raw_mailbox *mbox)
 
 	/* add our one and only message */
 	mail_index_append(trans, 1, &seq);
-	index_mailbox_set_recent_uid(&mbox->box, 1);
+	mailbox_recent_flags_set_uid(&mbox->box, 1);
 
+	while (mail_index_sync_next(index_sync_ctx, &sync_rec)) ;
 	if (mail_index_sync_commit(&index_sync_ctx) < 0) {
 		mailbox_set_index_error(&mbox->box);
 		return -1;
@@ -51,12 +59,7 @@ raw_storage_sync_init(struct mailbox *box, enum mailbox_sync_flags flags)
 	struct raw_mailbox *mbox = (struct raw_mailbox *)box;
 	int ret = 0;
 
-	if (!box->opened) {
-		if (mailbox_open(box) < 0)
-			ret = -1;
-	}
-
-	if (!mbox->synced && ret == 0)
+	if (!mbox->synced)
 		ret = raw_sync(mbox);
 
 	return index_mailbox_sync_init(box, flags, ret < 0);

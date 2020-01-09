@@ -1,4 +1,4 @@
-/* Copyright (c) 1999-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 1999-2018 Dovecot authors, see the included COPYING file */
 
 #define _GNU_SOURCE /* For Linux's struct ucred */
 #include "lib.h"
@@ -6,7 +6,6 @@
 #include "time-util.h"
 #include "net.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <ctype.h>
@@ -40,7 +39,22 @@ union sockaddr_union_unix {
 
 #if !defined(HAVE_GETPEEREID) && !defined(SO_PEERCRED) && !defined(HAVE_GETPEERUCRED) && defined(MSG_WAITALL) && defined(LOCAL_CREDS)
 #  define NEEDS_LOCAL_CREDS 1
+#else
+#  undef NEEDS_LOCAL_CREDS
 #endif
+
+/* If connect() fails with EADDRNOTAVAIL (or some others on FreeBSD), retry it
+   this many times.
+
+   This is needed on busy systems kernel may assign the same source port to two
+   sockets at bind() stage, which is what we generally want to allow more than
+   64k outgoing connections to different destinations. However, at bind() stage
+   the kernel doesn't know the destination yet. So it's possible that it
+   assigns the same source port to two (or more) sockets that have the same
+   destination IP+port as well. In this case connect() will fail with
+   EADDRNOTAVAIL. We'll need to retry this and hope that the next attempt won't
+   conflict. */
+#define MAX_CONNECT_RETRIES 20
 
 bool net_ip_compare(const struct ip_addr *ip1, const struct ip_addr *ip2)
 {
@@ -115,7 +129,7 @@ sin_get_ip(const union sockaddr_union *so, struct ip_addr *ip)
 {
 	/* IP structs may be sent across processes. Clear the whole struct
 	   first to make sure it won't leak any data across processes. */
-	memset(ip, 0, sizeof(*ip));
+	i_zero(ip);
 
 	ip->family = so->sin.sin_family;
 
@@ -127,20 +141,20 @@ sin_get_ip(const union sockaddr_union *so, struct ip_addr *ip)
 	if (ip->family == AF_INET)
 		memcpy(&ip->u.ip4, &so->sin.sin_addr, sizeof(ip->u.ip4));
 	else
-		memset(&ip->u, 0, sizeof(ip->u));
+		i_zero(&ip->u);
 }
 
-static inline void sin_set_port(union sockaddr_union *so, unsigned int port)
+static inline void sin_set_port(union sockaddr_union *so, in_port_t port)
 {
 #ifdef HAVE_IPV6
 	if (so->sin.sin_family == AF_INET6)
-                so->sin6.sin6_port = htons((unsigned short) port);
+                so->sin6.sin6_port = htons(port);
 	else
 #endif
-		so->sin.sin_port = htons((unsigned short) port);
+		so->sin.sin_port = htons(port);
 }
 
-static inline unsigned int sin_get_port(union sockaddr_union *so)
+static inline in_port_t sin_get_port(union sockaddr_union *so)
 {
 #ifdef HAVE_IPV6
 	if (so->sin.sin_family == AF_INET6)
@@ -152,37 +166,8 @@ static inline unsigned int sin_get_port(union sockaddr_union *so)
 	return 0;
 }
 
-#ifdef __FreeBSD__
-static int
-net_connect_ip_full_freebsd(const struct ip_addr *ip, unsigned int port,
-			    const struct ip_addr *my_ip, bool blocking);
-
-static int net_connect_ip_full(const struct ip_addr *ip, unsigned int port,
-			       const struct ip_addr *my_ip, bool blocking)
-{
-	int fd, try;
-
-	for (try = 0;;) {
-		fd = net_connect_ip_full_freebsd(ip, port, my_ip, blocking);
-		if (fd != -1 || ++try == 5 ||
-		    (errno != EADDRINUSE && errno != EACCES))
-			break;
-		/*
-		   This may be just a temporary problem:
-
-		   EADDRINUSE: busy
-		   EACCES: pf may cause this if another connection used
-		           the same port recently
-		*/
-	}
-	return fd;
-}
-/* then some kludging: */
-#define net_connect_ip_full net_connect_ip_full_freebsd
-#endif
-
-static int net_connect_ip_full(const struct ip_addr *ip, unsigned int port,
-			       const struct ip_addr *my_ip, bool blocking)
+static int net_connect_ip_once(const struct ip_addr *ip, in_port_t port,
+			       const struct ip_addr *my_ip, int sock_type, bool blocking)
 {
 	union sockaddr_union so;
 	int fd, ret, opt = 1;
@@ -193,9 +178,9 @@ static int net_connect_ip_full(const struct ip_addr *ip, unsigned int port,
 	}
 
 	/* create the socket */
-	memset(&so, 0, sizeof(so));
+	i_zero(&so);
         so.sin.sin_family = ip->family;
-	fd = socket(ip->family, SOCK_STREAM, 0);
+	fd = socket(ip->family, sock_type, 0);
 
 	if (fd == -1) {
 		i_error("socket() failed: %m");
@@ -203,8 +188,9 @@ static int net_connect_ip_full(const struct ip_addr *ip, unsigned int port,
 	}
 
 	/* set socket options */
-	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+	(void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	if (sock_type == SOCK_STREAM)
+		(void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
 	if (!blocking)
 		net_set_nonblock(fd, TRUE);
 
@@ -235,20 +221,46 @@ static int net_connect_ip_full(const struct ip_addr *ip, unsigned int port,
 
 	return fd;
 }
-#ifdef __FreeBSD__
-#  undef net_connect_ip_full
-#endif
 
-int net_connect_ip(const struct ip_addr *ip, unsigned int port,
-		   const struct ip_addr *my_ip)
+static int net_connect_ip_full(const struct ip_addr *ip, in_port_t port,
+			       const struct ip_addr *my_ip, int sock_type,
+			       bool blocking)
 {
-	return net_connect_ip_full(ip, port, my_ip, FALSE);
+	int fd, try;
+
+	for (try = 0;;) {
+		fd = net_connect_ip_once(ip, port, my_ip, sock_type, blocking);
+		if (fd != -1 || try++ >= MAX_CONNECT_RETRIES ||
+		    (errno != EADDRNOTAVAIL
+#ifdef __FreeBSD__
+		     /* busy */
+		     && errno != EADDRINUSE
+		     /* pf may cause this if another connection used
+			the same port recently */
+		     && errno != EACCES
+#endif
+		    ))
+			break;
+	}
+	return fd;
 }
 
-int net_connect_ip_blocking(const struct ip_addr *ip, unsigned int port,
+int net_connect_ip(const struct ip_addr *ip, in_port_t port,
+		   const struct ip_addr *my_ip)
+{
+	return net_connect_ip_full(ip, port, my_ip, SOCK_STREAM, FALSE);
+}
+
+int net_connect_ip_blocking(const struct ip_addr *ip, in_port_t port,
 			    const struct ip_addr *my_ip)
 {
-	return net_connect_ip_full(ip, port, my_ip, TRUE);
+	return net_connect_ip_full(ip, port, my_ip, SOCK_STREAM, TRUE);
+}
+
+int net_connect_udp(const struct ip_addr *ip, in_port_t port,
+			       const struct ip_addr *my_ip)
+{
+	return net_connect_ip_full(ip, port, my_ip, SOCK_DGRAM, FALSE);
 }
 
 int net_try_bind(const struct ip_addr *ip)
@@ -257,7 +269,7 @@ int net_try_bind(const struct ip_addr *ip)
 	int fd;
 
 	/* create the socket */
-	memset(&so, 0, sizeof(so));
+	i_zero(&so);
         so.sin.sin_family = ip->family;
 	fd = socket(ip->family, SOCK_STREAM, 0);
 	if (fd == -1) {
@@ -279,7 +291,7 @@ int net_connect_unix(const char *path)
 	union sockaddr_union_unix sa;
 	int fd, ret;
 
-	memset(&sa, 0, sizeof(sa));
+	i_zero(&sa);
 	sa.un.sun_family = AF_UNIX;
 	if (i_strocpy(sa.un.sun_path, path, sizeof(sa.un.sun_path)) < 0) {
 		/* too long path */
@@ -366,6 +378,37 @@ int net_set_cork(int fd ATTR_UNUSED, bool cork ATTR_UNUSED)
 #endif
 }
 
+int net_set_tcp_nodelay(int fd, bool nodelay)
+{
+	int val = nodelay;
+
+	return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+}
+
+int net_set_send_buffer_size(int fd, size_t size)
+{
+	int opt;
+
+	if (size > INT_MAX) {
+		errno = EINVAL;
+		return -1;
+	}
+	opt = (int)size;
+	return setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &opt, sizeof(opt));
+}
+
+int net_set_recv_buffer_size(int fd, size_t size)
+{
+	int opt;
+
+	if (size > INT_MAX) {
+		errno = EINVAL;
+		return -1;
+	}
+	opt = (int)size;
+	return setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &opt, sizeof(opt));
+}
+
 void net_get_ip_any4(struct ip_addr *ip)
 {
 	ip->family = AF_INET;
@@ -382,21 +425,21 @@ void net_get_ip_any6(struct ip_addr *ip)
 #endif
 }
 
-int net_listen(const struct ip_addr *my_ip, unsigned int *port, int backlog)
+int net_listen(const struct ip_addr *my_ip, in_port_t *port, int backlog)
 {
 	enum net_listen_flags flags = 0;
 
 	return net_listen_full(my_ip, port, &flags, backlog);
 }
 
-int net_listen_full(const struct ip_addr *my_ip, unsigned int *port,
+int net_listen_full(const struct ip_addr *my_ip, in_port_t *port,
 		    enum net_listen_flags *flags, int backlog)
 {
 	union sockaddr_union so;
 	int ret, fd, opt = 1;
 	socklen_t len;
 
-	memset(&so, 0, sizeof(so));
+	i_zero(&so);
 	sin_set_port(&so, *port);
 	sin_set_ip(&so, my_ip);
 
@@ -418,8 +461,8 @@ int net_listen_full(const struct ip_addr *my_ip, unsigned int *port,
 	}
 
 	/* set socket options */
-	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+	(void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	(void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
 
 	if ((*flags & NET_LISTEN_FLAG_REUSEPORT) != 0) {
 #ifdef SO_REUSEPORT
@@ -434,7 +477,7 @@ int net_listen_full(const struct ip_addr *my_ip, unsigned int *port,
 #ifdef IPV6_V6ONLY
 	if (so.sin.sin_family == AF_INET6) {
 		opt = 1;
-		setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+		(void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
 	}
 #endif
 	/* specify the address/port we want to listen in */
@@ -473,7 +516,7 @@ int net_listen_unix(const char *path, int backlog)
 	} sa;
 	int fd;
 
-	memset(&sa, 0, sizeof(sa));
+	i_zero(&sa);
 	sa.un.sun_family = AF_UNIX;
 	if (i_strocpy(sa.un.sun_path, path, sizeof(sa.un.sun_path)) < 0) {
 		/* too long path */
@@ -533,8 +576,7 @@ int net_listen_unix_unlink_stale(const char *path, int backlog)
 		}
 
 		/* delete and try again */
-		if (unlink(path) < 0 && errno != ENOENT) {
-			i_error("unlink(%s) failed: %m", path);
+		if (i_unlink_if_exists(path) < 0) {
 			errno = EADDRINUSE;
 			return -1;
 		}
@@ -542,7 +584,7 @@ int net_listen_unix_unlink_stale(const char *path, int backlog)
 	return fd;
 }
 
-int net_accept(int fd, struct ip_addr *addr_r, unsigned int *port_r)
+int net_accept(int fd, struct ip_addr *addr_r, in_port_t *port_r)
 {
 	union sockaddr_union so;
 	int ret;
@@ -561,7 +603,7 @@ int net_accept(int fd, struct ip_addr *addr_r, unsigned int *port_r)
 	}
 	if (so.sin.sin_family == AF_UNIX) {
 		if (addr_r != NULL)
-			memset(addr_r, 0, sizeof(*addr_r));
+			i_zero(addr_r);
 		if (port_r != NULL) *port_r = 0;
 	} else {
 		if (addr_r != NULL) sin_get_ip(&so, addr_r);
@@ -605,12 +647,12 @@ ssize_t net_transmit(int fd, const void *data, size_t len)
 	i_assert(len <= SSIZE_T_MAX);
 
 	ret = send(fd, data, len, 0);
-	if (unlikely(ret == -1 && (errno == EINTR || errno == EAGAIN)))
-		return 0;
-
-	if (unlikely(errno == EPIPE))
-		return -2;
-
+	if (ret == -1) {
+		if (errno == EINTR || errno == EAGAIN)
+			return 0;
+		if (errno == EPIPE)
+			return -2;
+	}
         return ret;
 }
 
@@ -621,6 +663,7 @@ int net_gethostbyname(const char *addr, struct ip_addr **ips,
 #ifdef HAVE_IPV6
 	union sockaddr_union *so;
 	struct addrinfo hints, *ai, *origai;
+	struct ip_addr ip;
 	int host_error;
 #else
 	struct hostent *hp;
@@ -631,6 +674,14 @@ int net_gethostbyname(const char *addr, struct ip_addr **ips,
         *ips_count = 0;
 
 #ifdef HAVE_IPV6
+	/* support [ipv6] style addresses here so they work globally */
+	if (addr[0] == '[' && net_addr2ip(addr, &ip) == 0) {
+		*ips_count = 1;
+		*ips = t_new(struct ip_addr, 1);
+		**ips = ip;
+		return 0;
+	}
+
 	memset(&hints, 0, sizeof(struct addrinfo));
 	hints.ai_socktype = SOCK_STREAM;
 
@@ -686,7 +737,7 @@ int net_gethostbyaddr(const struct ip_addr *ip, const char **name_r)
 	char hbuf[NI_MAXHOST];
 	int ret;
 
-	memset(&so, 0, sizeof(so));
+	i_zero(&so);
 	sin_set_ip(&so, ip);
 	ret = getnameinfo(&so.sa, addrlen, hbuf, sizeof(hbuf), NULL, 0,
 			  NI_NAMEREQD);
@@ -697,7 +748,7 @@ int net_gethostbyaddr(const struct ip_addr *ip, const char **name_r)
 	return 0;
 }
 
-int net_getsockname(int fd, struct ip_addr *addr, unsigned int *port)
+int net_getsockname(int fd, struct ip_addr *addr, in_port_t *port)
 {
 	union sockaddr_union so;
 	socklen_t addrlen;
@@ -709,7 +760,7 @@ int net_getsockname(int fd, struct ip_addr *addr, unsigned int *port)
 		return -1;
 	if (so.sin.sin_family == AF_UNIX) {
 		if (addr != NULL)
-			memset(addr, 0, sizeof(*addr));
+			i_zero(addr);
 		if (port != NULL) *port = 0;
 	} else {
 		if (addr != NULL) sin_get_ip(&so, addr);
@@ -718,7 +769,7 @@ int net_getsockname(int fd, struct ip_addr *addr, unsigned int *port)
 	return 0;
 }
 
-int net_getpeername(int fd, struct ip_addr *addr, unsigned int *port)
+int net_getpeername(int fd, struct ip_addr *addr, in_port_t *port)
 {
 	union sockaddr_union so;
 	socklen_t addrlen;
@@ -730,7 +781,7 @@ int net_getpeername(int fd, struct ip_addr *addr, unsigned int *port)
 		return -1;
 	if (so.sin.sin_family == AF_UNIX) {
 		if (addr != NULL)
-			memset(addr, 0, sizeof(*addr));
+			i_zero(addr);
 		if (port != NULL) *port = 0;
 	} else {
 		if (addr != NULL) sin_get_ip(&so, addr);
@@ -834,7 +885,7 @@ int net_getunixcred(int fd, struct net_unix_cred *cred_r)
 		return -1;
 	}
 	return 0;
-#elif NEEDS_LOCAL_CREDS
+#elif defined(NEEDS_LOCAL_CREDS)
 	/* NetBSD < 5 */
 	int i, n, on;
 	struct iovec iov;
@@ -882,13 +933,12 @@ int net_getunixcred(int fd, struct net_unix_cred *cred_r)
 const char *net_ip2addr(const struct ip_addr *ip)
 {
 #ifdef HAVE_IPV6
-	char addr[MAX_IP_LEN+1];
+	char *addr = t_malloc(MAX_IP_LEN+1);
 
-	addr[MAX_IP_LEN] = '\0';
 	if (inet_ntop(ip->family, &ip->u.ip6, addr, MAX_IP_LEN) == NULL)
 		return "";
 
-	return t_strdup(addr);
+	return addr;
 #else
 	unsigned long ip4;
 
@@ -904,18 +954,55 @@ const char *net_ip2addr(const struct ip_addr *ip)
 #endif
 }
 
+static bool net_addr2ip_inet4_fast(const char *addr, struct ip_addr *ip)
+{
+	uint8_t *saddr = (void *)&ip->u.ip4.s_addr;
+	unsigned int i, num;
+
+	if (str_parse_uint(addr, &num, &addr) < 0)
+		return FALSE;
+	if (*addr == '\0' && num <= 0xffffffff) {
+		/* single-number IPv4 address */
+		ip->u.ip4.s_addr = htonl(num);
+		ip->family = AF_INET;
+		return TRUE;
+	}
+
+	/* try to parse as a.b.c.d */
+	i = 0;
+	for (;;) {
+		if (num >= 256)
+			return FALSE;
+		saddr[i] = num;
+		if (i == 3)
+			break;
+		i++;
+		if (*addr != '.')
+			return FALSE;
+		addr++;
+		if (str_parse_uint(addr, &num, &addr) < 0)
+			return FALSE;
+	}
+	if (*addr != '\0')
+		return FALSE;
+	ip->family = AF_INET;
+	return TRUE;
+}
+
 int net_addr2ip(const char *addr, struct ip_addr *ip)
 {
 	int ret;
 
+	if (net_addr2ip_inet4_fast(addr, ip))
+		return 0;
+
 	if (strchr(addr, ':') != NULL) {
 		/* IPv6 */
-		ip->family = AF_INET6;
 #ifdef HAVE_IPV6
 		T_BEGIN {
 			if (addr[0] == '[') {
 				/* allow [ipv6 addr] */
-				unsigned int len = strlen(addr);
+				size_t len = strlen(addr);
 				if (addr[len-1] == ']')
 					addr = t_strndup(addr+1, len-2);
 			}
@@ -926,13 +1013,87 @@ int net_addr2ip(const char *addr, struct ip_addr *ip)
 #else
 		ip->u.ip4.s_addr = 0;
 #endif
+		ip->family = AF_INET6;
  	} else {
 		/* IPv4 */
-		ip->family = AF_INET;
 		if (inet_aton(addr, &ip->u.ip4) == 0)
 			return -1;
+		ip->family = AF_INET;
 	}
+	return 0;
+}
 
+int net_str2port(const char *str, in_port_t *port_r)
+{
+	uintmax_t l;
+
+	if (str_to_uintmax(str, &l) < 0)
+		return -1;
+
+	if (l == 0 || l > (in_port_t)-1)
+		return -1;
+	*port_r = (in_port_t)l;
+	return 0;
+}
+
+int net_str2port_zero(const char *str, in_port_t *port_r)
+{
+	uintmax_t l;
+
+	if (str_to_uintmax(str, &l) < 0)
+		return -1;
+
+	if (l > (in_port_t)-1)
+		return -1;
+	*port_r = (in_port_t)l;
+	return 0;
+}
+
+int net_str2hostport(const char *str, in_port_t default_port,
+		     const char **host_r, in_port_t *port_r)
+{
+	const char *p, *host;
+	in_port_t port;
+
+	if (str[0] == '[') {
+		/* [IPv6] address, possibly followed by :port */
+		p = strchr(str, ']');
+		if (p == NULL)
+			return -1;
+		host = t_strdup_until(str+1, p++);
+	} else {
+		p = strchr(str, ':');
+		if (p == NULL || strchr(p+1, ':') != NULL) {
+			/* host or IPv6 address */
+			*host_r = str;
+			*port_r = default_port;
+			return 0;
+		}
+		host = t_strdup_until(str, p);
+	}
+	if (p[0] == '\0') {
+		*host_r = host;
+		*port_r = default_port;
+		return 0;
+	}
+	if (p[0] != ':')
+		return -1;
+	if (net_str2port(p+1, &port) < 0)
+		return -1;
+	*host_r = host;
+	*port_r = port;
+	return 0;
+}
+
+int net_ipport2str(const struct ip_addr *ip, in_port_t port, const char **str_r)
+{
+	if (!IPADDR_IS_V4(ip) && !IPADDR_IS_V6(ip)) return -1;
+
+	*str_r = t_strdup_printf("%s%s%s:%u",
+				 IPADDR_IS_V6(ip) ? "[" : "",
+				 net_ip2addr(ip),
+				 IPADDR_IS_V6(ip) ? "]" : "",
+				 port);
 	return 0;
 }
 
@@ -961,8 +1122,12 @@ int net_geterror(int fd)
 	int data;
 	socklen_t len = sizeof(data);
 
-	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &len) == -1)
-		return -1;
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &len) == -1) {
+		/* we're now really returning the getsockopt()'s error code
+		   instead of the socket's, but normally we should never get
+		   here anyway. */
+		return errno;
+	}
 
 	return data;
 }
@@ -1002,7 +1167,7 @@ int net_hosterror_notfound(int error)
 #endif
 }
 
-const char *net_getservbyport(unsigned short port)
+const char *net_getservbyport(in_port_t port)
 {
 	struct servent *entry;
 
@@ -1080,7 +1245,7 @@ bool net_is_in_network(const struct ip_addr *ip,
 		ip = &tmp_ip;
 	}
 
-	if (ip->family == 0) {
+	if (ip->family == 0 || net_ip->family == 0) {
 		/* non-IPv4/IPv6 address (e.g. UNIX socket) never matches
 		   anything */
 		return FALSE;

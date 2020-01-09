@@ -1,11 +1,10 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "imap-match.h"
 #include "expire-set.h"
 
-#include <stdlib.h>
 
 struct expire_set {
 	pool_t pool;

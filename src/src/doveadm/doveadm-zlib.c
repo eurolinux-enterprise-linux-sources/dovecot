@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -52,7 +52,7 @@ static void cmd_dump_imapzlib(int argc ATTR_UNUSED, char *argv[])
 	fd = open(argv[1], O_RDONLY);
 	if (fd < 0)
 		i_fatal("open(%s) failed: %m", argv[1]);
-	input = i_stream_create_fd(fd, 1024*32, TRUE);
+	input = i_stream_create_fd_autoclose(&fd, 1024*32);
 	while ((line = i_stream_read_next_line(input)) != NULL) {
 		/* skip tag */
 		printf("%s\r\n", line);
@@ -70,7 +70,8 @@ static void cmd_dump_imapzlib(int argc ATTR_UNUSED, char *argv[])
 	i_stream_unref(&input);
 
 	while (i_stream_read_data(input2, &data, &size, 0) != -1) {
-		fwrite(data, 1, size, stdout);
+		if (fwrite(data, 1, size, stdout) != size)
+			break;
 		i_stream_skip(input2, size);
 	}
 	i_stream_unref(&input2);
@@ -122,8 +123,8 @@ static void server_input(struct client *client)
 
 	if (i_stream_read(client->input) == -1) {
 		if (client->input->stream_errno != 0) {
-			errno = client->input->stream_errno;
-			i_fatal("read(server) failed: %m");
+			i_fatal("read(server) failed: %s",
+				i_stream_get_error(client->input));
 		}
 
 		i_info("Server disconnected");
@@ -141,11 +142,12 @@ static void cmd_zlibconnect(int argc ATTR_UNUSED, char *argv[])
 {
 	struct client client;
 	struct ip_addr *ips;
-	unsigned int ips_count, port = 143;
+	unsigned int ips_count;
+	in_port_t port = 143;
 	int fd, ret;
 
 	if (argv[1] == NULL ||
-	    (argv[2] != NULL && str_to_uint(argv[2], &port) < 0))
+	    (argv[2] != NULL && net_str2port(argv[2], &port) < 0))
 		help(&doveadm_cmd_zlibconnect);
 
 	ret = net_gethostbyname(argv[1], &ips, &ips_count);
@@ -160,7 +162,7 @@ static void cmd_zlibconnect(int argc ATTR_UNUSED, char *argv[])
 	i_info("Connected to %s port %u. Ctrl-D starts compression",
 	       net_ip2addr(&ips[0]), port);
 
-	memset(&client, 0, sizeof(client));
+	i_zero(&client);
 	client.fd = fd;
 	client.input = i_stream_create_fd(fd, (size_t)-1, FALSE);
 	client.output = o_stream_create_fd(fd, 0, FALSE);

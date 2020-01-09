@@ -4,8 +4,10 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib
 
 libsasl_la_SOURCES = \
+	mech-external.c \
 	mech-login.c \
 	mech-plain.c \
+	mech-oauthbearer.c \
 	dsasl-client.c 
 
 headers = \

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,7 +7,6 @@
 #include "maildir-keywords.h"
 #include "maildir-filename-flags.h"
 
-#include <stdlib.h>
 
 void maildir_filename_flags_get(struct maildir_keywords_sync_ctx *ctx,
 				const char *fname, enum mail_flags *flags_r,
@@ -74,7 +73,8 @@ maildir_filename_append_keywords(struct maildir_keywords_sync_ctx *ctx,
 				 string_t *fname)
 {
 	const unsigned int *indexes;
-	unsigned int i, count, start = str_len(fname);
+	unsigned int i, count;
+	size_t start = str_len(fname);
 	char chr;
 
 	indexes = array_get(keywords, &count);

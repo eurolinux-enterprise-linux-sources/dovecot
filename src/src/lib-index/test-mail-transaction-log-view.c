@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,6 +8,11 @@
 
 static struct mail_transaction_log *log;
 static struct mail_transaction_log_view *view;
+
+void mail_index_set_error(struct mail_index *index ATTR_UNUSED,
+			  const char *fmt ATTR_UNUSED, ...)
+{
+}
 
 void mail_transaction_log_file_set_corrupted(struct mail_transaction_log_file *file ATTR_UNUSED,
 					     const char *fmt ATTR_UNUSED, ...)
@@ -20,7 +25,8 @@ void mail_transaction_logs_clean(struct mail_transaction_log *log ATTR_UNUSED)
 
 int mail_transaction_log_find_file(struct mail_transaction_log *log,
 				   uint32_t file_seq, bool nfs_flush ATTR_UNUSED,
-				   struct mail_transaction_log_file **file_r)
+				   struct mail_transaction_log_file **file_r,
+				   const char **reason_r)
 {
 	struct mail_transaction_log_file *file;
 
@@ -30,18 +36,21 @@ int mail_transaction_log_find_file(struct mail_transaction_log *log,
 			return 1;
 		}
 	}
+	*reason_r = "not found";
 	return 0;
 }
 
 int mail_transaction_log_file_map(struct mail_transaction_log_file *file ATTR_UNUSED,
-				  uoff_t start_offset ATTR_UNUSED, uoff_t end_offset ATTR_UNUSED)
+				  uoff_t start_offset ATTR_UNUSED, uoff_t end_offset ATTR_UNUSED,
+				  const char **reason_r ATTR_UNUSED)
 {
 	return 1;
 }
 
 int mail_transaction_log_file_get_highest_modseq_at(
 		struct mail_transaction_log_file *file ATTR_UNUSED,
-		uoff_t offset ATTR_UNUSED, uint64_t *highest_modseq_r)
+		uoff_t offset ATTR_UNUSED, uint64_t *highest_modseq_r,
+		const char **error_r ATTR_UNUSED)
 {
 	*highest_modseq_r = 0;
 	return 0;
@@ -49,7 +58,8 @@ int mail_transaction_log_file_get_highest_modseq_at(
 
 void mail_transaction_update_modseq(const struct mail_transaction_header *hdr ATTR_UNUSED,
 				    const void *data ATTR_UNUSED,
-				    uint64_t *cur_modseq)
+				    uint64_t *cur_modseq,
+				    unsigned int version ATTR_UNUSED)
 {
 	*cur_modseq += 1;
 }
@@ -71,8 +81,10 @@ test_transaction_log_file_add(uint32_t file_seq)
 
 	/* files must be sorted by file_seq */
 	for (p = &log->files; *p != NULL; p = &(*p)->next) {
-		if ((*p)->hdr.file_seq > file->hdr.file_seq)
+		if ((*p)->hdr.file_seq > file->hdr.file_seq) {
+			file->next = *p;
 			break;
+		}
 	}
 	*p = file;
 	log->head = file;
@@ -101,7 +113,7 @@ add_append_record(struct mail_transaction_log_file *file,
 	struct mail_transaction_header hdr;
 	size_t size;
 
-	memset(&hdr, 0, sizeof(hdr));
+	i_zero(&hdr);
 	hdr.type = MAIL_TRANSACTION_APPEND | MAIL_TRANSACTION_EXTERNAL;
 	hdr.size = mail_index_uint32_to_offset(sizeof(hdr) + sizeof(*rec));
 
@@ -119,8 +131,10 @@ static void test_mail_transaction_log_view(void)
 	const struct mail_index_record *rec;
 	struct mail_index_record append_rec;
 	const void *data;
+	void *oldfile;
 	uint32_t seq;
 	uoff_t offset, last_log_size;
+	const char *reason;
 	bool reset;
 
 	test_begin("init");
@@ -133,7 +147,7 @@ static void test_mail_transaction_log_view(void)
 	test_transaction_log_file_add(3);
 
 	/* add an append record to the 3rd log file */
-	memset(&append_rec, 0, sizeof(append_rec));
+	i_zero(&append_rec);
 	append_rec.uid = 1;
 
 	last_log_size = sizeof(struct mail_transaction_log_header) +
@@ -148,7 +162,7 @@ static void test_mail_transaction_log_view(void)
 
 	/* we have files 1-3 opened */
 	test_begin("set all");
-	test_assert(mail_transaction_log_view_set(view, 0, 0, (uint32_t)-1, (uoff_t)-1, &reset) == 1 &&
+	test_assert(mail_transaction_log_view_set(view, 0, 0, (uint32_t)-1, (uoff_t)-1, &reset, &reason) == 1 &&
 		    reset && view_is_file_refed(1) && view_is_file_refed(2) &&
 		    view_is_file_refed(3) &&
 		    !mail_transaction_log_view_is_corrupted(view));
@@ -165,7 +179,7 @@ static void test_mail_transaction_log_view(void)
 	test_end();
 
 	test_begin("set first");
-	test_assert(mail_transaction_log_view_set(view, 0, 0, 0, 0, &reset) == 1);
+	test_assert(mail_transaction_log_view_set(view, 0, 0, 0, 0, &reset, &reason) == 1);
 	mail_transaction_log_view_get_prev_pos(view, &seq, &offset);
 	test_assert(seq == 1 && offset == sizeof(struct mail_transaction_log_header));
 	test_assert(mail_transaction_log_view_next(view, &hdr, &data) == 0);
@@ -174,7 +188,7 @@ static void test_mail_transaction_log_view(void)
 	test_end();
 
 	test_begin("set end");
-	test_assert(mail_transaction_log_view_set(view, 3, last_log_size, (uint32_t)-1, (uoff_t)-1, &reset) == 1);
+	test_assert(mail_transaction_log_view_set(view, 3, last_log_size, (uint32_t)-1, (uoff_t)-1, &reset, &reason) == 1);
 	mail_transaction_log_view_get_prev_pos(view, &seq, &offset);
 	test_assert(seq == 3 && offset == last_log_size);
 	test_assert(mail_transaction_log_view_next(view, &hdr, &data) == 0);
@@ -186,25 +200,38 @@ static void test_mail_transaction_log_view(void)
 	mail_transaction_log_view_clear(view, 2);
 	test_assert(!view_is_file_refed(1) && view_is_file_refed(2) &&
 		    view_is_file_refed(3));
+	oldfile = log->files;
+	buffer_free(&log->files->buffer);
 	log->files = log->files->next;
+	i_free(oldfile);
 	test_assert(log->files->hdr.file_seq == 2);
 	test_end();
 
 	/* --- first file has been removed --- */
 
 	test_begin("set 2-3");
-	test_assert(mail_transaction_log_view_set(view, 2, 0, (uint32_t)-1, (uoff_t)-1, &reset) == 1);
+	test_assert(mail_transaction_log_view_set(view, 2, 0, (uint32_t)-1, (uoff_t)-1, &reset, &reason) == 1);
 	test_end();
 
 	test_begin("missing log handing");
-	test_assert(mail_transaction_log_view_set(view, 0, 0, (uint32_t)-1, (uoff_t)-1, &reset) == 0);
+	test_assert(mail_transaction_log_view_set(view, 0, 0, (uint32_t)-1, (uoff_t)-1, &reset, &reason) == 0);
 	test_end();
 
 	test_begin("closed log handling");
 	view->log = NULL;
-	test_assert(mail_transaction_log_view_set(view, 0, 0, (uint32_t)-1, (uoff_t)-1, &reset) == -1);
+	test_assert(mail_transaction_log_view_set(view, 0, 0, (uint32_t)-1, (uoff_t)-1, &reset, &reason) == -1);
 	view->log = log;
 	test_end();
+
+	mail_transaction_log_view_close(&view);
+	i_free(log->index);
+	while (log->files != NULL) {
+		oldfile = log->files;
+		buffer_free(&log->files->buffer);
+		log->files = log->files->next;
+		i_free(oldfile);
+	}
+	i_free(log);
 }
 
 int main(void)

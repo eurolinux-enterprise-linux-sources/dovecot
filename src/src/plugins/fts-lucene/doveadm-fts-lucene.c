@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "doveadm-dump.h"
@@ -21,7 +21,7 @@ static void cmd_dump_fts_lucene(int argc ATTR_UNUSED, char *argv[])
 	const struct lucene_index_record *rec;
 	bool first = TRUE;
 
-	memset(&prev_guid, 0, sizeof(prev_guid));
+	i_zero(&prev_guid);
 	index = lucene_index_init(argv[1], NULL, NULL);
 	iter = lucene_index_iter_init(index);
 	while ((rec = lucene_index_iter_next(iter)) != NULL) {
@@ -34,7 +34,10 @@ static void cmd_dump_fts_lucene(int argc ATTR_UNUSED, char *argv[])
 			memcpy(prev_guid, rec->mailbox_guid, sizeof(prev_guid));
 			printf("%s: ", guid_128_to_string(prev_guid));
 		}
-		printf("%u,", rec->uid);
+		printf("%u", rec->uid);
+		if (rec->part_num != 0)
+			printf("[%u]", rec->part_num);
+		printf("\n");
 	}
 	printf("\n");
 	if (lucene_index_iter_deinit(&iter) < 0)
@@ -50,7 +53,7 @@ static bool test_dump_fts_lucene(const char *path)
 	return stat(path, &st) == 0;
 }
 
-struct doveadm_cmd_dump doveadm_cmd_dump_fts_lucene = {
+static const struct doveadm_cmd_dump doveadm_cmd_dump_fts_lucene = {
 	"fts-lucene",
 	test_dump_fts_lucene,
 	cmd_dump_fts_lucene

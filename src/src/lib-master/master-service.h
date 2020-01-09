@@ -36,16 +36,31 @@ enum master_service_flags {
 };
 
 struct master_service_connection {
+	/* fd of the new connection. */
 	int fd;
+	/* fd of the socket listener. Same as fd for a FIFO. */
 	int listen_fd;
+	/* listener name as in configuration file, or "" if unnamed. */
 	const char *name;
 
-	struct ip_addr remote_ip;
-	unsigned int remote_port;
+	/* Original client/server IP/port. Both of these may have been changed
+	   by the haproxy protocol. */
+	struct ip_addr remote_ip, local_ip;
+	in_port_t remote_port, local_port;
 
+	/* The real client/server IP/port, unchanged by haproxy protocol. */
+	struct ip_addr real_remote_ip, real_local_ip;
+	in_port_t real_remote_port, real_local_port;
+
+	/* This is a FIFO fd. Only a single "connection" is ever received from
+	   a FIFO after the first writer sends something to it. */
 	unsigned int fifo:1;
+	/* Perform immediate SSL handshake for this connection. Currently this
+	   needs to be performed explicitly by each service. */
 	unsigned int ssl:1;
 
+	/* Internal: master_service_client_connection_accept() has been
+	   called for this connection. */
 	unsigned int accepted:1;
 };
 
@@ -63,6 +78,9 @@ master_service_init(const char *name, enum master_service_flags flags,
 /* Call getopt() and handle internal parameters. Return values are the same as
    getopt()'s. */
 int master_getopt(struct master_service *service);
+/* Returns TRUE if str is a valid getopt_str. Currently this only checks for
+   duplicate args so they aren't accidentally added. */
+bool master_getopt_str_is_valid(const char *str);
 /* Parser command line option. Returns TRUE if processed. */
 bool master_service_parse_option(struct master_service *service,
 				 int opt, const char *arg);
@@ -73,11 +91,17 @@ bool master_service_parse_option(struct master_service *service,
    initialization code is finished. */
 void master_service_init_finish(struct master_service *service);
 
+/* import_environment is a space-separated list of environment keys or
+   key=values. The key=values are immediately added to the environment.
+   All the keys are added to DOVECOT_PRESERVE_ENVS environment so they're
+   preserved by master_service_env_clean(). */
+void master_service_import_environment(const char *import_environment);
 /* Clean environment from everything except the ones listed in
    DOVECOT_PRESERVE_ENVS environment. */
 void master_service_env_clean(void);
 
-/* Initialize logging. */
+/* Initialize logging. Only the first call changes the actual logging
+   functions. The following calls change the log prefix. */
 void master_service_init_log(struct master_service *service,
 			     const char *prefix);
 
@@ -125,6 +149,9 @@ void master_service_set_service_count(struct master_service *service,
 unsigned int master_service_get_service_count(struct master_service *service);
 /* Return the number of listener sockets. */
 unsigned int master_service_get_socket_count(struct master_service *service);
+/* Returns the name of the listener socket, or "" if none is specified. */
+const char *master_service_get_socket_name(struct master_service *service,
+					   int listen_fd);
 
 /* Returns configuration file path. */
 const char *master_service_get_config_path(struct master_service *service);
@@ -146,7 +173,8 @@ void master_service_stop_new_connections(struct master_service *service);
 /* Returns TRUE if we've received a SIGINT/SIGTERM and we've decided to stop. */
 bool master_service_is_killed(struct master_service *service);
 /* Returns TRUE if our master process is already stopped. This process may or
-   may not be dying itself. */
+   may not be dying itself. Returns FALSE always if the process was started
+   standalone. */
 bool master_service_is_master_stopped(struct master_service *service);
 
 /* Send command to anvil process, if we have fd to it. */

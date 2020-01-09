@@ -1,9 +1,10 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream.h"
 #include "istream-zlib.h"
 #include "ostream-zlib.h"
+#include "iostream-lz4.h"
 #include "compression.h"
 
 #ifndef HAVE_ZLIB
@@ -19,6 +20,10 @@
 #ifndef HAVE_LZMA
 #  define i_stream_create_lzma NULL
 #  define o_stream_create_lzma NULL
+#endif
+#ifndef HAVE_LZ4
+#  define i_stream_create_lz4 NULL
+#  define o_stream_create_lz4 NULL
 #endif
 
 static bool is_compressed_zlib(struct istream *input)
@@ -63,6 +68,18 @@ static bool is_compressed_xz(struct istream *input)
 	return memcmp(data, "\xfd\x37\x7a\x58\x5a", 6) == 0;
 }
 
+static bool is_compressed_lz4(struct istream *input)
+{
+	const unsigned char *data;
+	size_t size;
+
+	if (i_stream_read_data(input, &data, &size,
+			       IOSTREAM_LZ4_MAGIC_LEN - 1) <= 0)
+		return FALSE;
+	/* there is no standard LZ4 header, so we've created our own */
+	return memcmp(data, IOSTREAM_LZ4_MAGIC, IOSTREAM_LZ4_MAGIC_LEN) == 0;
+}
+
 const struct compression_handler *compression_lookup_handler(const char *name)
 {
 	unsigned int i;
@@ -90,7 +107,8 @@ compression_detect_handler(struct istream *input)
 const struct compression_handler *
 compression_lookup_handler_from_ext(const char *path)
 {
-	unsigned int i, len, path_len = strlen(path);
+	unsigned int i;
+	size_t len, path_len = strlen(path);
 
 	for (i = 0; compression_handlers[i].name != NULL; i++) {
 		if (compression_handlers[i].ext == NULL)
@@ -113,5 +131,7 @@ const struct compression_handler compression_handlers[] = {
 	  i_stream_create_deflate, o_stream_create_deflate },
 	{ "xz", ".xz", is_compressed_xz,
 	  i_stream_create_lzma, o_stream_create_lzma },
+	{ "lz4", ".lz4", is_compressed_lz4,
+	  i_stream_create_lz4, o_stream_create_lz4 },
 	{ NULL, NULL, NULL, NULL, NULL }
 };

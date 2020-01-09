@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING memcached */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING memcached */
 
 #include "lib.h"
 #include "array.h"
@@ -38,7 +38,7 @@ struct memcached_connection {
 	buffer_t *cmd;
 	struct {
 		const unsigned char *value;
-		unsigned int value_len;
+		size_t value_len;
 		enum memcached_response status;
 		bool reply_received;
 	} reply;
@@ -48,7 +48,7 @@ struct memcached_dict {
 	struct dict dict;
 	struct ip_addr ip;
 	char *key_prefix;
-	unsigned int port;
+	in_port_t port;
 	unsigned int timeout_msecs;
 
 	struct ioloop *ioloop;
@@ -169,10 +169,8 @@ static const struct connection_vfuncs memcached_conn_vfuncs = {
 
 static int
 memcached_dict_init(struct dict *driver, const char *uri,
-		    enum dict_data_type value_type ATTR_UNUSED,
-		    const char *username ATTR_UNUSED,
-		    const char *base_dir ATTR_UNUSED, struct dict **dict_r,
-		    const char **error_r)
+		    const struct dict_settings *set ATTR_UNUSED,
+		    struct dict **dict_r, const char **error_r)
 {
 	struct memcached_dict *dict;
 	const char *const *args;
@@ -200,7 +198,7 @@ memcached_dict_init(struct dict *driver, const char *uri,
 				ret = -1;
 			}
 		} else if (strncmp(*args, "port=", 5) == 0) {
-			if (str_to_uint(*args+5, &dict->port) < 0) {
+			if (net_str2port(*args+5, &dict->port) < 0) {
 				*error_r = t_strdup_printf("Invalid port: %s",
 							   *args+5);
 				ret = -1;
@@ -273,13 +271,13 @@ static void memcached_add_header(buffer_t *buf, unsigned int key_len)
 	i_assert(buf->used == MEMCACHED_REQUEST_HDR_LENGTH);
 }
 
-static int
-memcached_dict_lookup_real(struct memcached_dict *dict, pool_t pool,
-			   const char *key, const char **value_r)
+static int memcached_dict_lookup(struct dict *_dict, pool_t pool,
+				 const char *key, const char **value_r)
 {
+	struct memcached_dict *dict = (struct memcached_dict *)_dict;
 	struct ioloop *prev_ioloop = current_ioloop;
 	struct timeout *to;
-	unsigned int key_len;
+	size_t key_len;
 
 	if (strncmp(key, DICT_PATH_SHARED, strlen(DICT_PATH_SHARED)) == 0)
 		key += strlen(DICT_PATH_SHARED);
@@ -291,7 +289,7 @@ memcached_dict_lookup_real(struct memcached_dict *dict, pool_t pool,
 		key = t_strconcat(dict->key_prefix, key, NULL);
 	key_len = strlen(key);
 	if (key_len > 0xffff) {
-		i_error("memcached: Key is too long (%u bytes): %s",
+		i_error("memcached: Key is too long (%"PRIuSIZE_T" bytes): %s",
 			key_len, key);
 		return -1;
 	}
@@ -322,7 +320,7 @@ memcached_dict_lookup_real(struct memcached_dict *dict, pool_t pool,
 				       dict->conn.cmd->data,
 				       dict->conn.cmd->used);
 
-			memset(&dict->conn.reply, 0, sizeof(dict->conn.reply));
+			i_zero(&dict->conn.reply);
 			io_loop_run(dict->ioloop);
 		}
 		timeout_remove(&to);
@@ -362,36 +360,11 @@ memcached_dict_lookup_real(struct memcached_dict *dict, pool_t pool,
 	return -1;
 }
 
-static int memcached_dict_lookup(struct dict *_dict, pool_t pool,
-				 const char *key, const char **value_r)
-{
-	struct memcached_dict *dict = (struct memcached_dict *)_dict;
-	int ret;
-
-	if (pool->datastack_pool)
-		ret = memcached_dict_lookup_real(dict, pool, key, value_r);
-	else T_BEGIN {
-		ret = memcached_dict_lookup_real(dict, pool, key, value_r);
-	} T_END;
-	return ret;
-}
-
 struct dict dict_driver_memcached = {
 	.name = "memcached",
 	{
-		memcached_dict_init,
-		memcached_dict_deinit,
-		NULL,
-		memcached_dict_lookup,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL,
-		NULL
+		.init = memcached_dict_init,
+		.deinit = memcached_dict_deinit,
+		.lookup = memcached_dict_lookup,
 	}
 };

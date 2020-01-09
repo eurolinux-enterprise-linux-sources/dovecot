@@ -1,28 +1,28 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "bsearch-insert-pos.h"
 #include "mail-index-private.h"
 
-#if WORDS_BIGENDIAN
-/* FIXME: Unfortunately these functions were originally written to use
-   endian-specific code and we can't avoid that without breaking backwards
-   compatibility. When we do break it, just select one of these. */
 uint32_t mail_index_uint32_to_offset(uint32_t offset)
 {
 	i_assert(offset < 0x40000000);
 	i_assert((offset & 3) == 0);
 
 	offset >>= 2;
-	return  0x00000080 | ((offset & 0x0000007f)) |
-		0x00008000 | ((offset & 0x00003f80) >> 7 << 8) |
-		0x00800000 | ((offset & 0x001fc000) >> 14 << 16) |
-		0x80000000 | ((offset & 0x0fe00000) >> 21 << 24);
+	offset = 0x00000080 | ((offset & 0x0000007f)) |
+		 0x00008000 | ((offset & 0x00003f80) >> 7 << 8) |
+		 0x00800000 | ((offset & 0x001fc000) >> 14 << 16) |
+		 0x80000000 | ((offset & 0x0fe00000) >> 21 << 24);
+
+	return cpu32_to_be(offset);
 }
 
 uint32_t mail_index_offset_to_uint32(uint32_t offset)
 {
+	offset = be32_to_cpu(offset);
+
 	if ((offset & 0x80808080) != 0x80808080)
 		return 0;
 
@@ -31,30 +31,6 @@ uint32_t mail_index_offset_to_uint32(uint32_t offset)
 		 ((offset & 0x007f0000) >> 16 << 14) |
 		 ((offset & 0x7f000000) >> 24 << 21)) << 2;
 }
-#else
-uint32_t mail_index_uint32_to_offset(uint32_t offset)
-{
-	i_assert(offset < 0x40000000);
-	i_assert((offset & 3) == 0);
-
-	offset >>= 2;
-	return  0x80000000 | ((offset & 0x0000007f) << 24) |
-		0x00800000 | ((offset & 0x00003f80) >> 7 << 16) |
-		0x00008000 | ((offset & 0x001fc000) >> 14 << 8) |
-		0x00000080 | ((offset & 0x0fe00000) >> 21);
-}
-
-uint32_t mail_index_offset_to_uint32(uint32_t offset)
-{
-	if ((offset & 0x80808080) != 0x80808080)
-		return 0;
-
-	return  (((offset & 0x0000007f) << 21) |
-		 ((offset & 0x00007f00) >> 8 << 14) |
-		 ((offset & 0x007f0000) >> 16 << 7) |
-		 ((offset & 0x7f000000) >> 24)) << 2;
-}
-#endif
 
 void mail_index_pack_num(uint8_t **p, uint32_t num)
 {
@@ -116,6 +92,18 @@ bool mail_index_seq_array_lookup(const ARRAY_TYPE(seq_array) *array,
 					mail_index_seq_record_cmp, idx_r);
 }
 
+void mail_index_seq_array_alloc(ARRAY_TYPE(seq_array) *array,
+				size_t record_size)
+{
+	size_t aligned_record_size = (record_size + 3) & ~3;
+
+	i_assert(!array_is_created(array));
+
+	array_create(array, default_pool,
+		     sizeof(uint32_t) + aligned_record_size,
+		     1024 / (sizeof(uint32_t) + aligned_record_size));
+}
+
 bool mail_index_seq_array_add(ARRAY_TYPE(seq_array) *array, uint32_t seq,
 			      const void *record, size_t record_size,
 			      void *old_record)
@@ -126,11 +114,8 @@ bool mail_index_seq_array_add(ARRAY_TYPE(seq_array) *array, uint32_t seq,
 	/* records need to be 32bit aligned */
 	aligned_record_size = (record_size + 3) & ~3;
 
-	if (!array_is_created(array)) {
-		array_create(array, default_pool,
-			     sizeof(seq) + aligned_record_size,
-			     1024 / (sizeof(seq) + aligned_record_size));
-	}
+	if (!array_is_created(array))
+		mail_index_seq_array_alloc(array, record_size);
 	i_assert(array->arr.element_size == sizeof(seq) + aligned_record_size);
 
 	if (mail_index_seq_array_lookup(array, seq, &idx)) {

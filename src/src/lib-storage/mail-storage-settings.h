@@ -7,6 +7,7 @@
 #define MAIL_STORAGE_SET_DRIVER_NAME "MAIL"
 
 struct mail_user;
+struct mail_namespace;
 struct mail_storage;
 
 struct mail_storage_settings {
@@ -20,11 +21,27 @@ struct mail_storage_settings {
 	const char *mail_cache_fields;
 	const char *mail_always_cache_fields;
 	const char *mail_never_cache_fields;
+	const char *mail_server_comment;
+	const char *mail_server_admin;
 	unsigned int mail_cache_min_mail_count;
+	unsigned int mail_cache_unaccessed_field_drop;
+	uoff_t mail_cache_record_max_size;
+	uoff_t mail_cache_compress_min_size;
+	unsigned int mail_cache_compress_delete_percentage;
+	unsigned int mail_cache_compress_continued_percentage;
+	unsigned int mail_cache_compress_header_continue_count;
+	uoff_t mail_index_rewrite_min_log_bytes;
+	uoff_t mail_index_rewrite_max_log_bytes;
+	uoff_t mail_index_log_rotate_min_size;
+	uoff_t mail_index_log_rotate_max_size;
+	unsigned int mail_index_log_rotate_min_age;
+	unsigned int mail_index_log2_max_age;
 	unsigned int mailbox_idle_check_interval;
 	unsigned int mail_max_keyword_length;
 	unsigned int mail_max_lock_timeout;
 	unsigned int mail_temp_scan_interval;
+	unsigned int mail_vsize_bg_after_count;
+	unsigned int mail_sort_max_read_count;
 	bool mail_save_crlf;
 	const char *mail_fsync;
 	bool mmap_disable;
@@ -32,6 +49,8 @@ struct mail_storage_settings {
 	bool mail_nfs_storage;
 	bool mail_nfs_index;
 	bool mailbox_list_index;
+	bool mailbox_list_index_very_dirty_syncs;
+	bool mailbox_list_index_include_inbox;
 	bool mail_debug;
 	bool mail_full_filesystem_access;
 	bool maildir_stat_dirs;
@@ -42,9 +61,14 @@ struct mail_storage_settings {
 	const char *ssl_client_ca_dir;
 	const char *ssl_client_ca_file;
 	const char *ssl_crypto_device;
+	const char *mail_attachment_detection_options;
 
 	enum file_lock_method parsed_lock_method;
 	enum fsync_mode parsed_fsync_mode;
+
+	const char *const *parsed_mail_attachment_content_type_filter;
+	bool parsed_mail_attachment_exclude_inlined;
+	bool parsed_mail_attachment_detection_add_flags_on_save;
 };
 
 struct mail_namespace_settings {
@@ -61,6 +85,7 @@ struct mail_namespace_settings {
 	bool subscriptions;
 	bool ignore_on_failure;
 	bool disabled;
+	unsigned int order;
 
 	ARRAY(struct mailbox_settings *) mailboxes;
 	struct mail_user_settings *user_set;
@@ -76,6 +101,9 @@ struct mailbox_settings {
 	const char *autocreate;
 	const char *special_use;
 	const char *driver;
+	const char *comment;
+	unsigned int autoexpunge;
+	unsigned int autoexpunge_max_mails;
 };
 
 struct mail_user_settings {
@@ -113,8 +141,13 @@ const void *
 mail_user_set_get_driver_settings(const struct setting_parser_info *info,
 				  const struct mail_user_settings *set,
 				  const char *driver);
+
 const struct mail_storage_settings *
 mail_user_set_get_storage_set(struct mail_user *user);
+/* Get storage-specific settings, which may be namespace-specific. */
+const void *mail_namespace_get_driver_settings(struct mail_namespace *ns,
+					       struct mail_storage *storage);
+/* FIXME: Obsolete - remove in v2.3 */
 const void *mail_storage_get_driver_settings(struct mail_storage *storage);
 
 const struct dynamic_settings_parser *

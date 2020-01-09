@@ -6,8 +6,10 @@
 
 enum config_line_type {
 	CONFIG_LINE_TYPE_SKIP,
+	CONFIG_LINE_TYPE_CONTINUE,
 	CONFIG_LINE_TYPE_ERROR,
 	CONFIG_LINE_TYPE_KEYVALUE,
+	CONFIG_LINE_TYPE_KEYVALUE_QUOTED,
 	CONFIG_LINE_TYPE_KEYFILE,
 	CONFIG_LINE_TYPE_KEYVARIABLE,
 	CONFIG_LINE_TYPE_SECTION_BEGIN,
@@ -18,14 +20,16 @@ enum config_line_type {
 
 struct config_section_stack {
 	struct config_section_stack *prev;
+	const char *key;
 
 	struct config_filter filter;
 	/* root=NULL-terminated list of parsers */
 	struct config_module_parser *parsers;
-	unsigned int pathlen;
+	size_t pathlen;
 
 	const char *open_path;
 	unsigned int open_linenum;
+	bool is_filter;
 };
 
 struct input_stack {
@@ -47,18 +51,21 @@ struct config_parser_context {
 	struct input_stack *cur_input;
 
 	string_t *str;
-	unsigned int pathlen;
+	size_t pathlen;
 	unsigned int section_counter;
 	const char *error;
 
 	struct old_set_parser *old;
 
+	HASH_TABLE(const char *, const char *) seen_settings;
 	struct config_filter_context *filter;
 	unsigned int expand_values:1;
 	unsigned int hide_errors:1;
 };
 
 extern void (*hook_config_parser_begin)(struct config_parser_context *ctx);
+extern int (*hook_config_parser_end)(struct config_parser_context *ctx,
+				     const char **error_r);
 
 int config_apply_line(struct config_parser_context *ctx, const char *key,
 		      const char *line, const char *section_name) ATTR_NULL(4);

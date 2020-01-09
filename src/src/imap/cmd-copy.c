@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "str.h"
@@ -28,13 +28,14 @@ static void client_send_sendalive_if_needed(struct client *client)
 	}
 }
 
-static int fetch_and_copy(struct client *client, bool move,
+static int fetch_and_copy(struct client_command_context *cmd, bool move,
 			  struct mailbox_transaction_context *t,
 			  struct mailbox_transaction_context **src_trans_r,
 			  struct mail_search_args *search_args,
 			  const char **src_uidset_r,
 			  unsigned int *copy_count_r)
 {
+	struct client *client = cmd->client;
 	struct mail_search_context *search_ctx;
         struct mailbox_transaction_context *src_trans;
 	struct mail_save_context *save_ctx;
@@ -48,6 +49,7 @@ static int fetch_and_copy(struct client *client, bool move,
 	msgset_generator_init(&srcset_ctx, src_uidset);
 
 	src_trans = mailbox_transaction_begin(client->mailbox, 0);
+	imap_transaction_set_cmd_reason(src_trans, cmd);
 	search_ctx = mailbox_search_init(src_trans, search_args, NULL, 0, NULL);
 
 	ret = 1;
@@ -86,6 +88,19 @@ static int fetch_and_copy(struct client *client, bool move,
 	return ret;
 }
 
+static void copy_update_trashed(struct client *client, struct mailbox *box,
+				unsigned int count)
+{
+	const struct mailbox_settings *set;
+
+	set = mailbox_settings_find(mailbox_get_namespace(box),
+				    mailbox_get_vname(box));
+	if (set != NULL && set->special_use[0] != '\0' &&
+	    str_array_icase_find(t_strsplit_spaces(set->special_use, " "),
+				 "\\Trash"))
+		client->trashed_count += count;
+}
+
 static bool cmd_copy_full(struct client_command_context *cmd, bool move)
 {
 	struct client *client = cmd->client;
@@ -120,7 +135,8 @@ static bool cmd_copy_full(struct client_command_context *cmd, bool move)
 	t = mailbox_transaction_begin(destbox,
 				      MAILBOX_TRANSACTION_FLAG_EXTERNAL |
 				      MAILBOX_TRANSACTION_FLAG_ASSIGN_UIDS);
-	ret = fetch_and_copy(client, move, t, &src_trans, search_args,
+	imap_transaction_set_cmd_reason(t, cmd);
+	ret = fetch_and_copy(cmd, move, t, &src_trans, search_args,
 			     &src_uidset, &copy_count);
 	mail_search_args_unref(&search_args);
 
@@ -147,6 +163,7 @@ static bool cmd_copy_full(struct client_command_context *cmd, bool move)
 		pool_unref(&changes.pool);
 	} else if (move) {
 		i_assert(copy_count == seq_range_count(&changes.saved_uids));
+		copy_update_trashed(client, destbox, copy_count);
 
 		str_printfa(msg, "* OK [COPYUID %u %s ",
 			    changes.uid_validity, src_uidset);
@@ -159,6 +176,7 @@ static bool cmd_copy_full(struct client_command_context *cmd, bool move)
 		pool_unref(&changes.pool);
 	} else {
 		i_assert(copy_count == seq_range_count(&changes.saved_uids));
+		copy_update_trashed(client, destbox, copy_count);
 
 		str_printfa(msg, "OK [COPYUID %u %s ", changes.uid_validity,
 			    src_uidset);

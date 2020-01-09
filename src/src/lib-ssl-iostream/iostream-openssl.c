@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream-private.h"
@@ -12,8 +12,21 @@ static void openssl_iostream_free(struct ssl_iostream *ssl_io);
 static void
 openssl_iostream_set_error(struct ssl_iostream *ssl_io, const char *str)
 {
+	char *new_str;
+
+	/* i_debug() may sometimes be overriden, making it write to this very
+	   same SSL stream, in which case the provided str may be invalidated
+	   before it is even used. Therefore, we duplicate it immediately. */
+	new_str = i_strdup(str);
+
+	if (ssl_io->verbose) {
+		/* This error should normally be logged by lib-ssl-iostream's
+		   caller. But if verbose=TRUE, log it here as well to make
+		   sure that the error is always logged. */
+		i_debug("%sSSL error: %s", ssl_io->log_prefix, new_str);
+	}
 	i_free(ssl_io->last_error);
-	ssl_io->last_error = i_strdup(str);
+	ssl_io->last_error = new_str;
 }
 
 static void openssl_info_callback(const SSL *ssl, int where, int ret)
@@ -29,15 +42,15 @@ static void openssl_info_callback(const SSL *ssl, int where, int ret)
 				SSL_alert_desc_string_long(ret));
 			break;
 		default:
-			i_warning("%sSSL alert: where=0x%x, ret=%d: %s %s",
-				  ssl_io->log_prefix, where, ret,
-				  SSL_alert_type_string_long(ret),
-				  SSL_alert_desc_string_long(ret));
+			i_debug("%sSSL alert: where=0x%x, ret=%d: %s %s",
+				ssl_io->log_prefix, where, ret,
+				SSL_alert_type_string_long(ret),
+				SSL_alert_desc_string_long(ret));
 			break;
 		}
 	} else if (ret == 0) {
-		i_warning("%sSSL failed: where=0x%x: %s",
-			  ssl_io->log_prefix, where, SSL_state_string_long(ssl));
+		i_debug("%sSSL failed: where=0x%x: %s",
+			ssl_io->log_prefix, where, SSL_state_string_long(ssl));
 	} else {
 		i_debug("%sSSL: where=0x%x, ret=%d: %s",
 			ssl_io->log_prefix, where, ret,
@@ -71,7 +84,7 @@ openssl_iostream_use_certificate(struct ssl_iostream *ssl_io, const char *cert,
 
 	if (ret == 0) {
 		*error_r = t_strdup_printf("Can't load ssl_cert: %s",
-			ssl_iostream_get_use_certificate_error(cert));
+			openssl_iostream_use_certificate_error(cert, NULL));
 		return -1;
 	}
 	return 0;
@@ -109,7 +122,7 @@ openssl_iostream_verify_client_cert(int preverify_ok, X509_STORE_CTX *ctx)
 	ssl_io = SSL_get_ex_data(ssl, dovecot_ssl_extdata_index);
 	ssl_io->cert_received = TRUE;
 
-	subject = X509_get_subject_name(ctx->current_cert);
+	subject = X509_get_subject_name(X509_STORE_CTX_get_current_cert(ctx));
 	if (subject == NULL ||
 	    X509_NAME_oneline(subject, certname, sizeof(certname)) == NULL)
 		certname[0] = '\0';
@@ -118,7 +131,7 @@ openssl_iostream_verify_client_cert(int preverify_ok, X509_STORE_CTX *ctx)
 	if (!preverify_ok) {
 		openssl_iostream_set_error(ssl_io, t_strdup_printf(
 			"Received invalid SSL certificate: %s: %s",
-			X509_verify_cert_error_string(ctx->error), certname));
+			X509_verify_cert_error_string(X509_STORE_CTX_get_error(ctx)), certname));
 		if (ssl_io->verbose_invalid_cert)
 			i_info("%s", ssl_io->last_error);
 	} else if (ssl_io->verbose) {
@@ -157,9 +170,28 @@ openssl_iostream_set(struct ssl_iostream *ssl_io,
 	if (set->prefer_server_ciphers)
 		SSL_set_options(ssl_io->ssl, SSL_OP_CIPHER_SERVER_PREFERENCE);
 	if (set->protocols != NULL) {
+#if defined(HAVE_SSL_CLEAR_OPTIONS)
 		SSL_clear_options(ssl_io->ssl, OPENSSL_ALL_PROTOCOL_OPTIONS);
+#endif
+#ifdef HAVE_SSL_CTX_SET_MIN_PROTO_VERSION
+		int min_protocol;
+		const char *error;
+		if (ssl_protocols_to_min_protocol(set->protocols,
+						  &min_protocol, &error) < 0) {
+			*error_r = t_strdup_printf(
+				"Unknown ssl_protocols setting: %s", error);
+			return -1;
+		} else if (SSL_set_min_proto_version(ssl_io->ssl,
+						     min_protocol) != 1) {
+			*error_r = t_strdup_printf(
+				"Failed to set SSL minimum protocol version to %d",
+				min_protocol);
+			return -1;
+		}
+#else
 		SSL_set_options(ssl_io->ssl,
 				openssl_get_protocol_options(set->protocols));
+#endif
 	}
 
 	if (set->cert != NULL && strcmp(ctx_set->cert, set->cert) != 0) {
@@ -234,7 +266,7 @@ openssl_iostream_create(struct ssl_iostream_context *ctx, const char *host,
 	ssl_io->bio_ext = bio_ext;
 	ssl_io->plain_input = *input;
 	ssl_io->plain_output = *output;
-	ssl_io->host = i_strdup(host);
+	ssl_io->connected_host = i_strdup(host);
 	ssl_io->log_prefix = host == NULL ? i_strdup("") :
 		i_strdup_printf("%s: ", host);
 	/* bio_int will be freed by SSL_free() */
@@ -261,6 +293,7 @@ openssl_iostream_create(struct ssl_iostream_context *ctx, const char *host,
 	if (ssl_io->plain_output->real_stream->error_handling_disabled)
 		o_stream_set_no_error_handling(*output, TRUE);
 
+	ssl_io->ssl_input = *input;
 	ssl_io->ssl_output = *output;
 	*iostream_r = ssl_io;
 	return 0;
@@ -274,7 +307,8 @@ static void openssl_iostream_free(struct ssl_iostream *ssl_io)
 	SSL_free(ssl_io->ssl);
 	i_free(ssl_io->plain_stream_errstr);
 	i_free(ssl_io->last_error);
-	i_free(ssl_io->host);
+	i_free(ssl_io->connected_host);
+	i_free(ssl_io->sni_host);
 	i_free(ssl_io->log_prefix);
 	i_free(ssl_io);
 }
@@ -290,9 +324,17 @@ static void openssl_iostream_unref(struct ssl_iostream *ssl_io)
 
 static void openssl_iostream_destroy(struct ssl_iostream *ssl_io)
 {
-	(void)SSL_shutdown(ssl_io->ssl);
+	if (SSL_shutdown(ssl_io->ssl) != 1) {
+		/* if bidirectional shutdown fails we need to clear
+		   the error queue */
+		openssl_iostream_clear_errors();
+	}
 	(void)openssl_iostream_more(ssl_io);
 	(void)o_stream_flush(ssl_io->plain_output);
+	/* close the plain i/o streams, because their fd may be closed soon,
+	   but we may still keep this ssl-iostream referenced until later. */
+	i_stream_close(ssl_io->plain_input);
+	o_stream_close(ssl_io->plain_output);
 
 	ssl_iostream_unref(&ssl_io);
 }
@@ -382,11 +424,13 @@ static bool openssl_iostream_bio_input(struct ssl_iostream *ssl_io)
 		ret = openssl_iostream_read_more(ssl_io, &data, &size);
 		ssl_io->plain_input->real_stream->try_alloc_limit = 0;
 		if (ret == -1 && size == 0 && !bytes_read) {
-			i_free(ssl_io->plain_stream_errstr);
-			ssl_io->plain_stream_errstr =
-				i_strdup(i_stream_get_error(ssl_io->plain_input));
-			ssl_io->plain_stream_errno =
-				ssl_io->plain_input->stream_errno;
+			if (ssl_io->plain_input->stream_errno != 0) {
+				i_free(ssl_io->plain_stream_errstr);
+				ssl_io->plain_stream_errstr =
+					i_strdup(i_stream_get_error(ssl_io->plain_input));
+				ssl_io->plain_stream_errno =
+					ssl_io->plain_input->stream_errno;
+			}
 			ssl_io->closed = TRUE;
 			return FALSE;
 		}
@@ -427,6 +471,7 @@ static bool openssl_iostream_bio_input(struct ssl_iostream *ssl_io)
 			ssl_io->ostream_flush_waiting_input = FALSE;
 			o_stream_set_flush_pending(ssl_io->plain_output, TRUE);
 		}
+		i_stream_set_input_pending(ssl_io->ssl_input, TRUE);
 		ssl_io->want_read = FALSE;
 	}
 	return bytes_read;
@@ -498,7 +543,7 @@ openssl_iostream_handle_error_full(struct ssl_iostream *ssl_io, int ret,
 			errstr = strerror(errno);
 		} else {
 			/* EOF. */
-			errno = ECONNRESET;
+			errno = EPIPE;
 			errstr = "Disconnected";
 			break;
 		}
@@ -507,7 +552,7 @@ openssl_iostream_handle_error_full(struct ssl_iostream *ssl_io, int ret,
 		break;
 	case SSL_ERROR_ZERO_RETURN:
 		/* clean connection closing */
-		errno = ECONNRESET;
+		errno = EPIPE;
 		i_free_and_null(ssl_io->last_error);
 		return -1;
 	case SSL_ERROR_SSL:
@@ -577,13 +622,22 @@ static int openssl_iostream_handshake(struct ssl_iostream *ssl_io)
 	if (ssl_io->handshake_callback != NULL) {
 		if (ssl_io->handshake_callback(&error, ssl_io->handshake_context) < 0) {
 			i_assert(error != NULL);
-			i_stream_close(ssl_io->plain_input);
-			o_stream_close(ssl_io->plain_output);
 			openssl_iostream_set_error(ssl_io, error);
 			ssl_io->handshake_failed = TRUE;
-			errno = EINVAL;
-			return -1;
 		}
+	} else if (ssl_io->connected_host != NULL && !ssl_io->handshake_failed) {
+		if (ssl_iostream_cert_match_name(ssl_io, ssl_io->connected_host) < 0) {
+			openssl_iostream_set_error(ssl_io, t_strdup_printf(
+				"SSL certificate doesn't match expected host name %s",
+				ssl_io->connected_host));
+			ssl_io->handshake_failed = TRUE;
+		}
+	}
+	if (ssl_io->handshake_failed) {
+		i_stream_close(ssl_io->plain_input);
+		o_stream_close(ssl_io->plain_output);
+		errno = EINVAL;
+		return -1;
 	}
 	i_free_and_null(ssl_io->last_error);
 	ssl_io->handshaked = TRUE;
@@ -668,14 +722,14 @@ openssl_iostream_get_peer_name(struct ssl_iostream *ssl_io)
 
 static const char *openssl_iostream_get_server_name(struct ssl_iostream *ssl_io)
 {
-	return ssl_io->host;
+	return ssl_io->sni_host;
 }
 
 static const char *
 openssl_iostream_get_security_string(struct ssl_iostream *ssl_io)
 {
 	const SSL_CIPHER *cipher;
-#ifdef HAVE_SSL_COMPRESSION
+#if defined(HAVE_SSL_COMPRESSION) && !defined(OPENSSL_NO_COMP)
 	const COMP_METHOD *comp;
 #endif
 	const char *comp_str;
@@ -686,7 +740,7 @@ openssl_iostream_get_security_string(struct ssl_iostream *ssl_io)
 
 	cipher = SSL_get_current_cipher(ssl_io->ssl);
 	bits = SSL_CIPHER_get_bits(cipher, &alg_bits);
-#ifdef HAVE_SSL_COMPRESSION
+#if defined(HAVE_SSL_COMPRESSION) && !defined(OPENSSL_NO_COMP)
 	comp = SSL_get_current_compression(ssl_io->ssl);
 	comp_str = comp == NULL ? "" :
 		t_strconcat(" ", SSL_COMP_get_name(comp), NULL);
@@ -705,9 +759,7 @@ openssl_iostream_get_last_error(struct ssl_iostream *ssl_io)
 	return ssl_io->last_error;
 }
 
-const struct iostream_ssl_vfuncs ssl_vfuncs = {
-	openssl_iostream_global_deinit,
-
+static const struct iostream_ssl_vfuncs ssl_vfuncs = {
 	openssl_iostream_context_init_client,
 	openssl_iostream_context_init_server,
 	openssl_iostream_context_deinit,
@@ -733,3 +785,13 @@ const struct iostream_ssl_vfuncs ssl_vfuncs = {
 	openssl_iostream_get_security_string,
 	openssl_iostream_get_last_error
 };
+
+void ssl_iostream_openssl_init(void)
+{
+	iostream_ssl_module_init(&ssl_vfuncs);
+}
+
+void ssl_iostream_openssl_deinit(void)
+{
+	openssl_iostream_global_deinit();
+}

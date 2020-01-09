@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,6 +7,22 @@
 #include "mailbox-list-private.h"
 #include "index-storage.h"
 #include "index-rebuild.h"
+
+static void
+index_index_copy_vsize(struct index_rebuild_context *ctx,
+		       struct mail_index_view *view,
+		       uint32_t old_seq, uint32_t new_seq)
+{
+	const void *data;
+	bool expunged;
+
+	mail_index_lookup_ext(view, old_seq, ctx->box->mail_vsize_ext_id,
+			      &data, &expunged);
+	if (data != NULL && !expunged) {
+		mail_index_update_ext(ctx->trans, new_seq,
+				      ctx->box->mail_vsize_ext_id, data, NULL);
+	}
+}
 
 static void
 index_index_copy_cache(struct index_rebuild_context *ctx,
@@ -70,6 +86,7 @@ index_index_copy_from_old(struct index_rebuild_context *ctx,
 	modseq = mail_index_modseq_lookup(view, old_seq);
 	mail_index_update_modseq(ctx->trans, new_seq, modseq);
 
+	index_index_copy_vsize(ctx, view, old_seq, new_seq);
 	index_index_copy_cache(ctx, view, old_seq, new_seq);
 }
 
@@ -98,7 +115,7 @@ index_rebuild_header(struct index_rebuild_context *ctx,
 	struct mail_index *index = mail_index_view_get_index(ctx->view);
 	struct mail_index_modseq_header modseq_hdr;
 	struct mail_index_view *trans_view;
-	uint32_t uid_validity, next_uid;
+	uint32_t uid_validity, next_uid, first_recent_uid;
 	uint64_t modseq;
 
 	hdr = mail_index_get_header(ctx->view);
@@ -131,8 +148,19 @@ index_rebuild_header(struct index_rebuild_context *ctx,
 			&next_uid, sizeof(next_uid), FALSE);
 	}
 
+	/* set first_recent_uid */
+	first_recent_uid = hdr->first_recent_uid;
+	if (backup_hdr != NULL &&
+	    backup_hdr->first_recent_uid > first_recent_uid &&
+	    backup_hdr->first_recent_uid <= next_uid)
+		first_recent_uid = backup_hdr->first_recent_uid;
+	first_recent_uid = I_MIN(first_recent_uid, next_uid);
+	mail_index_update_header(ctx->trans,
+		offsetof(struct mail_index_header, first_recent_uid),
+		&first_recent_uid, sizeof(first_recent_uid), FALSE);
+
 	/* set highest-modseq */
-	memset(&modseq_hdr, 0, sizeof(modseq_hdr));
+	i_zero(&modseq_hdr);
 	modseq_hdr.highest_modseq = mail_index_modseq_get_highest(ctx->view);
 	if (ctx->backup_view != NULL) {
 		modseq = mail_index_modseq_get_highest(ctx->backup_view);
@@ -142,6 +170,25 @@ index_rebuild_header(struct index_rebuild_context *ctx,
 	mail_index_update_header_ext(ctx->trans, index->modseq_ext_id,
 				     0, &modseq_hdr, sizeof(modseq_hdr));
 	mail_index_view_close(&trans_view);
+}
+
+static void
+index_rebuild_box_name_header(struct index_rebuild_context *ctx)
+{
+	const void *name_hdr;
+	size_t name_hdr_size;
+
+	mail_index_get_header_ext(ctx->view, ctx->box->box_name_hdr_ext_id,
+				  &name_hdr, &name_hdr_size);
+	if (name_hdr_size == 0 && ctx->backup_view != NULL) {
+		mail_index_get_header_ext(ctx->backup_view,
+					  ctx->box->box_name_hdr_ext_id,
+					  &name_hdr, &name_hdr_size);
+	}
+	if (name_hdr_size == 0)
+		return;
+	mail_index_update_header_ext(ctx->trans, ctx->box->box_name_hdr_ext_id,
+				     0, name_hdr, name_hdr_size);
 }
 
 struct index_rebuild_context *
@@ -157,19 +204,14 @@ index_index_rebuild_init(struct mailbox *box, struct mail_index_view *view,
 	ctx->view = view;
 	ctx->trans = trans;
 	mail_index_reset(ctx->trans);
-	index_mailbox_reset_uidvalidity(box);
+	mailbox_recent_flags_reset(box);
 	(void)mail_index_ext_lookup(box->index, "cache", &ctx->cache_ext_id);
 
-	/* open cache and read the caching decisions. we'll reset the cache in
-	   case it contains any invalid data, but we want to preserve the
-	   decisions. */
+	/* open cache and read the caching decisions. */
 	(void)mail_cache_open_and_verify(ctx->box->cache);
-	mail_cache_reset(box->cache);
 
 	/* if backup index file exists, try to use it */
-	if (mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_INDEX,
-				&index_dir) <= 0)
-		i_unreached();
+	index_dir = mailbox_get_index_path(box);
 	backup_path = t_strconcat(box->index_prefix, ".backup", NULL);
 	ctx->backup_index = mail_index_alloc(index_dir, backup_path);
 
@@ -191,12 +233,21 @@ void index_index_rebuild_deinit(struct index_rebuild_context **_ctx,
 				index_rebuild_generate_uidvalidity_t *cb)
 {
 	struct index_rebuild_context *ctx = *_ctx;
+	struct mail_cache_compress_lock *lock = NULL;
 
 	*_ctx = NULL;
 
 	/* initialize cache file with the old field decisions */
-	(void)mail_cache_compress(ctx->box->cache, ctx->trans);
+	(void)mail_cache_compress(ctx->box->cache, ctx->trans, &lock);
+	if (lock != NULL) {
+		/* FIXME: this is a bit too early. ideally we should return it
+		   from this function and unlock only after the transaction is
+		   committed, but it would be an API change and this rebuilding
+		   isn't happening normally anyway. */
+		mail_cache_compress_unlock(&lock);
+	}
 	index_rebuild_header(ctx, cb);
+	index_rebuild_box_name_header(ctx);
 	if (ctx->backup_index != NULL) {
 		mail_index_view_close(&ctx->backup_view);
 		mail_index_close(ctx->backup_index);

@@ -1,10 +1,10 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
 #include "restrict-access.h"
 #include "master-interface.h"
-#include "master-service.h"
+#include "master-service-private.h"
 #include "master-service-settings.h"
 #include "log-error-buffer.h"
 #include "log-connection.h"
@@ -12,11 +12,13 @@
 
 #include <unistd.h>
 
+bool verbose_proctitle;
 static struct log_error_buffer *errorbuf;
 
 static void
 sig_reopen_logs(const siginfo_t *si ATTR_UNUSED, void *context ATTR_UNUSED)
 {
+	master_service->log_initialized = FALSE;
 	master_service_init_log(master_service, "log: ");
 }
 
@@ -70,6 +72,8 @@ int main(int argc, char *argv[])
 						NULL, &error) < 0)
 		i_fatal("Error reading configuration: %s", error);
 	master_service_init_log(master_service, "log: ");
+
+	verbose_proctitle = master_service_settings_get(master_service)->verbose_proctitle;
 
 	restrict_access_by_env(NULL, FALSE);
 	restrict_access_allow_coredumps(TRUE);

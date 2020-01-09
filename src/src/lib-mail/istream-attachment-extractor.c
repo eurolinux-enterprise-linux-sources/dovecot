@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream-private.h"
@@ -59,7 +59,6 @@ struct attachment_istream {
 	struct attachment_istream_part part;
 
 	bool retry_read;
-	bool failed;
 };
 
 static void stream_add_data(struct attachment_istream *astream,
@@ -77,17 +76,18 @@ static void parse_content_type(struct attachment_istream *astream,
 	struct rfc822_parser_context parser;
 	string_t *content_type;
 
+	if (astream->part.content_type != NULL)
+		return;
+
 	rfc822_parser_init(&parser, hdr->full_value, hdr->full_value_len, NULL);
 	rfc822_skip_lwsp(&parser);
 
 	T_BEGIN {
 		content_type = t_str_new(64);
-		if (rfc822_parse_content_type(&parser, content_type) >= 0) {
-			i_free(astream->part.content_type);
-			astream->part.content_type =
-				i_strdup(str_c(content_type));
-		}
+		(void)rfc822_parse_content_type(&parser, content_type);
+		astream->part.content_type = i_strdup(str_c(content_type));
 	} T_END;
+	rfc822_parser_deinit(&parser);
 }
 
 static void
@@ -139,7 +139,7 @@ static bool astream_want_attachment(struct attachment_istream *astream,
 	if (astream->set.want_attachment == NULL)
 		return TRUE;
 
-	memset(&ahdr, 0, sizeof(ahdr));
+	i_zero(&ahdr);
 	ahdr.part = part;
 	ahdr.content_type = astream->part.content_type;
 	ahdr.content_disposition = astream->part.content_disposition;
@@ -148,6 +148,10 @@ static bool astream_want_attachment(struct attachment_istream *astream,
 
 static int astream_base64_decode_lf(struct attachment_istream_part *part)
 {
+	if (part->base64_have_crlf && part->base64_state != BASE64_STATE_CR) {
+		/* mixed LF vs CRLFs */
+		return -1;
+	}
 	part->base64_state = BASE64_STATE_0;
 	if (part->cur_base64_blocks < part->base64_line_blocks) {
 		/* last line */
@@ -204,6 +208,12 @@ astream_try_base64_decode_char(struct attachment_istream_part *part,
 		} else if (chr == '=') {
 			part->base64_state = BASE64_STATE_EOM;
 			part->cur_base64_blocks++;
+
+			if (part->cur_base64_blocks > part->base64_line_blocks &&
+			    part->base64_line_blocks > 0) {
+				/* too many blocks */
+				return -1;
+			}
 			return 0;
 		} else {
 			return -1;
@@ -212,7 +222,13 @@ astream_try_base64_decode_char(struct attachment_istream_part *part,
 	case BASE64_STATE_CR:
 		if (chr != '\n')
 			return -1;
-		part->base64_have_crlf = TRUE;
+		if (!part->base64_have_crlf) {
+			if (part->base64_line_blocks != 0) {
+				/* mixed LF vs CRLFs */
+				return -1;
+			}
+			part->base64_have_crlf = TRUE;
+		}
 		return astream_base64_decode_lf(part);
 	case BASE64_STATE_EOB:
 		if (chr != '=')
@@ -221,6 +237,12 @@ astream_try_base64_decode_char(struct attachment_istream_part *part,
 		part->base64_bytes = part->temp_output->offset + pos + 1;
 		part->base64_state = BASE64_STATE_EOM;
 		part->cur_base64_blocks++;
+
+		if (part->cur_base64_blocks > part->base64_line_blocks &&
+		    part->base64_line_blocks > 0) {
+			/* too many blocks */
+			return -1;
+		}
 		return 0;
 	case BASE64_STATE_EOM:
 		i_unreached();
@@ -305,7 +327,7 @@ static void astream_add_body(struct attachment_istream *astream,
 		o_stream_nsend(part->temp_output,
 			       part_buf->data, part_buf->used);
 		buffer_set_used_size(part_buf, 0);
-		/* fall through to write the new data to temp file */
+		/* fall through - write the new data to temp file */
 	case MAIL_ATTACHMENT_STATE_YES:
 		astream_try_base64_decode(part, block->data, block->size);
 		hash_format_loop(astream->set.hash_format,
@@ -353,8 +375,9 @@ static int astream_decode_base64(struct attachment_istream *astream)
 	o_stream_cork(output);
 
 	hash_format_reset(astream->set.hash_format);
-	while ((ret = i_stream_read(base64_input)) > 0) {
-		data = i_stream_get_data(base64_input, &size);
+	size_t bytes_needed = 1;
+	while ((ret = i_stream_read_bytes(base64_input, &data, &size,
+					  bytes_needed)) > 0) {
 		buffer_set_used_size(buf, 0);
 		if (base64_decode(data, size, &size, buf) < 0) {
 			i_error("istream-attachment: BUG: "
@@ -366,17 +389,19 @@ static int astream_decode_base64(struct attachment_istream *astream)
 		o_stream_nsend(output, buf->data, buf->used);
 		hash_format_loop(astream->set.hash_format,
 				 buf->data, buf->used);
+		bytes_needed = i_stream_get_data_size(base64_input) + 1;
 	}
 	if (ret != -1) {
 		i_assert(failed);
 	} else if (base64_input->stream_errno != 0) {
-		i_error("istream-attachment: read(%s) failed: %m",
-			i_stream_get_name(base64_input));
+		i_error("istream-attachment: read(%s) failed: %s",
+			i_stream_get_name(base64_input),
+			i_stream_get_error(base64_input));
 		failed = TRUE;
 	}
 	if (o_stream_nfinish(output) < 0) {
-		i_error("istream-attachment: write(%s) failed: %m",
-			o_stream_get_name(output));
+		i_error("istream-attachment: write(%s) failed: %s",
+			o_stream_get_name(output), o_stream_get_error(output));
 		failed = TRUE;
 	}
 
@@ -393,8 +418,9 @@ static int astream_decode_base64(struct attachment_istream *astream)
 		}
 		i_assert(ret == -1);
 		if (input->stream_errno != 0) {
-			i_error("istream-attachment: read(%s) failed: %m",
-				i_stream_get_name(base64_input));
+			i_error("istream-attachment: read(%s) failed: %s",
+				i_stream_get_name(input),
+				i_stream_get_error(input));
 			failed = TRUE;
 		}
 	}
@@ -436,7 +462,7 @@ astream_part_finish(struct attachment_istream *astream, const char **error_r)
 		return -1;
 	}
 
-	memset(&info, 0, sizeof(info));
+	i_zero(&info);
 	info.start_offset = astream->part.start_offset;
 	/* base64_bytes contains how many valid base64 bytes there are so far.
 	   if the base64 ends properly, it'll specify how much of the MIME part
@@ -518,7 +544,7 @@ static void astream_part_reset(struct attachment_istream *astream)
 	if (part->part_buf != NULL)
 		buffer_free(&part->part_buf);
 
-	memset(part, 0, sizeof(*part));
+	i_zero(part);
 	part->temp_fd = -1;
 	hash_format_reset(astream->set.hash_format);
 }
@@ -570,13 +596,8 @@ static int astream_read_next(struct attachment_istream *astream, bool *retry_r)
 
 	*retry_r = FALSE;
 
-	if (stream->pos - stream->skip >= stream->max_buffer_size)
+	if (stream->pos - stream->skip >= i_stream_get_max_buffer_size(&stream->istream))
 		return -2;
-
-	if (astream->failed) {
-		stream->istream.stream_errno = EINVAL;
-		return -1;
-	}
 
 	old_size = stream->pos - stream->skip;
 	switch (message_parser_parse_next_block(astream->parser, &block)) {
@@ -593,8 +614,7 @@ static int astream_read_next(struct attachment_istream *astream, bool *retry_r)
 
 		if (ret < 0) {
 			io_stream_set_error(&stream->iostream, "%s", error);
-			stream->istream.stream_errno = EINVAL;
-			astream->failed = TRUE;
+			stream->istream.stream_errno = EIO;
 		}
 		astream->cur_part = NULL;
 		return -1;
@@ -609,8 +629,7 @@ static int astream_read_next(struct attachment_istream *astream, bool *retry_r)
 		/* end of a MIME part */
 		if (astream_end_of_part(astream, &error) < 0) {
 			io_stream_set_error(&stream->iostream, "%s", error);
-			stream->istream.stream_errno = EINVAL;
-			astream->failed = TRUE;
+			stream->istream.stream_errno = EIO;
 			return -1;
 		}
 	}
@@ -655,11 +674,10 @@ static void i_stream_attachment_extractor_close(struct iostream_private *stream,
 	struct attachment_istream *astream =
 		(struct attachment_istream *)stream;
 	struct message_part *parts;
-	int ret;
 
 	if (astream->parser != NULL) {
-		ret = message_parser_deinit(&astream->parser, &parts);
-		i_assert(ret == 0); /* we didn't use preparsed message_parts */
+		if (message_parser_deinit(&astream->parser, &parts) < 0)
+			i_unreached(); /* we didn't use preparsed message_parts */
 	}
 	hash_format_deinit_free(&astream->set.hash_format);
 	if (astream->pool != NULL)

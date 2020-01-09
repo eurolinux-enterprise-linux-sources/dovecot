@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,6 +6,7 @@
 #include "master-service-settings.h"
 #include "config-parser.h"
 #include "config-filter.h"
+#include "dns-util.h"
 
 struct config_filter_context {
 	pool_t pool;
@@ -30,13 +31,34 @@ static bool config_filter_match_service(const struct config_filter *mask,
 	return TRUE;
 }
 
+static bool
+config_filter_match_local_name(const struct config_filter *mask,
+			       const char *filter_local_name)
+{
+	/* Handle multiple names seperated by spaces in local_name
+	   * Ex: local_name "mail.domain.tld domain.tld mx.domain.tld" { ... } */
+	const char *ptr, *local_name = mask->local_name;
+	while((ptr = strchr(local_name, ' ')) != NULL) {
+		if (dns_match_wildcard(filter_local_name,
+		    t_strdup_until(local_name, ptr)) == 0)
+			return TRUE;
+		local_name = ptr+1;
+	}
+	return dns_match_wildcard(filter_local_name, local_name) == 0;
+}
+
 static bool config_filter_match_rest(const struct config_filter *mask,
 				     const struct config_filter *filter)
 {
+	bool matched;
+
 	if (mask->local_name != NULL) {
 		if (filter->local_name == NULL)
 			return FALSE;
-		if (strcmp(filter->local_name, mask->local_name) != 0)
+		T_BEGIN {
+			matched = config_filter_match_local_name(mask, filter->local_name);
+		} T_END;
+		if (!matched)
 			return FALSE;
 	}
 	/* FIXME: it's not comparing full masks */
@@ -82,7 +104,7 @@ bool config_filters_equal(const struct config_filter *f1,
 	if (!net_ip_compare(&f1->local_net, &f2->local_net))
 		return FALSE;
 
-	if (null_strcmp(f1->local_name, f2->local_name) != 0)
+	if (null_strcasecmp(f1->local_name, f2->local_name) != 0)
 		return FALSE;
 
 	return TRUE;
@@ -185,7 +207,7 @@ static bool have_changed_settings(const struct config_filter_parser *parser,
 }
 
 static struct config_filter_parser *const *
-config_filter_find_all(struct config_filter_context *ctx,
+config_filter_find_all(struct config_filter_context *ctx, pool_t pool,
 		       const char *const *modules,
 		       const struct config_filter *filter,
 		       struct master_service_settings_output *output_r)
@@ -194,10 +216,10 @@ config_filter_find_all(struct config_filter_context *ctx,
 	ARRAY_TYPE(const_string) service_names;
 	unsigned int i;
 
-	memset(output_r, 0, sizeof(*output_r));
+	i_zero(output_r);
 
-	t_array_init(&matches, 8);
-	t_array_init(&service_names, 8);
+	p_array_init(&matches, pool, 8);
+	p_array_init(&service_names, pool, 8);
 	for (i = 0; ctx->parsers[i] != NULL; i++) {
 		const struct config_filter *mask = &ctx->parsers[i]->filter;
 
@@ -228,6 +250,21 @@ config_filter_find_all(struct config_filter_context *ctx,
 	array_sort(&matches, config_filter_parser_cmp);
 	array_append_zero(&matches);
 	return array_idx(&matches, 0);
+}
+
+struct config_filter_parser *const *
+config_filter_get_all(struct config_filter_context *ctx)
+{
+	ARRAY_TYPE(config_filter_parsers) filters;
+	unsigned int i;
+
+	t_array_init(&filters, 8);
+	for (i = 0; ctx->parsers[i] != NULL; i++) {
+		array_append(&filters, &ctx->parsers[i], 1);
+	}
+	array_sort(&filters, config_filter_parser_cmp_rev);
+	array_append_zero(&filters);
+	return array_idx(&filters, 0);
 }
 
 struct config_filter_parser *const *
@@ -322,7 +359,7 @@ int config_filter_parsers_get(struct config_filter_context *ctx, pool_t pool,
 	   with an error. Merging SET_STRLIST types requires
 	   settings_parser_apply_changes() to work a bit unintuitively by
 	   letting the destination settings override the source settings. */
-	src = config_filter_find_all(ctx, modules, filter, output_r);
+	src = config_filter_find_all(ctx, pool, modules, filter, output_r);
 
 	/* all of them should have the same number of parsers.
 	   duplicate our initial parsers from the first match */

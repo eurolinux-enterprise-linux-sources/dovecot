@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "hostpid.h"
@@ -16,9 +16,16 @@
 struct index_mailbox_list {
 	struct mailbox_list list;
 	const char *temp_prefix;
+
+	const char *create_mailbox_name;
+	guid_128_t create_mailbox_guid;
 };
 
 extern struct mailbox_list index_mailbox_list;
+
+static int
+index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
+			  struct mailbox_list *_newlist, const char *newname);
 
 static struct mailbox_list *index_list_alloc(void)
 {
@@ -47,7 +54,7 @@ static int index_list_init(struct mailbox_list *_list, const char **error_r)
 	if (mailbox_list_get_root_path(_list, MAILBOX_LIST_PATH_TYPE_INDEX, &dir) &&
 	    mailbox_list_mkdir_root(_list, dir, MAILBOX_LIST_PATH_TYPE_INDEX) < 0) {
 		*error_r = t_strdup_printf("Failed to create the index root directory: %s",
-					   mailbox_list_get_last_error(_list, NULL));
+					   mailbox_list_get_last_internal_error(_list, NULL));
 		return -1;
 	}
 	return 0;
@@ -60,39 +67,46 @@ static void index_list_deinit(struct mailbox_list *_list)
 	pool_unref(&list->list.pool);
 }
 
-static char index_list_get_hierarchy_sep(struct mailbox_list *list ATTR_UNUSED)
+static char index_list_get_hierarchy_sep(struct mailbox_list *list)
 {
-	return MAILBOX_LIST_INDEX_HIERARHCY_SEP;
+	return *list->ns->set->separator != '\0' ? *list->ns->set->separator :
+		MAILBOX_LIST_INDEX_HIERARHCY_SEP;
 }
 
 static int
-index_list_get_node(struct index_mailbox_list *list, const char *name,
-		    struct mailbox_list_index_node **node_r)
+index_list_get_refreshed_node_seq(struct index_mailbox_list *list,
+				  struct mail_index_view *view,
+				  const char *name,
+				  struct mailbox_list_index_node **node_r,
+				  uint32_t *seq_r)
 {
-	struct mailbox_list_index_node *node;
+	unsigned int i;
 
-	if (mailbox_list_index_refresh(&list->list) < 0)
-		return -1;
+	*node_r = NULL;
+	*seq_r = 0;
 
-	node = mailbox_list_index_lookup(&list->list, name);
-	if (node == NULL)
-		return 0;
-	*node_r = node;
-	return 1;
+	for (i = 0; i < 2; i++) {
+		*node_r = mailbox_list_index_lookup(&list->list, name);
+		if (*node_r == NULL)
+			return 0;
+		if (mail_index_lookup_seq(view, (*node_r)->uid, seq_r))
+			return 1;
+		/* mailbox was just expunged. refreshing should notice it. */
+		if (mailbox_list_index_refresh_force(&list->list) < 0)
+			return -1;
+	}
+	i_panic("mailbox list index: refreshing doesn't lose expunged uid=%u",
+		(*node_r)->uid);
+	return -1;
 }
 
 static const char *
 index_get_guid_path(struct mailbox_list *_list, const char *root_dir,
 		    const guid_128_t mailbox_guid)
 {
-	if (_list->set.mailbox_dir_name == '\0') {
-		return t_strconcat(root_dir, "/",
-				   guid_128_to_string(mailbox_guid), NULL);
-	} else {
-		return t_strdup_printf("%s/%s%s", root_dir,
-				       _list->set.mailbox_dir_name,
-				       guid_128_to_string(mailbox_guid));
-	}
+	return t_strdup_printf("%s/%s%s", root_dir,
+			       _list->set.mailbox_dir_name,
+			       guid_128_to_string(mailbox_guid));
 }
 
 static int
@@ -123,28 +137,52 @@ index_list_get_path(struct mailbox_list *_list, const char *name,
 	case MAILBOX_LIST_PATH_TYPE_ALT_MAILBOX:
 		type = MAILBOX_LIST_PATH_TYPE_ALT_DIR;
 		break;
+	case MAILBOX_LIST_PATH_TYPE_LIST_INDEX:
+		i_unreached();
 	default:
 		break;
 	}
 	if (!mailbox_list_set_get_root_path(&_list->set, type, &root_dir))
 		return 0;
 
-	if ((ret = index_list_get_node(list, name, &node)) <= 0) {
-		if (ret == 0) {
-			mailbox_list_set_error(_list, MAIL_ERROR_NOTFOUND,
-				T_MAIL_ERR_MAILBOX_NOT_FOUND(name));
-		}
-		return -1;
+	if (list->create_mailbox_name != NULL &&
+	    strcmp(list->create_mailbox_name, name) == 0) {
+		*path_r = index_get_guid_path(_list, root_dir,
+					      list->create_mailbox_guid);
+		return 1;
 	}
-	/* we could get here during sync from
-	   index_list_mailbox_create_selectable() */
-	view = ilist->sync_ctx == NULL ? mail_index_view_open(ilist->index) :
-		ilist->sync_ctx->view;
-	if (!mail_index_lookup_seq(view, node->uid, &seq))
-		i_panic("mailbox list index: lost uid=%u", node->uid);
-	if (!mailbox_list_index_status(_list, view, seq, 0,
-				       &status, mailbox_guid) ||
-	    guid_128_is_empty(mailbox_guid)) {
+
+	if (ilist->sync_ctx != NULL) {
+		/* we could get here during sync from
+		   index_list_mailbox_create_selectable() */
+		view = ilist->sync_ctx->view;
+		node = mailbox_list_index_lookup(&list->list, name);
+		if (node == NULL) {
+			seq = 0;
+			ret = 0;
+		} else if (mail_index_lookup_seq(view, node->uid, &seq)) {
+			ret = 1;
+		} else {
+			i_panic("mailbox list index: lost uid=%u", node->uid);
+		}
+	} else {
+		if (mailbox_list_index_refresh(&list->list) < 0)
+			return -1;
+		view = mail_index_view_open(ilist->index);
+		ret = index_list_get_refreshed_node_seq(list, view, name, &node, &seq);
+		if (ret < 0) {
+			mail_index_view_close(&view);
+			return -1;
+		}
+	}
+	i_assert(ret == 0 || seq != 0);
+	if (ret == 0) {
+		mailbox_list_set_error(_list, MAIL_ERROR_NOTFOUND,
+				       T_MAIL_ERR_MAILBOX_NOT_FOUND(name));
+		ret = -1;
+	} else if (!mailbox_list_index_status(_list, view, seq, 0,
+					      &status, mailbox_guid, NULL) ||
+		   guid_128_is_empty(mailbox_guid)) {
 		mailbox_list_set_error(_list, MAIL_ERROR_NOTFOUND,
 				       T_MAIL_ERR_MAILBOX_NOT_FOUND(name));
 		ret = -1;
@@ -189,13 +227,14 @@ index_list_node_exists(struct index_mailbox_list *list, const char *name,
 		       enum mailbox_existence *existence_r)
 {
 	struct mailbox_list_index_node *node;
-	int ret;
 
 	*existence_r = MAILBOX_EXISTENCE_NONE;
 
-	if ((ret = index_list_get_node(list, name, &node)) < 0)
+	if (mailbox_list_index_refresh(&list->list) < 0)
 		return -1;
-	if (ret == 0)
+
+	node = mailbox_list_index_lookup(&list->list, name);
+	if (node == NULL)
 		return 0;
 
 	if ((node->flags & (MAILBOX_LIST_INDEX_FLAG_NONEXISTENT |
@@ -239,9 +278,8 @@ index_list_mailbox_create_dir(struct index_mailbox_list *list, const char *name)
 
 static int
 index_list_mailbox_create_selectable(struct mailbox *box,
-				     const struct mailbox_update *update)
+				     const guid_128_t mailbox_guid)
 {
-	struct index_list_mailbox *ibox = INDEX_LIST_STORAGE_CONTEXT(box);
 	struct index_mailbox_list *list =
 		(struct index_mailbox_list *)box->list;
 	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT(box->list);
@@ -249,18 +287,26 @@ index_list_mailbox_create_selectable(struct mailbox *box,
 	struct mailbox_list_index_record rec;
 	struct mailbox_list_index_node *node;
 	const void *data;
-	bool expunged, created, success;
+	bool expunged, created;
 	uint32_t seq;
 
 	if (mailbox_list_index_sync_begin(&list->list, &sync_ctx) < 0)
 		return -1;
 
 	seq = mailbox_list_index_sync_name(sync_ctx, box->name, &node, &created);
+	if (box->corrupted_mailbox_name) {
+		/* an existing mailbox is being created with a "unknown" name.
+		   opening the mailbox will hopefully find its real name and
+		   rename it. */
+		node->flags |= MAILBOX_LIST_INDEX_FLAG_CORRUPTED_NAME;
+		mail_index_update_flags(sync_ctx->trans, seq, MODIFY_ADD,
+			(enum mail_flags)MAILBOX_LIST_INDEX_FLAG_CORRUPTED_NAME);
+	}
 	if (!created &&
 	    (node->flags & (MAILBOX_LIST_INDEX_FLAG_NONEXISTENT |
 			    MAILBOX_LIST_INDEX_FLAG_NOSELECT)) == 0) {
 		/* already selectable */
-		(void)mailbox_list_index_sync_end(&sync_ctx, FALSE);
+		(void)mailbox_list_index_sync_end(&sync_ctx, TRUE);
 		return 0;
 	}
 
@@ -271,14 +317,16 @@ index_list_mailbox_create_selectable(struct mailbox *box,
 	i_assert(guid_128_is_empty(rec.guid));
 
 	/* make it selectable */
-	node->flags = 0;
-	mail_index_update_flags(sync_ctx->trans, seq, MODIFY_REPLACE, 0);
+	node->flags &= ~(MAILBOX_LIST_INDEX_FLAG_NONEXISTENT |
+			 MAILBOX_LIST_INDEX_FLAG_NOSELECT |
+			 MAILBOX_LIST_INDEX_FLAG_NOINFERIORS);
+	mail_index_update_flags(sync_ctx->trans, seq, MODIFY_REPLACE,
+				(enum mail_flags)node->flags);
 
-	memcpy(rec.guid, update->mailbox_guid, sizeof(rec.guid));
+	memcpy(rec.guid, mailbox_guid, sizeof(rec.guid));
 	mail_index_update_ext(sync_ctx->trans, seq, ilist->ext_id, &rec, NULL);
 
-	success = ibox->module_ctx.super.create_box(box, update, FALSE) == 0;
-	if (mailbox_list_index_sync_end(&sync_ctx, success) < 0) {
+	if (mailbox_list_index_sync_end(&sync_ctx, TRUE) < 0) {
 		/* make sure we forget any changes done internally */
 		mailbox_list_index_reset(ilist);
 		return -1;
@@ -290,6 +338,7 @@ static int
 index_list_mailbox_create(struct mailbox *box,
 			  const struct mailbox_update *update, bool directory)
 {
+	struct index_list_mailbox *ibox = INDEX_LIST_STORAGE_CONTEXT(box);
 	struct index_mailbox_list *list =
 		(struct index_mailbox_list *)box->list;
 	struct mailbox_update new_update;
@@ -311,16 +360,51 @@ index_list_mailbox_create(struct mailbox *box,
 		/* if no GUID is requested, generate it ourself. set
 		   UIDVALIDITY to index sometimes later. */
 		if (update == NULL)
-			memset(&new_update, 0, sizeof(new_update));
+			i_zero(&new_update);
 		else
 			new_update = *update;
 		if (guid_128_is_empty(new_update.mailbox_guid))
 			guid_128_generate(new_update.mailbox_guid);
-		ret = index_list_mailbox_create_selectable(box, &new_update);
-		if (ret < 0) {
-			mail_storage_copy_list_error(box->storage, box->list);
-			return -1;
+
+		/* create the backend mailbox first before it exists in the
+		   list. the mailbox creation wants to use get_path() though,
+		   so use a bit kludgy create_mailbox_* variables during the
+		   creation to return the path. we'll also support recursively
+		   creating more mailboxes in here. */
+		const char *old_name;
+		guid_128_t old_guid;
+
+		old_name = list->create_mailbox_name;
+		guid_128_copy(old_guid, list->create_mailbox_guid);
+
+		list->create_mailbox_name = box->name;
+		guid_128_copy(list->create_mailbox_guid, new_update.mailbox_guid);
+
+		ret = ibox->module_ctx.super.create_box(box, &new_update, FALSE);
+
+		if (ret == 0) {
+			/* backend mailbox was successfully created. now add it
+			   to the list. */
+			ret = index_list_mailbox_create_selectable(box, new_update.mailbox_guid);
+			if (ret < 0)
+				mail_storage_copy_list_error(box->storage, box->list);
+			if (ret <= 0) {
+				/* failed to add to list. rollback the backend
+				   mailbox creation */
+				bool create_error = ret < 0;
+
+				if (create_error)
+					mail_storage_last_error_push(box->storage);
+				if (mailbox_delete(box) < 0)
+					ret = -1;
+				if (create_error)
+					mail_storage_last_error_pop(box->storage);
+			}
 		}
+		list->create_mailbox_name = old_name;
+		guid_128_copy(list->create_mailbox_guid, old_guid);
+		if (ret < 0)
+			return ret;
 	} else {
 		ret = 0;
 	}
@@ -389,11 +473,139 @@ index_list_mailbox_exists(struct mailbox *box, bool auto_boxes ATTR_UNUSED,
 	return 0;
 }
 
+static bool mailbox_has_corrupted_name(struct mailbox *box)
+{
+	struct mailbox_list_index_node *node;
+
+	if (box->corrupted_mailbox_name)
+		return TRUE;
+
+	node = mailbox_list_index_lookup(box->list, box->name);
+	return node != NULL &&
+		(node->flags & MAILBOX_LIST_INDEX_FLAG_CORRUPTED_NAME) != 0;
+}
+
+static void index_list_rename_corrupted(struct mailbox *box, const char *newname)
+{
+	if (index_list_rename_mailbox(box->list, box->name,
+				      box->list, newname) == 0 ||
+	    box->list->error != MAIL_ERROR_EXISTS)
+		return;
+
+	/* mailbox already exists. don't give up yet, just use the newname
+	   as prefix and add the "lost-xx" as suffix. */
+	char sep = mailbox_list_get_hierarchy_sep(box->list);
+	const char *oldname = box->name;
+
+	/* oldname should be at the root level, but check for hierarchies
+	   anyway to be safe. */
+	const char *p = strrchr(oldname, sep);
+	if (p != NULL)
+		oldname = p+1;
+
+	newname = t_strdup_printf("%s-%s", newname, oldname);
+	(void)index_list_rename_mailbox(box->list, box->name,
+					box->list, newname);
+}
+
+static int index_list_mailbox_open(struct mailbox *box)
+{
+	struct index_list_mailbox *ibox = INDEX_LIST_STORAGE_CONTEXT(box);
+	const void *data;
+	const unsigned char *name_hdr;
+	size_t name_hdr_size;
+
+	if (ibox->module_ctx.super.open(box) < 0)
+		return -1;
+
+	if (box->view == NULL) {
+		/* FIXME: dsync-merge is performing a delete in obox - remove
+		   this check once dsync-merging is no longer used. */
+		return 0;
+	}
+
+	/* if mailbox name has changed, update it to the header. Use \0
+	   as the hierarchy separator in the header. This is to make sure
+	   we don't keep rewriting the name just in case some backend switches
+	   between separators when accessed different ways. */
+
+	/* Get the current mailbox name with \0 separators. */
+	char sep = mailbox_list_get_hierarchy_sep(box->list);
+	char *box_zerosep_name = t_strdup_noconst(box->name);
+	size_t box_name_len = strlen(box_zerosep_name);
+	for (size_t i = 0; i < box_name_len; i++) {
+		if (box_zerosep_name[i] == sep)
+			box_zerosep_name[i] = '\0';
+	}
+
+	/* Does it match what's in the header now? */
+	mail_index_get_header_ext(box->view, box->box_name_hdr_ext_id,
+				  &data, &name_hdr_size);
+	name_hdr = data;
+	while (name_hdr_size > 0 && name_hdr[name_hdr_size-1] == '\0') {
+		/* Remove trailing \0 - header doesn't shrink always */
+		name_hdr_size--;
+	}
+	if (name_hdr_size == box_name_len &&
+	    memcmp(box_zerosep_name, name_hdr, box_name_len) == 0) {
+		/* Same mailbox name */
+	} else if (!mailbox_has_corrupted_name(box)) {
+		/* Mailbox name changed - update */
+		struct mail_index_transaction *trans =
+			mail_index_transaction_begin(box->view, 0);
+		mail_index_ext_resize_hdr(trans, box->box_name_hdr_ext_id,
+					  box_name_len);
+		mail_index_update_header_ext(trans, box->box_name_hdr_ext_id, 0,
+					     box_zerosep_name, box_name_len);
+		(void)mail_index_transaction_commit(&trans);
+	} else if (name_hdr_size > 0) {
+		/* Mailbox name is corrupted. Rename it to the previous name. */
+		char sep = mailbox_list_get_hierarchy_sep(box->list);
+		char *newname = t_malloc0(name_hdr_size + 1);
+		memcpy(newname, name_hdr, name_hdr_size);
+		for (size_t i = 0; i < name_hdr_size; i++) {
+			if (newname[i] == '\0')
+				newname[i] = sep;
+		}
+
+		index_list_rename_corrupted(box, newname);
+	}
+	return 0;
+}
+
+void mailbox_list_index_backend_sync_init(struct mailbox *box,
+					  enum mailbox_sync_flags flags)
+{
+	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT(box->list);
+
+	if ((flags & MAILBOX_SYNC_FLAG_FORCE_RESYNC) != 0 &&
+	    !ilist->force_resynced) {
+		box->storage->list_index_rebuild_reason =
+			MAIL_STORAGE_LIST_INDEX_REBUILD_REASON_FORCE_RESYNC;
+		if (box->storage->v.list_index_corrupted != NULL &&
+		    box->storage->v.list_index_corrupted(box->storage) < 0)
+			ilist->force_resync_failed = TRUE;
+		/* try to rebuild list index only once - even if it failed */
+		ilist->force_resynced = TRUE;
+	}
+}
+
+int mailbox_list_index_backend_sync_deinit(struct mailbox *box)
+{
+	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT(box->list);
+
+	if (ilist->force_resync_failed) {
+		/* fail this only once */
+		ilist->force_resync_failed = FALSE;
+		return -1;
+	}
+	return 0;
+}
+
 static void
-index_list_try_delete(struct index_mailbox_list *list, const char *name,
+index_list_try_delete(struct mailbox_list *_list, const char *name,
 		      enum mailbox_list_path_type type)
 {
-	struct mailbox_list *_list = &list->list;
 	const char *mailbox_path, *path;
 
 	if (mailbox_list_get_path(_list, name, MAILBOX_LIST_PATH_TYPE_MAILBOX,
@@ -423,7 +635,7 @@ index_list_try_delete(struct index_mailbox_list *list, const char *name,
 }
 
 static void
-index_list_delete_finish(struct index_mailbox_list *list, const char *name)
+index_list_delete_finish(struct mailbox_list *list, const char *name)
 {
 	index_list_try_delete(list, name, MAILBOX_LIST_PATH_TYPE_INDEX);
 	index_list_try_delete(list, name, MAILBOX_LIST_PATH_TYPE_CONTROL);
@@ -435,59 +647,22 @@ index_list_delete_entry(struct index_mailbox_list *list, const char *name,
 			bool delete_selectable)
 {
 	struct mailbox_list_index_sync_context *sync_ctx;
-	struct mailbox_list_index_record rec;
-	struct mailbox_list_index_node *node;
-	const void *data;
-	bool expunged;
-	uint32_t seq;
 	int ret;
 
-	if (mailbox_list_index_sync_begin(&list->list, &sync_ctx) < 0)
-		return -1;
-
-	if ((ret = index_list_get_node(list, name, &node)) < 0) {
-		(void)mailbox_list_index_sync_end(&sync_ctx, FALSE);
-		return -1;
-	}
-	if (ret == 0) {
-		(void)mailbox_list_index_sync_end(&sync_ctx, FALSE);
-		mailbox_list_set_error(&list->list, MAIL_ERROR_NOTFOUND,
-				       T_MAIL_ERR_MAILBOX_NOT_FOUND(name));
-		return -1;
-	}
-	if (!mail_index_lookup_seq(sync_ctx->view, node->uid, &seq))
-		i_panic("mailbox list index: lost uid=%u", node->uid);
-	if (delete_selectable) {
-		/* make it at least non-selectable */
-		node->flags = MAILBOX_LIST_INDEX_FLAG_NOSELECT;
-		mail_index_update_flags(sync_ctx->trans, seq, MODIFY_REPLACE,
-					(enum mail_flags)node->flags);
-
-		mail_index_lookup_ext(sync_ctx->view, seq,
-				      sync_ctx->ilist->ext_id,
-				      &data, &expunged);
-		i_assert(data != NULL && !expunged);
-		memcpy(&rec, data, sizeof(rec));
-		rec.uid_validity = 0;
-		memset(&rec.guid, 0, sizeof(rec.guid));
-		mail_index_update_ext(sync_ctx->trans, seq,
-				      sync_ctx->ilist->ext_id, &rec, NULL);
-	}
-	if (node->children != NULL) {
-		/* can't delete this directory before its children,
-		   but we may have made it non-selectable already */
-		if (mailbox_list_index_sync_end(&sync_ctx, TRUE) < 0)
-			return -1;
+	if (list->create_mailbox_name != NULL &&
+	    strcmp(name, list->create_mailbox_name) == 0) {
+		/* we're rollbacking a failed create. if the name exists in the
+		   list, it was done by somebody else so we don't want to
+		   remove it. */
 		return 0;
 	}
 
-	/* we can remove the entire node */
-	mail_index_expunge(sync_ctx->trans, seq);
-	mailbox_list_index_node_unlink(sync_ctx->ilist, node);
-
+	if (mailbox_list_index_sync_begin(&list->list, &sync_ctx) < 0)
+		return -1;
+	ret = mailbox_list_index_sync_delete(sync_ctx, name, delete_selectable);
 	if (mailbox_list_index_sync_end(&sync_ctx, TRUE) < 0)
 		return -1;
-	return 1;
+	return ret;
 }
 
 static int
@@ -503,7 +678,8 @@ index_list_delete_mailbox(struct mailbox_list *_list, const char *name)
 	if (ret <= 0)
 		return ret;
 
-	if ((_list->flags & MAILBOX_LIST_FLAG_NO_MAIL_FILES) != 0) {
+	if ((_list->flags & (MAILBOX_LIST_FLAG_NO_MAIL_FILES |
+			     MAILBOX_LIST_FLAG_NO_DELETES)) != 0) {
 		ret = 0;
 	} else if ((_list->flags & MAILBOX_LIST_FLAG_MAILBOX_FILES) != 0) {
 		ret = mailbox_list_delete_mailbox_file(_list, name, path);
@@ -512,8 +688,9 @@ index_list_delete_mailbox(struct mailbox_list *_list, const char *name)
 							       path, TRUE);
 	}
 
-	if (ret == 0 || (_list->props & MAILBOX_LIST_PROP_AUTOCREATE_DIRS) != 0)
-		index_list_delete_finish(list, name);
+	if ((ret == 0 || (_list->props & MAILBOX_LIST_PROP_AUTOCREATE_DIRS) != 0) &&
+	    (_list->flags & MAILBOX_LIST_FLAG_NO_DELETES) == 0)
+		index_list_delete_finish(_list, name);
 	if (ret == 0) {
 		if (index_list_delete_entry(list, name, TRUE) < 0)
 			return -1;
@@ -551,13 +728,13 @@ index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
 			  struct mailbox_list *_newlist, const char *newname)
 {
 	struct index_mailbox_list *list = (struct index_mailbox_list *)_oldlist;
+	const size_t oldname_len = strlen(oldname);
 	struct mailbox_list_index_sync_context *sync_ctx;
 	struct mailbox_list_index_record oldrec, newrec;
 	struct mailbox_list_index_node *oldnode, *newnode, *child;
 	const void *data;
 	bool created, expunged;
 	uint32_t oldseq, newseq;
-	int ret;
 
 	if (_oldlist != _newlist) {
 		mailbox_list_set_error(_oldlist, MAIL_ERROR_NOTPOSSIBLE,
@@ -565,14 +742,18 @@ index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
 		return -1;
 	}
 
+	if (strncmp(oldname, newname, oldname_len) == 0 &&
+	   newname[oldname_len] == mailbox_list_get_hierarchy_sep(_newlist)) {
+		mailbox_list_set_error(_oldlist, MAIL_ERROR_NOTPOSSIBLE,
+			"Can't rename mailbox under itself.");
+		return -1;
+	}
+
 	if (mailbox_list_index_sync_begin(&list->list, &sync_ctx) < 0)
 		return -1;
 
-	if ((ret = index_list_get_node(list, oldname, &oldnode)) < 0) {
-		(void)mailbox_list_index_sync_end(&sync_ctx, FALSE);
-		return -1;
-	}
-	if (ret == 0) {
+	oldnode = mailbox_list_index_lookup(&list->list, oldname);
+	if (oldnode == NULL) {
 		(void)mailbox_list_index_sync_end(&sync_ctx, FALSE);
 		mailbox_list_set_error(&list->list, MAIL_ERROR_NOTFOUND,
 			T_MAIL_ERR_MAILBOX_NOT_FOUND(oldname));
@@ -616,6 +797,13 @@ index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
 	oldrec.name_id = newrec.name_id;
 	oldrec.parent_uid = newrec.parent_uid;
 
+	if ((newnode->flags & MAILBOX_LIST_INDEX_FLAG_CORRUPTED_NAME) != 0) {
+		/* mailbox is renamed - clear away the corruption flag so the
+		   new name will be written to the mailbox index header. */
+		newnode->flags &= ~MAILBOX_LIST_INDEX_FLAG_CORRUPTED_NAME;
+		mail_index_update_flags(sync_ctx->trans, oldseq, MODIFY_REMOVE,
+			(enum mail_flags)MAILBOX_LIST_INDEX_FLAG_CORRUPTED_NAME);
+	}
 	mail_index_update_ext(sync_ctx->trans, oldseq,
 			      sync_ctx->ilist->ext_id, &oldrec, NULL);
 	mail_index_expunge(sync_ctx->trans, newseq);
@@ -666,40 +854,39 @@ struct mailbox_list index_mailbox_list = {
 	.props = MAILBOX_LIST_PROP_NO_ROOT,
 	.mailbox_name_max_length = MAILBOX_LIST_NAME_MAX_LENGTH,
 
-	{
-		index_list_alloc,
-		index_list_init,
-		index_list_deinit,
-		NULL,
-		index_list_get_hierarchy_sep,
-		mailbox_list_default_get_vname,
-		mailbox_list_default_get_storage_name,
-		index_list_get_path,
-		index_list_get_temp_prefix,
-		NULL,
-		index_list_iter_init,
-		index_list_iter_next,
-		index_list_iter_deinit,
-		NULL,
-		NULL,
-		mailbox_list_subscriptions_refresh,
-		index_list_set_subscribed,
-		index_list_delete_mailbox,
-		index_list_delete_dir,
-		index_list_delete_symlink,
-		index_list_rename_mailbox,
-		NULL, NULL, NULL, NULL
+	.v = {
+		.alloc = index_list_alloc,
+		.init = index_list_init,
+		.deinit = index_list_deinit,
+		.get_hierarchy_sep = index_list_get_hierarchy_sep,
+		.get_vname = mailbox_list_default_get_vname,
+		.get_storage_name = mailbox_list_default_get_storage_name,
+		.get_path = index_list_get_path,
+		.get_temp_prefix = index_list_get_temp_prefix,
+		.iter_init = index_list_iter_init,
+		.iter_next = index_list_iter_next,
+		.iter_deinit = index_list_iter_deinit,
+		.subscriptions_refresh = mailbox_list_subscriptions_refresh,
+		.set_subscribed = index_list_set_subscribed,
+		.delete_mailbox = index_list_delete_mailbox,
+		.delete_dir = index_list_delete_dir,
+		.delete_symlink = index_list_delete_symlink,
+		.rename_mailbox = index_list_rename_mailbox,
 	}
 };
 
-void mailbox_list_index_backend_init_mailbox(struct mailbox *box)
+bool mailbox_list_index_backend_init_mailbox(struct mailbox *box,
+					     struct mailbox_vfuncs *v)
 {
 	if (strcmp(box->list->name, MAILBOX_LIST_NAME_INDEX) != 0)
-		return;
-	box->v.create_box = index_list_mailbox_create;
-	box->v.update_box = index_list_mailbox_update;
-	box->v.exists = index_list_mailbox_exists;
+		return TRUE;
 
-	box->v.list_index_has_changed = NULL;
-	box->v.list_index_update_sync = NULL;
+	/* NOTE: this is using the same v as
+	   mailbox_list_index_status_init_mailbox(), so don't have them
+	   accidentally override each others. */
+	v->create_box = index_list_mailbox_create;
+	v->update_box = index_list_mailbox_update;
+	v->exists = index_list_mailbox_exists;
+	v->open = index_list_mailbox_open;
+	return FALSE;
 }

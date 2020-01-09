@@ -1,16 +1,16 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream.h"
 #include "str.h"
 #include "index-storage.h"
 #include "index-mail.h"
+#include "index-pop3-uidl.h"
 #include "dbox-attachment.h"
 #include "dbox-storage.h"
 #include "dbox-file.h"
 #include "dbox-mail.h"
 
-#include <stdlib.h>
 
 struct mail *
 dbox_mail_alloc(struct mailbox_transaction_context *t,
@@ -96,6 +96,7 @@ int dbox_mail_get_virtual_size(struct mail *_mail, uoff_t *size_r)
 	struct dbox_mail *mail = (struct dbox_mail *)_mail;
 	struct index_mail_data *data = &mail->imail.data;
 	const char *value;
+	uintmax_t size;
 
 	if (index_mail_get_cached_virtual_size(&mail->imail, size_r))
 		return 0;
@@ -106,7 +107,9 @@ int dbox_mail_get_virtual_size(struct mail *_mail, uoff_t *size_r)
 	if (value == NULL)
 		return index_mail_get_virtual_size(_mail, size_r);
 
-	data->virtual_size = strtoul(value, NULL, 16);
+	if (str_to_uintmax_hex(value, &size) < 0 || size > (uoff_t)-1)
+		return -1;
+	data->virtual_size = (uoff_t)size;
 	*size_r = data->virtual_size;
 	return 0;
 }
@@ -116,6 +119,7 @@ int dbox_mail_get_received_date(struct mail *_mail, time_t *date_r)
 	struct dbox_mail *mail = (struct dbox_mail *)_mail;
 	struct index_mail_data *data = &mail->imail.data;
 	const char *value;
+	uintmax_t time;
 
 	if (index_mail_get_received_date(_mail, date_r) == 0)
 		return 0;
@@ -124,7 +128,11 @@ int dbox_mail_get_received_date(struct mail *_mail, time_t *date_r)
 				   &value) < 0)
 		return -1;
 
-	data->received_date = value == NULL ? 0 : strtoul(value, NULL, 16);
+	time = 0;
+	if (value != NULL && str_to_uintmax_hex(value, &time) < 0)
+		return -1;
+
+	data->received_date = (time_t)time;
 	*date_r = data->received_date;
 	return 0;
 }
@@ -171,13 +179,21 @@ dbox_get_cached_metadata(struct dbox_mail *mail, enum dbox_metadata_key key,
 	if (mail_cache_lookup_field(imail->mail.mail.transaction->cache_view,
 				    str, imail->mail.mail.seq,
 				    ibox->cache_fields[cache_field].idx) > 0) {
-		if (cache_field != MAIL_CACHE_POP3_ORDER)
-			*value_r = str_c(str);
-		else {
+		if (cache_field == MAIL_CACHE_POP3_ORDER) {
 			i_assert(str_len(str) == sizeof(order));
 			memcpy(&order, str_data(str), sizeof(order));
-			*value_r = order == 0 ? "" : dec2str(order);
+			str_truncate(str, 0);
+			if (order != 0)
+				str_printfa(str, "%u", order);
+			else {
+				/* order=0 means it doesn't exist. we don't
+				   want to return "0" though, because then the
+				   mails get ordered to beginning, while
+				   nonexistent are supposed to be ordered at
+				   the end. */
+			}
 		}
+		*value_r = str_c(str);
 		return 0;
 	}
 
@@ -208,15 +224,31 @@ int dbox_mail_get_special(struct mail *_mail, enum mail_fetch_field field,
 			  const char **value_r)
 {
 	struct dbox_mail *mail = (struct dbox_mail *)_mail;
+	int ret;
 
 	/* keep the UIDL in cache file, otherwise POP3 would open all
 	   mail files and read the metadata. same for GUIDs if they're
 	   used. */
 	switch (field) {
 	case MAIL_FETCH_UIDL_BACKEND:
-		return dbox_get_cached_metadata(mail, DBOX_METADATA_POP3_UIDL,
-						MAIL_CACHE_POP3_UIDL, value_r);
+		if (!index_pop3_uidl_can_exist(_mail)) {
+			*value_r = "";
+			return 0;
+		}
+		ret = dbox_get_cached_metadata(mail, DBOX_METADATA_POP3_UIDL,
+					       MAIL_CACHE_POP3_UIDL, value_r);
+		if (ret == 0) {
+			index_pop3_uidl_update_exists(&mail->imail.mail.mail,
+						      (*value_r)[0] != '\0');
+		}
+		return ret;
 	case MAIL_FETCH_POP3_ORDER:
+		if (!index_pop3_uidl_can_exist(_mail)) {
+			/* we're assuming that if there's a POP3 order, there's
+			   also a UIDL */
+			*value_r = "";
+			return 0;
+		}
 		return dbox_get_cached_metadata(mail, DBOX_METADATA_POP3_ORDER,
 						MAIL_CACHE_POP3_ORDER, value_r);
 	case MAIL_FETCH_GUID:

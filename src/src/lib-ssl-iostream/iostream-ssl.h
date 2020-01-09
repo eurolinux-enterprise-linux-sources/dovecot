@@ -18,10 +18,13 @@ struct ssl_iostream_settings {
 	bool verify_remote_cert; /* neither/both */
 	bool require_valid_cert; /* stream-only */
 	bool prefer_server_ciphers;
+	bool compression;
+	bool tickets;
 };
 
 /* Returns 0 if ok, -1 and sets error_r if failed. The returned error string
-   becomes available via ssl_iostream_get_last_error() */
+   becomes available via ssl_iostream_get_last_error(). The callback most
+   likely should be calling ssl_iostream_check_cert_validity(). */
 typedef int
 ssl_iostream_handshake_callback_t(const char **error_r, void *context);
 
@@ -45,6 +48,10 @@ void ssl_iostream_set_log_prefix(struct ssl_iostream *ssl_io,
 				 const char *prefix);
 
 int ssl_iostream_handshake(struct ssl_iostream *ssl_io);
+/* Call the given callback when SSL handshake finishes. The callback must
+   verify whether the certificate and its hostname is valid. If there is no
+   callback, the default is to use ssl_iostream_check_cert_validity() with the
+   same host as given to io_stream_create_ssl_client() */
 void ssl_iostream_set_handshake_callback(struct ssl_iostream *ssl_io,
 					 ssl_iostream_handshake_callback_t *callback,
 					 void *context);
@@ -63,7 +70,8 @@ const char *ssl_iostream_get_server_name(struct ssl_iostream *ssl_io);
 const char *ssl_iostream_get_security_string(struct ssl_iostream *ssl_io);
 const char *ssl_iostream_get_last_error(struct ssl_iostream *ssl_io);
 
-int ssl_iostream_generate_params(buffer_t *output, const char **error_r);
+int ssl_iostream_generate_params(buffer_t *output, unsigned int dh_length,
+				 const char **error_r);
 int ssl_iostream_context_import_params(struct ssl_iostream_context *ctx,
 				       const buffer_t *input);
 

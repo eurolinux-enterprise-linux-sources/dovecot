@@ -16,6 +16,7 @@ enum passdb_result {
 	PASSDB_RESULT_USER_UNKNOWN = -3,
 	PASSDB_RESULT_USER_DISABLED = -4,
 	PASSDB_RESULT_PASS_EXPIRED = -5,
+	PASSDB_RESULT_NEXT = -6,
 
 	PASSDB_RESULT_PASSWORD_MISMATCH = 0,
 	PASSDB_RESULT_OK = 1
@@ -54,11 +55,18 @@ struct passdb_module_interface {
 
 struct passdb_module {
 	const char *args;
-	/* The caching key for this module, or NULL if caching isn't wanted. */
-	const char *cache_key;
+	/* The default caching key for this module, or NULL if caching isn't
+	   wanted. This is updated by settings in auth_passdb. */
+#define default_cache_key cache_key /* FIXME: remove in v2.3 - for API backwards compatibility */
+	const char *default_cache_key;
 	/* Default password scheme for this module.
 	   If cache_key is set, must not be NULL. */
 	const char *default_pass_scheme;
+	/* Supported authentication mechanisms, NULL is all, [NULL] is none*/
+	const char *const *mechanisms;
+	/* Username filter, NULL is no filter */
+	const char *const *username_filter;
+
 	/* If blocking is set to TRUE, use child processes to access
 	   this passdb. */
 	bool blocking;
@@ -68,8 +76,9 @@ struct passdb_module {
 	/* number of time init() has been called */
 	int init_refcount;
 
-	struct passdb_template *default_fields_tmpl;
-	struct passdb_template *override_fields_tmpl;
+	/* WARNING: avoid adding anything here that isn't based on args.
+	   if you do, you need to change passdb.c:passdb_find() also to avoid
+	   accidentally merging wrong passdbs. */
 
 	struct passdb_module_interface iface;
 };
@@ -99,7 +108,7 @@ void passdb_deinit(struct passdb_module *passdb);
 void passdb_register_module(struct passdb_module_interface *iface);
 void passdb_unregister_module(struct passdb_module_interface *iface);
 
-void passdbs_generate_md5(unsigned char md5[MD5_RESULTLEN]);
+void passdbs_generate_md5(unsigned char md5[STATIC_ARRAY MD5_RESULTLEN]);
 
 void passdbs_init(void);
 void passdbs_deinit(void);

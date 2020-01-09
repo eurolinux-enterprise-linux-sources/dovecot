@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -9,6 +9,7 @@
 #include "mail-index-alloc-cache.h"
 #include "mailbox-log.h"
 #include "mailbox-list-private.h"
+#include "index-pop3-uidl.h"
 #include "dbox-mail.h"
 #include "dbox-save.h"
 #include "mdbox-map.h"
@@ -39,7 +40,7 @@ int mdbox_storage_create(struct mail_storage *_storage,
 	struct mdbox_storage *storage = (struct mdbox_storage *)_storage;
 	const char *dir;
 
-	storage->set = mail_storage_get_driver_settings(_storage);
+	storage->set = mail_namespace_get_driver_settings(ns, _storage);
 	storage->preallocate_space = storage->set->mdbox_preallocate_space;
 
 	if (*ns->list->set.mailbox_dir_name == '\0') {
@@ -53,9 +54,11 @@ int mdbox_storage_create(struct mail_storage *_storage,
 	dir = mailbox_list_get_root_forced(ns->list, MAILBOX_LIST_PATH_TYPE_DIR);
 	storage->storage_dir = p_strconcat(_storage->pool, dir,
 					   "/"MDBOX_GLOBAL_DIR_NAME, NULL);
-	storage->alt_storage_dir = p_strconcat(_storage->pool,
-					       ns->list->set.alt_dir,
-					       "/"MDBOX_GLOBAL_DIR_NAME, NULL);
+	if (ns->list->set.alt_dir != NULL) {
+		storage->alt_storage_dir = p_strconcat(_storage->pool,
+							ns->list->set.alt_dir,
+							"/"MDBOX_GLOBAL_DIR_NAME, NULL);
+	}
 	i_array_init(&storage->open_files, 64);
 
 	storage->map = mdbox_map_init(storage, ns->list);
@@ -167,8 +170,11 @@ mdbox_mailbox_alloc(struct mail_storage *storage, struct mailbox_list *list,
 int mdbox_mailbox_open(struct mailbox *box)
 {
 	struct mdbox_mailbox *mbox = (struct mdbox_mailbox *)box;
+	time_t path_ctime;
 
-	if (dbox_mailbox_open(box) < 0)
+	if (dbox_mailbox_check_existence(box, &path_ctime) < 0)
+		return -1;
+	if (dbox_mailbox_open(box, path_ctime) < 0)
 		return -1;
 
 	mbox->ext_id =
@@ -212,8 +218,9 @@ int mdbox_read_header(struct mdbox_mailbox *mbox,
 		mdbox_storage_set_corrupted(mbox->storage);
 		return -1;
 	}
-	memset(hdr, 0, sizeof(*hdr));
-	memcpy(hdr, data, I_MIN(data_size, sizeof(*hdr)));
+	i_zero(hdr);
+	if (data_size > 0)
+		memcpy(hdr, data, I_MIN(data_size, sizeof(*hdr)));
 	*need_resize_r = data_size < sizeof(*hdr);
 	return 0;
 }
@@ -226,7 +233,7 @@ void mdbox_update_header(struct mdbox_mailbox *mbox,
 	bool need_resize;
 
 	if (mdbox_read_header(mbox, &hdr, &need_resize) < 0) {
-		memset(&hdr, 0, sizeof(hdr));
+		i_zero(&hdr);
 		need_resize = TRUE;
 	}
 
@@ -307,6 +314,12 @@ mdbox_write_index_header(struct mailbox *box,
 	}
 	mail_index_view_close(&view);
 
+	if (box->inbox_user && box->creating) {
+		/* initialize pop3-uidl header when creating mailbox
+		   (not on mailbox_update()) */
+		index_pop3_uidl_set_max_uid(box, trans, 0);
+	}
+
 	mdbox_update_header(mbox, trans, update);
 	if (new_trans != NULL) {
 		if (mail_index_transaction_commit(&new_trans) < 0) {
@@ -379,12 +392,17 @@ mdbox_mailbox_get_guid(struct mdbox_mailbox *mbox, guid_128_t guid_r)
 
 	/* there's a race condition between mkdir and getting the mailbox GUID.
 	   normally this is handled by mdbox syncing, but GUID can be looked up
-	   without syncing. when mbox->creating=TRUE, the errors are hidden
-	   and we'll simply finish the mailbox creation */
+	   without syncing. when we detect this situation we'll try to finish
+	   creating the indexes first, which usually means just waiting for
+	   the sync lock to get unlocked by the other process creating them. */
 	idx_hdr = mail_index_get_header(mbox->box.view);
-	mbox->creating = idx_hdr->uid_validity == 0 && idx_hdr->next_uid == 1;
+	if (idx_hdr->uid_validity == 0 && idx_hdr->next_uid == 1) {
+		if (dbox_mailbox_create_indexes(&mbox->box, NULL) < 0)
+			return -1;
+	}
+
 	if (mdbox_read_header(mbox, &hdr, &need_resize) < 0)
-		memset(&hdr, 0, sizeof(hdr));
+		i_zero(&hdr);
 
 	if (guid_128_is_empty(hdr.mailbox_guid)) {
 		/* regenerate it */
@@ -394,7 +412,6 @@ mdbox_mailbox_get_guid(struct mdbox_mailbox *mbox, guid_128_t guid_r)
 	}
 	if (ret == 0)
 		memcpy(guid_r, hdr.mailbox_guid, GUID_128_SIZE);
-	mbox->creating = FALSE;
 	return ret;
 }
 
@@ -442,7 +459,8 @@ struct mail_storage mdbox_storage = {
 		dbox_storage_get_list_settings,
 		mdbox_storage_autodetect,
 		mdbox_mailbox_alloc,
-		mdbox_purge
+		mdbox_purge,
+		NULL,
 	}
 };
 

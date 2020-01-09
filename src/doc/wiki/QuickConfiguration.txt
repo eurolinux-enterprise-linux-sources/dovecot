@@ -9,27 +9,65 @@ Contents
 
  1. Quick Configuration
 
-     1. Configuration file
+     1. TLDR; Just want it running
+
+     2. Configuration file
 
          1. Installing from sources
 
          2. Split configuration files
 
-     2. Authentication
+         3. Hints about writing configuration files
 
-     3. Mail Location
+     3. Authentication
 
-     4. Mbox
+     4. Mail Location
 
-     5. Maildir
+     5. Mbox
 
-     6. Client Workarounds
+     6. Maildir
 
-     7. SSL and Plaintext Authentication
+     7. Client Workarounds
 
-     8. NFS
+     8. SSL and Plaintext Authentication
 
-     9. Running
+     9. NFS
+
+     10. Running
+
+TLDR; Just want it running
+--------------------------
+
+Here is a very simple basic configuration with single vmail user to be placed
+as dovecot.conf. Please note that some distros split configuration under
+/etc/dovecot/conf.d, which, while it can be useful, is not required.
+
+You need to create group vmail and user vmail.
+
+---%<-------------------------------------------------------------------------
+mail_home=/srv/mail/%Lu
+mail_location=sdbox:~/Mail
+
+## this is sometimes needed
+#first_valid_uid = uid-of-vmail-user
+
+# if you want to use system users
+passdb {
+  driver = pam
+}
+
+userdb {
+  driver = passwd
+  args = blocking=no
+  override_fields = uid=vmail gid=vmail
+}
+
+ssl=yes
+ssl_cert=</path/to/cert.pem
+ssl_key=</path/to/key.pem
+# if you are using v2.3+
+#ssl_dh=</path/to/dh.pem
+---%<-------------------------------------------------------------------------
 
 Configuration file
 ------------------
@@ -68,6 +106,21 @@ to just have a single 'dovecot.conf' file, which you can create easily using
 
 ---%<-------------------------------------------------------------------------
 doveconf -n > dovecot.conf
+---%<-------------------------------------------------------------------------
+
+Hints about writing configuration files
+---------------------------------------
+
+ * Usually it does not matter in which file you write the setting, however,
+   later settings replace earlier ones. If you use the same section multiple
+   times, the settings are merged together.
+ * Boolean settings in the 'plugin' section interprete /any/ value as *true*,
+   even '0', 'no' and 'false'.
+ * To read the content of a file, for instance for the SSL certificate option,
+   prefix the filename with a '<', e.g.:
+
+---%<-------------------------------------------------------------------------
+ssl_cert = </etc/ssl/certs/imap.pem
 ---%<-------------------------------------------------------------------------
 
 Authentication
@@ -143,4 +196,4 @@ Running
 
 See <RunningDovecot.txt> and <Logging.txt>.
 
-(This file was created from the wiki on 2013-12-19 04:42)
+(This file was created from the wiki on 2018-05-23 04:42)

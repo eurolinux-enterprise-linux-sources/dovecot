@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "mail-storage.h"
@@ -20,12 +20,15 @@ cmd_search_box(struct doveadm_mail_cmd_context *ctx,
 	const char *guid_str;
 	int ret = 0;
 
-	if (doveadm_mail_iter_init(ctx, info, ctx->search_args, 0, NULL,
+	if (doveadm_mail_iter_init(ctx, info, ctx->search_args, 0, NULL, FALSE,
 				   &iter) < 0)
 		return -1;
 	box = doveadm_mail_iter_get_mailbox(iter);
 
 	if (mailbox_get_metadata(box, MAILBOX_METADATA_GUID, &metadata) < 0) {
+		i_error("Couldn't get mailbox '%s' GUID: %s",
+			mailbox_get_vname(box),
+			mailbox_get_last_internal_error(box, NULL));
 		ret = -1;
 		doveadm_mail_failed_mailbox(ctx, box);
 	} else {
@@ -88,6 +91,12 @@ static struct doveadm_mail_cmd_context *cmd_search_alloc(void)
 	return ctx;
 }
 
-struct doveadm_mail_cmd cmd_search = {
-	cmd_search_alloc, "search", "<search query>"
+struct doveadm_cmd_ver2 doveadm_cmd_search_ver2 = {
+	.name = "search",
+	.mail_cmd = cmd_search_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<search query>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

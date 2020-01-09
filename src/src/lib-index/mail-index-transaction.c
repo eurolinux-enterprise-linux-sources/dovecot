@@ -1,17 +1,45 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
 #include "array.h"
+#include "hook-build.h"
 #include "bsearch-insert-pos.h"
+#include "llist.h"
 #include "mail-index-private.h"
 #include "mail-transaction-log-private.h"
 #include "mail-index-transaction-private.h"
 
-#include <stdlib.h>
+static ARRAY(hook_mail_index_transaction_created_t *)
+	hook_mail_index_transaction_created;
 
-void (*hook_mail_index_transaction_created)
-		(struct mail_index_transaction *t) = NULL;
+void mail_index_transaction_hook_register(hook_mail_index_transaction_created_t *hook)
+{
+	if (!array_is_created(&hook_mail_index_transaction_created))
+		i_array_init(&hook_mail_index_transaction_created, 8);
+	array_append(&hook_mail_index_transaction_created, &hook, 1);
+}
+
+void mail_index_transaction_hook_unregister(hook_mail_index_transaction_created_t *hook)
+{
+	unsigned int idx;
+	bool found = FALSE;
+
+	i_assert(array_is_created(&hook_mail_index_transaction_created));
+	for(idx = 0; idx < array_count(&hook_mail_index_transaction_created); idx++) {
+		hook_mail_index_transaction_created_t *const *hook_ptr =
+			array_idx(&hook_mail_index_transaction_created, idx);
+		if (*hook_ptr == hook) {
+			array_delete(&hook_mail_index_transaction_created, idx, 1);
+			found = TRUE;
+			break;
+		}
+	}
+	i_assert(found == TRUE);
+	if (array_count(&hook_mail_index_transaction_created) == 0)
+		array_free(&hook_mail_index_transaction_created);
+}
+
 
 struct mail_index_view *
 mail_index_transaction_get_view(struct mail_index_transaction *t)
@@ -50,6 +78,7 @@ void mail_index_transaction_unref(struct mail_index_transaction **_t)
 
 	mail_index_transaction_reset_v(t);
 
+	DLLIST_REMOVE(&t->view->transactions_list, t);
 	array_free(&t->module_contexts);
 	mail_index_view_transaction_unref(t->view);
 	if (t->latest_view != NULL)
@@ -160,6 +189,10 @@ mail_index_transaction_commit_real(struct mail_index_transaction *t,
 	if (mail_transaction_log_append_begin(log->index, trans_flags, &ctx) < 0)
 		return -1;
 	ret = mail_transaction_log_file_refresh(t, ctx);
+#ifdef DEBUG
+	uint64_t expected_highest_modseq =
+		mail_index_transaction_get_highest_modseq(t);
+#endif
 	if (ret > 0) T_BEGIN {
 		mail_index_transaction_finish(t);
 		mail_index_transaction_export(t, ctx);
@@ -171,11 +204,14 @@ mail_index_transaction_commit_real(struct mail_index_transaction *t,
 	mail_transaction_log_get_head(log, &log_seq2, &log_offset2);
 	i_assert(log_seq1 == log_seq2);
 
+#ifdef DEBUG
+	i_assert(expected_highest_modseq == log->head->sync_highest_modseq);
+#endif
+
 	if (t->reset) {
 		/* get rid of the old index. it might just confuse readers,
 		   especially if it's broken. */
-		if (unlink(log->index->filepath) < 0 && errno != ENOENT)
-			i_error("unlink(%s) failed: %m", log->index->filepath);
+		i_unlink_if_exists(log->index->filepath);
 	}
 
 	*commit_size_r = log_offset2 - log_offset1;
@@ -258,7 +294,7 @@ int mail_index_transaction_commit_full(struct mail_index_transaction **_t,
 	}
 
 	*_t = NULL;
-	memset(result_r, 0, sizeof(*result_r));
+	i_zero(result_r);
 	if (t->v.commit(t, result_r) < 0)
 		return -1;
 
@@ -311,8 +347,18 @@ mail_index_transaction_begin(struct mail_index_view *view,
 
 	i_array_init(&t->module_contexts,
 		     I_MIN(5, mail_index_module_register.id));
+	DLLIST_PREPEND(&view->transactions_list, t);
 
-	if (hook_mail_index_transaction_created != NULL)
-		hook_mail_index_transaction_created(t);
+	if (array_is_created(&hook_mail_index_transaction_created)) {
+	        struct hook_build_context *ctx =
+			hook_build_init((void *)&t->v, sizeof(t->v));
+		hook_mail_index_transaction_created_t *const *ptr;
+		array_foreach(&hook_mail_index_transaction_created, ptr) {
+			(*ptr)(t);
+			hook_build_update(ctx, t->vlast);
+		}
+		t->vlast = NULL;
+		hook_build_deinit(&ctx);
+	}
 	return t;
 }

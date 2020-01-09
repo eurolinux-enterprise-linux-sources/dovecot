@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "ioloop.h"
@@ -114,7 +114,7 @@ static void client_input_append(struct client_command_context *cmd)
 
 	o_stream_cork(client->output);
 	finished = command_exec(cmd);
-	if (!finished && cmd->state != CLIENT_COMMAND_STATE_DONE)
+	if (!finished)
 		(void)client_handle_unfinished_cmd(cmd);
 	else
 		client_command_free(&cmd);
@@ -205,12 +205,10 @@ cmd_append_catenate_mpurl(struct client_command_context *cmd,
 	/* add this input stream to chain */
 	i_stream_chain_append(ctx->catchain, mpresult.input);
 	/* save by reading the chain stream */
-	while (!i_stream_is_eof(mpresult.input)) {
+	do {
 		ret = i_stream_read(mpresult.input);
 		i_assert(ret != 0); /* we can handle only blocking input here */
-		if (mailbox_save_continue(ctx->save_ctx) < 0 || ret == -1)
-			break;
-	}
+	} while (mailbox_save_continue(ctx->save_ctx) == 0 && ret != -1);
 
 	if (mpresult.input->stream_errno != 0) {
 		errno = mpresult.input->stream_errno;
@@ -493,22 +491,23 @@ cmd_append_handle_args(struct client_command_context *cmd,
 	valid = FALSE;
 	*nonsync_r = FALSE;
 	ctx->catenate = FALSE;
-	if (imap_arg_atom_equals(args, "CATENATE")) {
-		args++;
-		if (imap_arg_get_list(args, &cat_list)) {
-			valid = TRUE;
-			ctx->catenate = TRUE;
-		}
+	if (imap_arg_get_literal_size(args, &ctx->literal_size)) {
+		*nonsync_r = args->type == IMAP_ARG_LITERAL_SIZE_NONSYNC;
+		ctx->binary_input = args->literal8;
+		valid = TRUE;
+	} else if (!imap_arg_atom_equals(args, "CATENATE")) {
+		/* invalid */
+	} else if (!imap_arg_get_list(++args, &cat_list)) {
+		/* invalid */
+	} else {
+		valid = TRUE;
+		ctx->catenate = TRUE;
 		/* We'll do BINARY conversion only if the CATENATE's first
 		   part is a literal8. If it doesn't and a literal8 is seen
 		   later we'll abort the append with UNKNOWN-CTE. */
 		ctx->binary_input = imap_arg_atom_equals(&cat_list[0], "TEXT") &&
 			cat_list[1].literal8;
 
-	} else if (imap_arg_get_literal_size(args, &ctx->literal_size)) {
-		*nonsync_r = args->type == IMAP_ARG_LITERAL_SIZE_NONSYNC;
-		ctx->binary_input = args->literal8;
-		valid = TRUE;
 	}
 	if (!IMAP_ARG_IS_EOL(&args[1]))
 		valid = FALSE;
@@ -533,6 +532,7 @@ cmd_append_handle_args(struct client_command_context *cmd,
 			/* invalid keywords - delay failure */
 			client_send_box_error(cmd, ctx->box);
 			ctx->failed = TRUE;
+			keywords = NULL;
 		}
 	}
 
@@ -665,6 +665,7 @@ static bool cmd_append_finish_parsing(struct client_command_context *cmd)
 		imap_write_seq_range(msg, &changes.saved_uids);
 		str_append(msg, "] Append completed.");
 	}
+	ctx->client->append_count += save_count;
 	pool_unref(&changes.pool);
 
 	if (ctx->box == cmd->client->mailbox) {
@@ -911,11 +912,11 @@ bool cmd_append(struct client_command_context *cmd)
 		ctx->t = mailbox_transaction_begin(ctx->box,
 					MAILBOX_TRANSACTION_FLAG_EXTERNAL |
 					MAILBOX_TRANSACTION_FLAG_ASSIGN_UIDS);
+		imap_transaction_set_cmd_reason(ctx->t, cmd);
 	}
 
 	io_remove(&client->io);
-	client->io = io_add(i_stream_get_fd(client->input), IO_READ,
-			    client_input_append, cmd);
+	client->io = io_add_istream(client->input, client_input_append, cmd);
 	/* append is special because we're only waiting on client input, not
 	   client output, so disable the standard output handler until we're
 	   finished */

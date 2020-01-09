@@ -23,6 +23,7 @@ enum index_cache_field {
 	MAIL_CACHE_GUID,
 	MAIL_CACHE_MESSAGE_PARTS,
 	MAIL_CACHE_BINARY_PARTS,
+	MAIL_CACHE_BODY_SNIPPET,
 
 	MAIL_INDEX_CACHE_FIELD_COUNT
 };
@@ -43,7 +44,9 @@ enum mail_cache_record_flag {
 	/* Mail header or body is known to contain NUL characters. */
 	MAIL_CACHE_FLAG_HAS_NULS		= 0x0004,
 	/* Mail header or body is known to not contain NUL characters. */
-	MAIL_CACHE_FLAG_HAS_NO_NULS		= 0x0008,
+	MAIL_CACHE_FLAG_HAS_NO_NULS		= 0x0020,
+	/* obsolete _HAS_NO_NULS flag, which was being set incorrectly */
+	MAIL_CACHE_FLAG_HAS_NO_NULS_BROKEN	= 0x0008,
 
 	/* BODY is IMAP_BODY_PLAIN_7BIT_ASCII and rest of BODYSTRUCTURE
 	   fields are NIL */
@@ -81,8 +84,8 @@ struct index_mail_data {
 	struct message_part *parts;
 	struct message_binary_part *bin_parts;
 	const char *envelope, *body, *bodystructure, *guid, *filename;
-	const char *from_envelope;
-	struct message_part_envelope_data *envelope_data;
+	const char *from_envelope, *body_snippet;
+	struct message_part_envelope *envelope_data;
 
 	uint32_t seq;
 	uint32_t cache_flags;
@@ -112,6 +115,7 @@ struct index_mail_data {
 	unsigned int save_bodystructure_header:1;
 	unsigned int save_bodystructure_body:1;
 	unsigned int save_message_parts:1;
+	unsigned int save_body_snippet:1;
 	unsigned int stream_has_only_header:1;
 	unsigned int parsed_bodystructure:1;
 	unsigned int hdr_size_set:1;
@@ -124,6 +128,7 @@ struct index_mail_data {
 	unsigned int initialized_wrapper_stream:1;
 	unsigned int destroy_callback_set:1;
 	unsigned int prefetch_sent:1;
+	unsigned int header_parser_initialized:1;
 };
 
 struct index_mail {
@@ -168,9 +173,12 @@ bool index_mail_prefetch(struct mail *mail);
 void index_mail_add_temp_wanted_fields(struct mail *mail,
 				       enum mail_fetch_field fields,
 				       struct mailbox_header_lookup_ctx *headers);
+void index_mail_update_access_parts_pre(struct mail *mail);
+void index_mail_update_access_parts_post(struct mail *_mail);
 void index_mail_close(struct mail *mail);
 void index_mail_close_streams(struct index_mail *mail);
 void index_mail_free(struct mail *mail);
+void index_mail_set_message_parts_corrupted(struct mail *mail, const char *error);
 
 bool index_mail_want_parse_headers(struct index_mail *mail);
 void index_mail_parse_header_init(struct index_mail *mail,
@@ -180,7 +188,8 @@ void index_mail_parse_header(struct message_part *part,
 			     struct message_header_line *hdr,
 			     struct index_mail *mail) ATTR_NULL(1);
 int index_mail_parse_headers(struct index_mail *mail,
-			     struct mailbox_header_lookup_ctx *headers)
+			     struct mailbox_header_lookup_ctx *headers,
+			     const char *reason)
 	ATTR_NULL(2);
 int index_mail_headers_get_envelope(struct index_mail *mail);
 
@@ -228,15 +237,26 @@ void index_mail_expunge(struct mail *mail);
 void index_mail_precache(struct mail *mail);
 void index_mail_set_cache_corrupted(struct mail *mail,
 				    enum mail_fetch_field field);
+void index_mail_set_cache_corrupted_reason(struct mail *mail,
+					   enum mail_fetch_field field,
+					   const char *reason);
 int index_mail_opened(struct mail *mail, struct istream **stream);
 int index_mail_stream_check_failure(struct index_mail *mail);
+void index_mail_stream_log_failure_for(struct index_mail *mail,
+				       struct istream *input);
+void index_mail_refresh_expunged(struct mail *mail);
 struct index_mail *index_mail_get_index_mail(struct mail *mail);
 
 bool index_mail_get_cached_uoff_t(struct index_mail *mail,
 				  enum index_cache_field field, uoff_t *size_r);
 bool index_mail_get_cached_virtual_size(struct index_mail *mail,
 					uoff_t *size_r);
+bool index_mail_get_cached_body(struct index_mail *mail, const char **value_r);
+bool index_mail_get_cached_bodystructure(struct index_mail *mail,
+					 const char **value_r);
+const uint32_t *index_mail_get_vsize_extension(struct mail *_mail);
 
+bool index_mail_want_cache(struct index_mail *mail, enum index_cache_field field);
 void index_mail_cache_add(struct index_mail *mail, enum index_cache_field field,
 			  const void *data, size_t data_size);
 void index_mail_cache_add_idx(struct index_mail *mail, unsigned int field_idx,
@@ -251,5 +271,7 @@ void index_mail_cache_parse_deinit(struct mail *mail, time_t received_date,
 int index_mail_cache_lookup_field(struct index_mail *mail, buffer_t *buf,
 				  unsigned int field_idx);
 void index_mail_save_finish(struct mail_save_context *ctx);
+
+const char *index_mail_cache_reason(struct mail *mail, const char *reason);
 
 #endif

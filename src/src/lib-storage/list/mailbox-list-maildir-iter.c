@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -51,7 +51,7 @@ maildir_fill_parents(struct maildir_list_iterate_context *ctx,
 	struct mail_namespace *ns = ctx->ctx.list->ns;
 	struct mailbox_node *node;
 	const char *p;
-	unsigned int vname_len = strlen(vname);
+	size_t vname_len = strlen(vname);
 	bool created;
 	char ns_sep = mail_namespace_get_sep(ns);
 
@@ -441,7 +441,10 @@ maildir_list_iter_init(struct mailbox_list *_list, const char *const *patterns,
 	ctx->prefix_char = strcmp(_list->name, MAILBOX_LIST_NAME_IMAPDIR) == 0 ?
 		'\0' : list->sep;
 
-	ctx->dir = _list->set.root_dir;
+	if (_list->set.iter_from_index_dir)
+		ctx->dir = _list->set.index_dir;
+	else
+		ctx->dir = _list->set.root_dir;
 
 	if ((flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) != 0) {
 		/* Listing only subscribed mailboxes.
@@ -499,9 +502,15 @@ maildir_list_iter_next(struct mailbox_list_iterate_context *_ctx)
 
 	node = mailbox_tree_iterate_next(ctx->tree_iter, &ctx->info.vname);
 	if (node == NULL)
-		return NULL;
+		return mailbox_list_iter_default_next(_ctx);
 
 	ctx->info.flags = node->flags;
+	if (strcmp(ctx->info.vname, "INBOX") == 0 &&
+	    mail_namespace_is_inbox_noinferiors(ctx->info.ns)) {
+		i_assert((ctx->info.flags & MAILBOX_NOCHILDREN) != 0);
+		ctx->info.flags &= ~MAILBOX_NOCHILDREN;
+		ctx->info.flags |= MAILBOX_NOINFERIORS;
+	}
 	if ((_ctx->flags & MAILBOX_LIST_ITER_RETURN_SUBSCRIBED) != 0 &&
 	    (_ctx->flags & MAILBOX_LIST_ITER_SELECT_SUBSCRIBED) == 0) {
 		/* we're listing all mailboxes but we want to know

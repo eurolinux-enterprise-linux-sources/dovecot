@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -77,10 +77,38 @@ char *str_unescape(char *str)
 	return start;
 }
 
-void str_append_tabescaped(string_t *dest, const char *src)
+int str_unescape_next(const char **str, const char **unescaped_r)
 {
-	for (; *src != '\0'; src++) {
-		switch (*src) {
+	const char *p;
+	char *escaped;
+	bool esc_found = FALSE;
+
+	for (p = *str; *p != '\0'; p++) {
+		if (*p == '"')
+			break;
+		else if (*p == '\\') {
+			if (p[1] == '\0')
+				return -1;
+			esc_found = TRUE;
+			p++;
+		}
+	}
+	if (*p != '"')
+		return -1;
+	escaped = p_strdup_until(unsafe_data_stack_pool, *str, p);
+	*str = p+1;
+	*unescaped_r = !esc_found ? escaped : str_unescape(escaped);
+	return 0;
+}
+
+void str_append_tabescaped_n(string_t *dest, const unsigned char *src, size_t src_size)
+{
+	for (size_t i = 0; i < src_size; i++) {
+		switch (src[i]) {
+		case '\000':
+			str_append_c(dest, '\001');
+			str_append_c(dest, '0');
+			break;
 		case '\001':
 			str_append_c(dest, '\001');
 			str_append_c(dest, '1');
@@ -98,11 +126,16 @@ void str_append_tabescaped(string_t *dest, const char *src)
 			str_append_c(dest, 'n');
 			break;
 		default:
-			str_append_c(dest, *src);
+			str_append_c(dest, src[i]);
 			break;
 		}
 	}
 }
+
+void str_append_tabescaped(string_t *dest, const char *src) {
+	str_append_tabescaped_n(dest, (const unsigned char*)src, strlen(src));
+}
+
 
 const char *str_tabescape(const char *str)
 {
@@ -137,6 +170,9 @@ void str_append_tabunescaped(string_t *dest, const void *src, size_t src_size)
 			i++;
 			if (i < src_size) {
 				switch (src_c[i]) {
+				case '0':
+					str_append_c(dest, '\000');
+					break;
 				case '1':
 					str_append_c(dest, '\001');
 					break;
@@ -165,10 +201,10 @@ char *str_tabunescape(char *str)
 	/* @UNSAFE */
 	char *dest, *start = str;
 
-	while (*str != '\001') {
-		if (*str == '\0')
-			return start;
-		str++;
+	str = strchr(str, '\001');
+	if (str == NULL) {
+		/* no unescaping needed */
+		return start;
 	}
 
 	for (dest = str; *str != '\0'; str++) {
@@ -179,6 +215,9 @@ char *str_tabunescape(char *str)
 			if (*str == '\0')
 				break;
 			switch (*str) {
+			case '0':
+				*dest++ = '\000';
+				break;
 			case '1':
 				*dest++ = '\001';
 				break;
@@ -202,6 +241,58 @@ char *str_tabunescape(char *str)
 	return start;
 }
 
+const char *t_str_tabunescape(const char *str)
+{
+	if (strchr(str, '\001') == NULL)
+		return str;
+	else
+		return str_tabunescape(t_strdup_noconst(str));
+}
+
+const char *const *t_strsplit_tabescaped_inplace(char *data)
+{
+	/* @UNSAFE */
+	char **array;
+	unsigned int count, new_alloc_count, alloc_count;
+
+	if (*data == '\0')
+		return t_new(const char *, 1);
+
+	alloc_count = 32;
+	array = t_malloc(sizeof(char *) * alloc_count);
+
+	array[0] = data; count = 1;
+	bool need_unescape = FALSE;
+	while ((data = strpbrk(data, "\t\001")) != NULL) {
+		/* separator or escape char found */
+		if (*data == '\001') {
+			need_unescape = TRUE;
+			data++;
+			continue;
+		}
+		if (count+1 >= alloc_count) {
+			new_alloc_count = nearest_power(alloc_count+1);
+			array = p_realloc(unsafe_data_stack_pool, array,
+					  sizeof(char *) * alloc_count,
+					  sizeof(char *) *
+					  new_alloc_count);
+			alloc_count = new_alloc_count;
+		}
+		*data++ = '\0';
+		if (need_unescape) {
+			str_tabunescape(array[count-1]);
+			need_unescape = FALSE;
+		}
+		array[count++] = data;
+	}
+	if (need_unescape)
+		str_tabunescape(array[count-1]);
+	i_assert(count < alloc_count);
+	array[count] = NULL;
+
+	return (const char *const *)array;
+}
+
 char **p_strsplit_tabescaped(pool_t pool, const char *str)
 {
 	char **args;
@@ -215,5 +306,5 @@ char **p_strsplit_tabescaped(pool_t pool, const char *str)
 
 const char *const *t_strsplit_tabescaped(const char *str)
 {
-	return (void *)p_strsplit_tabescaped(pool_datastack_create(), str);
+	return (void *)p_strsplit_tabescaped(unsafe_data_stack_pool, str);
 }

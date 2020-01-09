@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2018 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 
@@ -13,7 +13,6 @@
 #include "db-dict.h"
 
 #include <stddef.h>
-#include <stdlib.h>
 
 enum dict_settings_section {
 	DICT_SETTINGS_SECTION_ROOT = 0,
@@ -194,8 +193,9 @@ static bool parse_section(const char *type, const char *name,
 				ctx->cur_key->parsed_format =
 					DB_DICT_VALUE_FORMAT_JSON;
 			} else {
-				return t_strconcat("Unknown key format: ",
-						   ctx->cur_key->format, NULL);
+				*errormsg = t_strconcat("Unknown key format: ",
+					ctx->cur_key->format, NULL);
+				return FALSE;
 			}
 		}
 		ctx->cur_key = NULL;
@@ -206,10 +206,14 @@ static bool parse_section(const char *type, const char *name,
 		return FALSE;
 	}
 	if (strcmp(type, "key") == 0) {
-		if (name == NULL)
-			return "Key section is missing name";
-		if (strchr(name, '.') != NULL)
-			return "Key section names must not contain '.'";
+		if (name == NULL) {
+			*errormsg = "Key section is missing name";
+			return FALSE;
+		}
+		if (strchr(name, '.') != NULL) {
+			*errormsg = "Key section names must not contain '.'";
+			return FALSE;
+		}
 		ctx->section = DICT_SETTINGS_SECTION_KEY;
 		ctx->cur_key = array_append_space(&ctx->conn->set.keys);
 		*ctx->cur_key = default_key_settings;
@@ -293,7 +297,7 @@ struct dict_connection *db_dict_init(const char *config_path)
 	p_array_init(&conn->set.parsed_passdb_objects, pool, 2);
 	p_array_init(&conn->set.parsed_userdb_objects, pool, 2);
 
-	memset(&ctx, 0, sizeof(ctx));
+	i_zero(&ctx);
 	ctx.conn = conn;
 	if (!settings_read(config_path, NULL, parse_setting,
 			   parse_section, &ctx, &error))
@@ -404,19 +408,19 @@ static int db_dict_iter_lookup_key_values(struct db_dict_value_iter *iter)
 			continue;
 
 		str_truncate(path, strlen(DICT_PATH_SHARED));
-		var_expand(path, key->key->key, iter->var_expand_table);
+		str_append(path, key->key->key);
 		ret = dict_lookup(iter->conn->dict, iter->pool,
 				  str_c(path), &key->value);
 		if (ret > 0) {
-			auth_request_log_debug(iter->auth_request, "dict",
+			auth_request_log_debug(iter->auth_request, AUTH_SUBSYS_DB,
 					       "Lookup: %s = %s", str_c(path),
 					       key->value);
 		} else if (ret < 0) {
-			auth_request_log_error(iter->auth_request, "dict",
+			auth_request_log_error(iter->auth_request, AUTH_SUBSYS_DB,
 				"Failed to lookup key %s", str_c(path));
 			return -1;
 		} else if (key->key->default_value != NULL) {
-			auth_request_log_debug(iter->auth_request, "dict",
+			auth_request_log_debug(iter->auth_request, AUTH_SUBSYS_DB,
 				"Lookup: %s not found, using default value %s",
 				str_c(path), key->key->default_value);
 			key->value = key->key->default_value;
@@ -439,7 +443,7 @@ int db_dict_value_iter_init(struct dict_connection *conn,
 	pool_t pool;
 	int ret;
 
-	pool = pool_alloconly_create("auth dict lookup", 1024);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"auth dict lookup", 1024);
 	iter = p_new(pool, struct db_dict_value_iter, 1);
 	iter->pool = pool;
 	iter->conn = conn;
@@ -453,7 +457,14 @@ int db_dict_value_iter_init(struct dict_connection *conn,
 	p_array_init(&iter->keys, pool, array_count(&conn->set.keys));
 	array_foreach(&conn->set.keys, key) {
 		iterkey = array_append_space(&iter->keys);
-		iterkey->key = key;
+		struct db_dict_key *new_key = p_new(iter->pool, struct db_dict_key, 1);
+		memcpy(new_key, key, sizeof(struct db_dict_key));
+		string_t *expanded_key = str_new(iter->pool, strlen(key->key));
+		auth_request_var_expand_with_table(expanded_key, key->key, auth_request,
+						   iter->var_expand_table,
+						   NULL);
+		new_key->key = str_c(expanded_key);
+		iterkey->key = new_key;
 	}
 	T_BEGIN {
 		db_dict_iter_find_used_keys(iter);

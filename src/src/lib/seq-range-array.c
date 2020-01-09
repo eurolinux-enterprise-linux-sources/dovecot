@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -110,8 +110,10 @@ void seq_range_array_add_with_init(ARRAY_TYPE(seq_range) *array,
 	seq_range_array_add(array, seq);
 }
 
-void seq_range_array_add_range(ARRAY_TYPE(seq_range) *array,
-			       uint32_t seq1, uint32_t seq2)
+static void
+seq_range_array_add_range_internal(ARRAY_TYPE(seq_range) *array,
+				   uint32_t seq1, uint32_t seq2,
+				   unsigned int *r_count)
 {
 	struct seq_range *data, value;
 	unsigned int idx1, idx2, count;
@@ -120,11 +122,48 @@ void seq_range_array_add_range(ARRAY_TYPE(seq_range) *array,
 	seq_range_lookup(array, seq2, &idx2);
 
 	data = array_get_modifiable(array, &count);
+	if (r_count != NULL) {
+		/* Find number we're adding by counting the number we're
+		   not adding, and subtracting that from the nominal range. */
+		unsigned int added = seq2+1 - seq1;
+		unsigned int countidx2 = idx2;
+		unsigned int overcounted = 0u, notadded = 0u;
+		unsigned int i;
+
+		if (idx1 == count) {
+			/* not in a range as too far right */
+		} else if (seq1 < data[idx1].seq1) {
+			/* not in a range, to the left of a real range */
+		} else {
+			/* count the whole of this range, which is an overcount */
+			overcounted += seq1 - data[idx1].seq1;
+			/* fencepost check: equality means the whole range is valid,
+			   therefore there's no overcounting. Result = 0 overcount */
+		}
+		if (idx2 == count) {
+			/* not in a range as too far right */
+		} else  if (seq2 < data[idx2].seq1) {
+			/* not in a range, to the left of a real range */
+		} else {
+			/* count the whole of this range, which is an overcount */
+			overcounted += data[idx2].seq2 - seq2;
+			countidx2++; /* may become == count i.e. past the end */
+			/* fencepost check: equality  means the whole range is valid,
+			   therefore there's no overcounting. Result = 0 overcount. */
+		}
+		/* Now count how many we're not adding */
+		for (i = idx1; i < countidx2; i++)
+			notadded += data[i].seq2+1 - data[i].seq1;
+		/* Maybe the not added tally included some over-counting too */
+		added -= (notadded - overcounted);
+		*r_count = added;
+	}
+
 	if (idx1 > 0 && data[idx1-1].seq2+1 == seq1)
 		idx1--;
 
 	if (idx1 == idx2 &&
-	    (idx2 == count || data[idx2].seq1 > seq2+1) &&
+	    (idx2 == count || (seq2 < (uint32_t)-1 && data[idx2].seq1 > seq2+1)) &&
 	    (idx1 == 0 || data[idx1-1].seq2 < seq1-1)) {
 		/* no overlapping */
 		value.seq1 = seq1;
@@ -147,6 +186,19 @@ void seq_range_array_add_range(ARRAY_TYPE(seq_range) *array,
 			array_delete(array, idx1 + 1, idx2 - idx1);
 		}
 	}
+}
+
+void seq_range_array_add_range(ARRAY_TYPE(seq_range) *array,
+			       uint32_t seq1, uint32_t seq2)
+{
+	seq_range_array_add_range_internal(array, seq1, seq2, NULL);
+}
+unsigned int seq_range_array_add_range_count(ARRAY_TYPE(seq_range) *array,
+					     uint32_t seq1, uint32_t seq2)
+{
+	unsigned int count;
+	seq_range_array_add_range_internal(array, seq1, seq2, &count);
+	return count;
 }
 
 void seq_range_array_merge(ARRAY_TYPE(seq_range) *dest,
@@ -288,6 +340,28 @@ unsigned int seq_range_array_remove_seq_range(ARRAY_TYPE(seq_range) *dest,
 	return ret;
 }
 
+void seq_range_array_remove_nth(ARRAY_TYPE(seq_range) *array,
+				uint32_t n, uint32_t count)
+{
+	struct seq_range_iter iter;
+	uint32_t seq1, seq2;
+
+	if (count == 0)
+		return;
+
+	seq_range_array_iter_init(&iter, array);
+	if (!seq_range_array_iter_nth(&iter, n, &seq1)) {
+		/* n points beyond array */
+		return;
+	}
+	if (count-1 >= (uint32_t)-1 - n ||
+	    !seq_range_array_iter_nth(&iter, n + (count-1), &seq2)) {
+		/* count points beyond array */
+		seq2 = (uint32_t)-1;
+	}
+	seq_range_array_remove_range(array, seq1, seq2);
+}
+
 unsigned int seq_range_array_intersect(ARRAY_TYPE(seq_range) *dest,
 				       const ARRAY_TYPE(seq_range) *src)
 {
@@ -353,7 +427,7 @@ void seq_range_array_invert(ARRAY_TYPE(seq_range) *array,
 {
 	struct seq_range *range, value;
 	unsigned int i, count;
-	uint32_t next_min_seq;
+	uint32_t prev_min_seq;
 
 	if (array_is_created(array))
 		range = array_get_modifiable(array, &count);
@@ -380,16 +454,25 @@ void seq_range_array_invert(ARRAY_TYPE(seq_range) *array,
 	}
 
 	for (i = 0; i < count; ) {
-		next_min_seq = range[i].seq2 + 1;
-		if (range[i].seq1 == min_seq) {
+		prev_min_seq = min_seq;
+		min_seq = range[i].seq2;
+		if (range[i].seq1 == prev_min_seq) {
 			array_delete(array, i, 1);
 			range = array_get_modifiable(array, &count);
 		} else {
 			range[i].seq2 = range[i].seq1 - 1;
-			range[i].seq1 = min_seq;
+			range[i].seq1 = prev_min_seq;
 			i++;
 		}
-		min_seq = next_min_seq;
+		if (min_seq >= max_seq) {
+			/* max_seq is reached. the rest of the array should be
+			   empty. we'll return here, because min_seq++ may
+			   wrap to 0. */
+			i_assert(min_seq == max_seq);
+			i_assert(i == count);
+			return;
+		}
+		min_seq++;
 	}
 	if (min_seq <= max_seq) {
 		value.seq1 = min_seq;
@@ -401,7 +484,7 @@ void seq_range_array_invert(ARRAY_TYPE(seq_range) *array,
 void seq_range_array_iter_init(struct seq_range_iter *iter_r,
 			       const ARRAY_TYPE(seq_range) *array)
 {
-	memset(iter_r, 0, sizeof(*iter_r));
+	i_zero(iter_r);
 	iter_r->array = array;
 }
 

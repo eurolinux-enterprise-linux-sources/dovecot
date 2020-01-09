@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "utc-mktime.h"
@@ -20,8 +20,33 @@ static int tm_cmp(const struct tm *tm1, const struct tm *tm2)
 	return tm1->tm_sec - tm2->tm_sec;
 }
 
+static inline void adjust_leap_second(struct tm *tm)
+{
+	if (tm->tm_sec == 60)
+		tm->tm_sec = 59;
+}
+
+#ifdef HAVE_TIMEGM
+/* Normalization done by timegm is considered a failure here, since it means
+ * the timestamp is not valid as-is. Leap second 60 is adjusted to 59 before
+ * this though. */
 time_t utc_mktime(const struct tm *tm)
 {
+	struct tm leap_adj_tm = *tm;
+	adjust_leap_second(&leap_adj_tm);
+	struct tm tmp = leap_adj_tm;
+	time_t t;
+
+	t = timegm(&tmp);
+	if (tm_cmp(&leap_adj_tm, &tmp) != 0)
+		return (time_t)-1;
+	return t;
+}
+#else
+time_t utc_mktime(const struct tm *tm)
+{
+	struct tm leap_adj_tm = *tm;
+	adjust_leap_second(&leap_adj_tm);
 	const struct tm *try_tm;
 	time_t t;
 	int bits, dir;
@@ -37,7 +62,7 @@ time_t utc_mktime(const struct tm *tm)
 #endif
 	for (bits = TIME_T_MAX_BITS - 2;; bits--) {
 		try_tm = gmtime(&t);
-		dir = tm_cmp(tm, try_tm);
+		dir = tm_cmp(&leap_adj_tm, try_tm);
 		if (dir == 0)
 			return t;
 		if (bits < 0)
@@ -51,3 +76,4 @@ time_t utc_mktime(const struct tm *tm)
 
 	return (time_t)-1;
 }
+#endif

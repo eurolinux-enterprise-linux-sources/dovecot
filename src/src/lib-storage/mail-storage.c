@@ -1,16 +1,24 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
 #include "array.h"
 #include "llist.h"
 #include "str.h"
+#include "str-sanitize.h"
+#include "sha1.h"
 #include "unichar.h"
+#include "hex-binary.h"
+#include "file-dotlock.h"
+#include "file-create-locked.h"
 #include "istream.h"
 #include "eacces-error.h"
 #include "mkdir-parents.h"
 #include "time-util.h"
 #include "var-expand.h"
+#include "dsasl-client.h"
+#include "imap-date.h"
+#include "settings-parser.h"
 #include "mail-index-private.h"
 #include "mail-index-alloc-cache.h"
 #include "mailbox-tree.h"
@@ -20,13 +28,15 @@
 #include "mail-namespace.h"
 #include "mail-search.h"
 #include "mail-search-register.h"
+#include "mail-search-mime-register.h"
 #include "mailbox-search-result-private.h"
 #include "mailbox-guid-cache.h"
+#include "mail-cache.h"
 
-#include <stdlib.h>
 #include <ctype.h>
 
-#define MAILBOX_DELETE_RETRY_SECS (60*5)
+#define MAILBOX_DELETE_RETRY_SECS 30
+#define MAILBOX_MAX_HIERARCHY_NAME_LENGTH 255
 
 extern struct mail_search_register *mail_search_register_imap;
 extern struct mail_search_register *mail_search_register_human;
@@ -38,23 +48,37 @@ struct mail_storage_mail_index_module mail_storage_mail_index_module =
 	MODULE_CONTEXT_INIT(&mail_index_module_register);
 ARRAY_TYPE(mail_storage) mail_storage_classes;
 
+static int mail_storage_init_refcount = 0;
+
 void mail_storage_init(void)
 {
+	if (mail_storage_init_refcount++ > 0)
+		return;
+	dsasl_clients_init();
+	mailbox_attributes_init();
 	mailbox_lists_init();
 	mail_storage_hooks_init();
 	i_array_init(&mail_storage_classes, 8);
+	mail_storage_register_all();
+	mailbox_list_register_all();
 }
 
 void mail_storage_deinit(void)
 {
+	i_assert(mail_storage_init_refcount > 0);
+	if (--mail_storage_init_refcount > 0)
+		return;
 	if (mail_search_register_human != NULL)
 		mail_search_register_deinit(&mail_search_register_human);
 	if (mail_search_register_imap != NULL)
 		mail_search_register_deinit(&mail_search_register_imap);
+	mail_search_mime_register_deinit();
 	if (array_is_created(&mail_storage_classes))
 		array_free(&mail_storage_classes);
 	mail_storage_hooks_deinit();
 	mailbox_lists_deinit();
+	mailbox_attributes_deinit();
+	dsasl_clients_deinit();
 }
 
 void mail_storage_class_register(struct mail_storage *storage_class)
@@ -204,8 +228,8 @@ mail_storage_get_class(struct mail_namespace *ns, const char *driver,
 }
 
 static int
-mail_storage_verify_root(const char *root_dir, bool autocreate,
-			 const char **error_r)
+mail_storage_verify_root(const char *root_dir, const char *dir_type,
+			 bool autocreate, const char **error_r)
 {
 	struct stat st;
 
@@ -220,7 +244,7 @@ mail_storage_verify_root(const char *root_dir, bool autocreate,
 		return -1;
 	} else if (!autocreate) {
 		*error_r = t_strdup_printf(
-			"Root mail directory doesn't exist: %s", root_dir);
+			"Root %s directory doesn't exist: %s", dir_type, root_dir);
 		return -1;
 	} else {
 		/* doesn't exist */
@@ -232,12 +256,19 @@ static int
 mail_storage_create_root(struct mailbox_list *list,
 			 enum mail_storage_flags flags, const char **error_r)
 {
-	const char *root_dir, *error;
+	const char *root_dir, *type_name, *error;
+	enum mailbox_list_path_type type;
 	bool autocreate;
 	int ret;
 
-	if (!mailbox_list_get_root_path(list, MAILBOX_LIST_PATH_TYPE_MAILBOX,
-					&root_dir)) {
+	if (list->set.iter_from_index_dir) {
+		type = MAILBOX_LIST_PATH_TYPE_INDEX;
+		type_name = "index";
+	} else {
+		type = MAILBOX_LIST_PATH_TYPE_MAILBOX;
+		type_name = "mail";
+	}
+	if (!mailbox_list_get_root_path(list, type, &root_dir)) {
 		/* storage doesn't use directories (e.g. shared root) */
 		return 0;
 	}
@@ -248,7 +279,7 @@ mail_storage_create_root(struct mailbox_list *list,
 
 		/* we don't need to verify, but since debugging is
 		   enabled, check and log if the root doesn't exist */
-		if (mail_storage_verify_root(root_dir, FALSE, &error) < 0) {
+		if (mail_storage_verify_root(root_dir, type_name, FALSE, &error) < 0) {
 			i_debug("Namespace %s: Creating storage despite: %s",
 				list->ns->prefix, error);
 		}
@@ -256,7 +287,13 @@ mail_storage_create_root(struct mailbox_list *list,
 	}
 
 	autocreate = (flags & MAIL_STORAGE_FLAG_NO_AUTOCREATE) == 0;
-	ret = mail_storage_verify_root(root_dir, autocreate, error_r);
+	if (autocreate && list->set.iter_from_index_dir) {
+		/* If the directories don't exist, we'll just autocreate them
+		   later. FIXME: Make this the default in v2.3 even when
+		   ITERINDEX isn't used. */
+		return 0;
+	}
+	ret = mail_storage_verify_root(root_dir, type_name, autocreate, error_r);
 	if (ret == 0) {
 		ret = mailbox_list_try_mkdir_root(list, root_dir,
 						  MAILBOX_LIST_PATH_TYPE_MAILBOX,
@@ -274,7 +311,8 @@ mail_storage_match_class(struct mail_storage *storage,
 		return FALSE;
 
 	if ((storage->class_flags & MAIL_STORAGE_CLASS_FLAG_UNIQUE_ROOT) != 0 &&
-	    strcmp(storage->unique_root_dir, set->root_dir) != 0)
+	    strcmp(storage->unique_root_dir,
+	    	(set->root_dir != NULL ? set->root_dir : "")) != 0)
 		return FALSE;
 
 	if (strcmp(storage->name, "shared") == 0) {
@@ -325,9 +363,7 @@ int mail_storage_create_full(struct mail_namespace *ns, const char *driver,
 		}
 	}
 
-	memset(&list_set, 0, sizeof(list_set));
-	list_set.mailbox_dir_name = "";
-	list_set.maildir_name = "";
+	mailbox_list_settings_init_defaults(&list_set);
 	if (data == NULL) {
 		/* autodetect */
 	} else if (driver != NULL && strcmp(driver, "shared") == 0) {
@@ -353,6 +389,8 @@ int mail_storage_create_full(struct mail_namespace *ns, const char *driver,
 			list_flags |= MAILBOX_LIST_FLAG_MAILBOX_FILES;
 		if ((storage_class->class_flags & MAIL_STORAGE_CLASS_FLAG_NO_ROOT) != 0)
 			list_flags |= MAILBOX_LIST_FLAG_NO_MAIL_FILES;
+		if ((storage_class->class_flags & MAIL_STORAGE_CLASS_FLAG_NO_LIST_DELETES) != 0)
+			list_flags |= MAILBOX_LIST_FLAG_NO_DELETES;
 		if (mailbox_list_create(list_set.layout, ns, &list_set,
 					list_flags, &list, error_r) < 0) {
 			*error_r = t_strdup_printf("Mailbox list driver %s: %s",
@@ -431,7 +469,12 @@ void mail_storage_unref(struct mail_storage **_storage)
 	DLLIST_REMOVE(&storage->user->storages, storage);
 
 	storage->v.destroy(storage);
+	i_free(storage->last_internal_error);
 	i_free(storage->error_string);
+	if (array_is_created(&storage->error_stack)) {
+		i_assert(array_count(&storage->error_stack) == 0);
+		array_free(&storage->error_stack);
+	}
 
 	*_storage = NULL;
 	pool_unref(&storage->pool);
@@ -462,14 +505,19 @@ void mail_storage_clear_error(struct mail_storage *storage)
 {
 	i_free_and_null(storage->error_string);
 
+	i_free(storage->last_internal_error);
+	storage->last_error_is_internal = FALSE;
 	storage->error = MAIL_ERROR_NONE;
 }
 
 void mail_storage_set_error(struct mail_storage *storage,
 			    enum mail_error error, const char *string)
 {
-	i_free(storage->error_string);
-	storage->error_string = i_strdup(string);
+	if (storage->error_string != string) {
+		i_free(storage->error_string);
+		storage->error_string = i_strdup(string);
+	}
+	storage->last_error_is_internal = FALSE;
 	storage->error = error;
 }
 
@@ -482,21 +530,55 @@ void mail_storage_set_internal_error(struct mail_storage *storage)
 	i_free(storage->error_string);
 	storage->error_string = i_strdup(str);
 	storage->error = MAIL_ERROR_TEMP;
+
+	/* this function doesn't set last_internal_error, so
+	   last_error_is_internal can't be TRUE. */
+	storage->last_error_is_internal = FALSE;
 }
 
 void mail_storage_set_critical(struct mail_storage *storage,
 			       const char *fmt, ...)
 {
+	char *old_error = storage->error_string;
+	char *old_internal_error = storage->last_internal_error;
 	va_list va;
 
-	va_start(va, fmt);
-	i_error("%s", t_strdup_vprintf(fmt, va));
-	va_end(va);
-
+	storage->error_string = NULL;
+	storage->last_internal_error = NULL;
 	/* critical errors may contain sensitive data, so let user
 	   see only "Internal error" with a timestamp to make it
 	   easier to look from log files the actual error message. */
 	mail_storage_set_internal_error(storage);
+
+	va_start(va, fmt);
+	storage->last_internal_error = i_strdup_vprintf(fmt, va);
+	va_end(va);
+	storage->last_error_is_internal = TRUE;
+	i_error("%s", storage->last_internal_error);
+
+	/* free the old_error and old_internal_error only after the new error
+	   is generated, because they may be one of the parameters. */
+	i_free(old_error);
+	i_free(old_internal_error);
+}
+
+const char *mail_storage_get_last_internal_error(struct mail_storage *storage,
+						 enum mail_error *error_r)
+{
+	if (error_r != NULL)
+		*error_r = storage->error;
+	if (storage->last_error_is_internal) {
+		i_assert(storage->last_internal_error != NULL);
+		return storage->last_internal_error;
+	}
+	return mail_storage_get_last_error(storage, error_r);
+}
+
+const char *mailbox_get_last_internal_error(struct mailbox *box,
+					    enum mail_error *error_r)
+{
+	return mail_storage_get_last_internal_error(mailbox_get_storage(box),
+						    error_r);
 }
 
 void mail_storage_copy_error(struct mail_storage *dest,
@@ -524,11 +606,27 @@ void mail_storage_copy_list_error(struct mail_storage *storage,
 
 void mailbox_set_index_error(struct mailbox *box)
 {
-	if (mail_index_is_deleted(box->index))
+	if (mail_index_is_deleted(box->index)) {
 		mailbox_set_deleted(box);
-	else
-		mail_storage_set_internal_error(box->storage);
-	mail_index_reset_error(box->index);
+		mail_index_reset_error(box->index);
+	} else {
+		mail_storage_set_index_error(box->storage, box->index);
+	}
+}
+
+void mail_storage_set_index_error(struct mail_storage *storage,
+				  struct mail_index *index)
+{
+	const char *index_error;
+
+	mail_storage_set_internal_error(storage);
+	/* use the lib-index's error as our internal error string */
+	index_error = mail_index_get_error_message(index);
+	if (index_error == NULL)
+		index_error = "BUG: Unknown internal index error";
+	storage->last_internal_error = i_strdup(index_error);
+	storage->last_error_is_internal = TRUE;
+	mail_index_reset_error(index);
 }
 
 const struct mail_storage_settings *
@@ -595,6 +693,35 @@ enum mail_error mailbox_get_last_mail_error(struct mailbox *box)
 	return error;
 }
 
+void mail_storage_last_error_push(struct mail_storage *storage)
+{
+	struct mail_storage_error *err;
+
+	if (!array_is_created(&storage->error_stack))
+		i_array_init(&storage->error_stack, 2);
+	err = array_append_space(&storage->error_stack);
+	err->error_string = i_strdup(storage->error_string);
+	err->error = storage->error;
+	err->last_error_is_internal = storage->last_error_is_internal;
+	if (err->last_error_is_internal)
+		err->last_internal_error = i_strdup(storage->last_internal_error);
+}
+
+void mail_storage_last_error_pop(struct mail_storage *storage)
+{
+	unsigned int count = array_count(&storage->error_stack);
+	const struct mail_storage_error *err =
+		array_idx(&storage->error_stack, count-1);
+
+	i_free(storage->error_string);
+	i_free(storage->last_internal_error);
+	storage->error_string = err->error_string;
+	storage->error = err->error;
+	storage->last_error_is_internal = err->last_error_is_internal;
+	storage->last_internal_error = err->last_internal_error;
+	array_delete(&storage->error_stack, count-1, 1);
+}
+
 bool mail_storage_is_mailbox_file(struct mail_storage *storage)
 {
 	return (storage->class_flags &
@@ -620,12 +747,10 @@ bool mail_storage_set_error_from_errno(struct mail_storage *storage)
 }
 
 const struct mailbox_settings *
-mailbox_settings_find(struct mail_user *user, const char *vname)
+mailbox_settings_find(struct mail_namespace *ns, const char *vname)
 {
 	struct mailbox_settings *const *box_set;
-	struct mail_namespace *ns;
 
-	ns = mail_namespace_find(user->namespaces, vname);
 	if (!array_is_created(&ns->set->mailboxes))
 		return NULL;
 
@@ -687,7 +812,7 @@ struct mailbox *mailbox_alloc(struct mailbox_list *list, const char *vname,
 		}
 
 		box = storage->v.mailbox_alloc(storage, new_list, vname, flags);
-		box->set = mailbox_settings_find(storage->user, vname);
+		box->set = mailbox_settings_find(new_list->ns, vname);
 		box->open_error = open_error;
 		if (open_error != 0)
 			mail_storage_set_error(storage, open_error, errstr);
@@ -727,7 +852,7 @@ struct mailbox *mailbox_alloc_guid(struct mailbox_list *list,
 		i_error("mailbox_alloc_guid(%s): "
 			"Couldn't verify mailbox GUID: %s",
 			guid_128_to_string(guid),
-			mailbox_get_last_error(box, NULL));
+			mailbox_get_last_internal_error(box, NULL));
 		vname = NULL;
 		mailbox_free(&box);
 	} else {
@@ -745,7 +870,14 @@ struct mailbox *mailbox_alloc_guid(struct mailbox_list *list,
 	return box;
 }
 
-static bool mailbox_is_autocreated(struct mailbox *box)
+void mailbox_set_reason(struct mailbox *box, const char *reason)
+{
+	i_assert(reason != NULL);
+
+	box->reason = p_strdup(box->pool, reason);
+}
+
+bool mailbox_is_autocreated(struct mailbox *box)
 {
 	if (box->inbox_user)
 		return TRUE;
@@ -759,7 +891,7 @@ static int mailbox_autocreate(struct mailbox *box)
 	enum mail_error error;
 
 	if (mailbox_create(box, NULL, FALSE) < 0) {
-		errstr = mailbox_get_last_error(box, &error);
+		errstr = mailbox_get_last_internal_error(box, &error);
 		if (error != MAIL_ERROR_EXISTS) {
 			mail_storage_set_critical(box->storage,
 				"Failed to autocreate mailbox %s: %s",
@@ -772,7 +904,8 @@ static int mailbox_autocreate(struct mailbox *box)
 		if (mailbox_set_subscribed(box, TRUE) < 0) {
 			mail_storage_set_critical(box->storage,
 				"Failed to autosubscribe to mailbox %s: %s",
-				box->vname, mailbox_get_last_error(box, NULL));
+				box->vname,
+				mailbox_get_last_internal_error(box, NULL));
 			return -1;
 		}
 	}
@@ -793,7 +926,7 @@ static int mailbox_autocreate_and_reopen(struct mailbox *box)
 		box->storage->user->inbox_open_error_logged = TRUE;
 		mail_storage_set_critical(box->storage,
 			"Opening INBOX failed: %s",
-			mailbox_get_last_error(box, NULL));
+			mailbox_get_last_internal_error(box, NULL));
 	}
 	return ret;
 }
@@ -841,7 +974,19 @@ static int mailbox_verify_name(struct mailbox *box)
 
 	if (ns->prefix_len > 0) {
 		/* vname is either "namespace/box" or "namespace" */
-		i_assert(strncmp(vname, ns->prefix, ns->prefix_len-1) == 0);
+		if (strncmp(vname, ns->prefix, ns->prefix_len-1) != 0 ||
+		    (vname[ns->prefix_len-1] != '\0' &&
+		     vname[ns->prefix_len-1] != ns->prefix[ns->prefix_len-1])) {
+			/* User input shouldn't normally be able to get us in
+			   here. The main reason this isn't an assert is to
+			   allow any input at all to mailbox_verify_*_name()
+			   without crashing. */
+			mail_storage_set_error(box->storage, MAIL_ERROR_PARAMS,
+				t_strdup_printf("Invalid mailbox name '%s': "
+					"Missing namespace prefix '%s'",
+					str_sanitize(vname, 80), ns->prefix));
+			return -1;
+		}
 		vname += ns->prefix_len - 1;
 		if (vname[0] != '\0') {
 			i_assert(vname[0] == ns->prefix[ns->prefix_len-1]);
@@ -918,10 +1063,13 @@ static bool mailbox_name_has_control_chars(const char *name)
 	return FALSE;
 }
 
+void mailbox_skip_create_name_restrictions(struct mailbox *box, bool set)
+{
+	box->skip_create_name_restrictions = set;
+}
+
 int mailbox_verify_create_name(struct mailbox *box)
 {
-	char sep = mail_namespace_get_sep(box->list->ns);
-
 	/* mailbox_alloc() already checks that vname is valid UTF8,
 	   so we don't need to verify that.
 
@@ -929,12 +1077,32 @@ int mailbox_verify_create_name(struct mailbox *box)
 	   visible to users, while storage name may be a fixed length GUID. */
 	if (mailbox_verify_name(box) < 0)
 		return -1;
+	if (box->skip_create_name_restrictions)
+		return 0;
 	if (mailbox_name_has_control_chars(box->vname)) {
 		mail_storage_set_error(box->storage, MAIL_ERROR_PARAMS,
 			"Control characters not allowed in new mailbox names");
 		return -1;
 	}
-	if (mailbox_list_name_is_too_large(box->vname, sep)) {
+	if (strlen(box->vname) > MAILBOX_LIST_NAME_MAX_LENGTH) {
+		mail_storage_set_error(box->storage, MAIL_ERROR_PARAMS,
+				       "Mailbox name too long");
+		return -1;
+	}
+	/* check individual component names, too */
+	const char *old_name = box->name;
+	const char *name;
+	const char sep = mailbox_list_get_hierarchy_sep(box->list);
+	while((name = strchr(old_name, sep)) != NULL) {
+		if (name - old_name > MAILBOX_MAX_HIERARCHY_NAME_LENGTH) {
+			mail_storage_set_error(box->storage, MAIL_ERROR_PARAMS,
+				"Mailbox name too long");
+			return -1;
+		}
+		name++;
+		old_name = name;
+	}
+	if (strlen(old_name) > MAILBOX_MAX_HIERARCHY_NAME_LENGTH) {
 		mail_storage_set_error(box->storage, MAIL_ERROR_PARAMS,
 				       "Mailbox name too long");
 		return -1;
@@ -945,7 +1113,7 @@ int mailbox_verify_create_name(struct mailbox *box)
 static bool have_listable_namespace_prefix(struct mail_namespace *ns,
 					   const char *name)
 {
-	unsigned int name_len = strlen(name);
+	size_t name_len = strlen(name);
 
 	for (; ns != NULL; ns = ns->next) {
 		if ((ns->flags & (NAMESPACE_FLAG_LIST_PREFIX |
@@ -985,7 +1153,7 @@ int mailbox_exists(struct mailbox *box, bool auto_boxes,
 		return 0;
 	}
 
-	if (auto_boxes && box->set != NULL && mailbox_is_autocreated(box)) {
+	if (auto_boxes && mailbox_is_autocreated(box)) {
 		*existence_r = MAILBOX_EXISTENCE_SELECT;
 		return 0;
 	}
@@ -1015,6 +1183,12 @@ mailbox_open_full(struct mailbox *box, struct istream *input)
 
 	if (box->opened)
 		return 0;
+
+	if (box->storage->set->mail_debug && box->reason != NULL) {
+		i_debug("%s: Mailbox opened because: %s",
+			box->vname, box->reason);
+	}
+
 	switch (box->open_error) {
 	case 0:
 		break;
@@ -1048,6 +1222,7 @@ mailbox_open_full(struct mailbox *box, struct istream *input)
 	} T_END;
 
 	if (ret < 0 && box->storage->error == MAIL_ERROR_NOTFOUND &&
+	    !box->deleting &&
 	    box->input == NULL && mailbox_is_autocreated(box)) T_BEGIN {
 		ret = mailbox_autocreate_and_reopen(box);
 	} T_END;
@@ -1066,6 +1241,8 @@ static bool mailbox_try_undelete(struct mailbox *box)
 {
 	time_t mtime;
 
+	i_assert(!box->mailbox_undeleting);
+
 	if ((box->flags & MAILBOX_FLAG_READONLY) != 0) {
 		/* most importantly we don't do this because we want to avoid
 		   a loop: mdbox storage rebuild -> mailbox_open() ->
@@ -1078,7 +1255,10 @@ static bool mailbox_try_undelete(struct mailbox *box)
 	if (mtime + MAILBOX_DELETE_RETRY_SECS > time(NULL))
 		return FALSE;
 
-	if (mailbox_mark_index_deleted(box, FALSE) < 0)
+	box->mailbox_undeleting = TRUE;
+	int ret = mailbox_mark_index_deleted(box, FALSE);
+	box->mailbox_undeleting = FALSE;
+	if (ret < 0)
 		return FALSE;
 	box->mailbox_deleted = FALSE;
 	return TRUE;
@@ -1086,8 +1266,16 @@ static bool mailbox_try_undelete(struct mailbox *box)
 
 int mailbox_open(struct mailbox *box)
 {
+	/* check that the storage supports stubs if require them */
+	if (((box->flags & MAILBOX_FLAG_USE_STUBS) != 0) &&
+	    ((box->storage->storage_class->class_flags & MAIL_STORAGE_CLASS_FLAG_STUBS) == 0)) {
+		mail_storage_set_error(box->storage, MAIL_ERROR_NOTPOSSIBLE,
+				       "Mailbox does not support mail stubs");
+		return -1;
+	}
+
 	if (mailbox_open_full(box, NULL) < 0) {
-		if (!box->mailbox_deleted)
+		if (!box->mailbox_deleted || box->mailbox_undeleting)
 			return -1;
 
 		/* mailbox has been marked as deleted. if this deletion
@@ -1096,6 +1284,11 @@ int mailbox_open(struct mailbox *box)
 		   undelete it and reopen. */
 		if(!mailbox_try_undelete(box))
 			return -1;
+
+		/* make sure we close the mailbox in the middle. some backends
+		   may not have fully opened the mailbox while it was being
+		   undeleted. */
+		mailbox_close(box);
 		if (mailbox_open_full(box, NULL) < 0)
 			return -1;
 	}
@@ -1130,6 +1323,7 @@ static int mailbox_alloc_index_pvt(struct mailbox *box)
 
 int mailbox_open_index_pvt(struct mailbox *box)
 {
+	enum mail_index_open_flags index_flags;
 	int ret;
 
 	if (box->view_pvt != NULL)
@@ -1139,7 +1333,11 @@ int mailbox_open_index_pvt(struct mailbox *box)
 
 	if ((ret = mailbox_alloc_index_pvt(box)) <= 0)
 		return ret;
-	if (mail_index_open(box->index_pvt, MAIL_INDEX_OPEN_FLAG_CREATE) < 0)
+	index_flags = MAIL_INDEX_OPEN_FLAG_CREATE |
+		mail_storage_settings_to_index_flags(box->storage->set);
+	if ((box->flags & MAILBOX_FLAG_SAVEONLY) != 0)
+		index_flags |= MAIL_INDEX_OPEN_FLAG_SAVEONLY;
+	if (mail_index_open(box->index_pvt, index_flags) < 0)
 		return -1;
 	box->view_pvt = mail_index_view_open(box->index_pvt);
 	return 1;
@@ -1169,7 +1367,7 @@ void mail_storage_free_binary_cache(struct mail_storage *storage)
 
 	timeout_remove(&storage->binary_cache.to);
 	i_stream_destroy(&storage->binary_cache.input);
-	memset(&storage->binary_cache, 0, sizeof(storage->binary_cache));
+	i_zero(&storage->binary_cache);
 }
 
 void mailbox_close(struct mailbox *box)
@@ -1188,6 +1386,11 @@ void mailbox_close(struct mailbox *box)
 	box->opened = FALSE;
 	box->mailbox_deleted = FALSE;
 	array_clear(&box->search_results);
+
+	if (array_is_created(&box->recent_flags))
+		array_free(&box->recent_flags);
+	box->recent_flags_prev_uid = 0;
+	box->recent_flags_count = 0;
 }
 
 void mailbox_free(struct mailbox **_box)
@@ -1228,6 +1431,34 @@ bool mailbox_is_any_inbox(struct mailbox *box)
 	return box->inbox_any;
 }
 
+static void mailbox_copy_cache_decisions_from_inbox(struct mailbox *box)
+{
+	struct mail_namespace *ns =
+		mail_namespace_find_inbox(box->storage->user->namespaces);
+	struct mailbox *inbox =
+		mailbox_alloc(ns->list, "INBOX", MAILBOX_FLAG_READONLY);
+	enum mailbox_existence existence;
+
+	/* this should be NoSelect but since inbox can never be
+	   NoSelect we use EXISTENCE_NONE to avoid creating inbox by accident */
+	mailbox_set_reason(inbox, "copy caching decisions");
+	if (mailbox_exists(inbox, FALSE, &existence) == 0 &&
+	    existence != MAILBOX_EXISTENCE_NONE &&
+	    mailbox_open(inbox) == 0 &&
+	    mailbox_open(box) == 0) {
+		struct mail_index_transaction *dit =
+			mail_index_transaction_begin(box->view,
+						     MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
+
+		mail_cache_decisions_copy(dit, inbox->cache, box->cache);
+
+		/* we can't do much about errors here */
+		(void)mail_index_transaction_commit(&dit);
+	}
+
+	mailbox_free(&inbox);
+}
+
 int mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 		   bool directory)
 {
@@ -1236,21 +1467,48 @@ int mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 	if (mailbox_verify_create_name(box) < 0)
 		return -1;
 
+	/* Avoid race conditions by keeping mailbox list locked during changes.
+	   This especially fixes a race during INBOX creation with LAYOUT=index
+	   because it scans for missing mailboxes if INBOX doesn't exist. The
+	   second process's scan can find a half-created INBOX and add it,
+	   causing the first process to become confused. */
+	if (mailbox_list_lock(box->list) < 0) {
+		mail_storage_copy_list_error(box->storage, box->list);
+		return -1;
+	}
 	box->creating = TRUE;
 	ret = box->v.create_box(box, update, directory);
 	box->creating = FALSE;
+	mailbox_list_unlock(box->list);
+
+	if (ret == 0) {
+		box->list->guid_cache_updated = TRUE;
+		if (!box->inbox_any)
+			mailbox_copy_cache_decisions_from_inbox(box);
+	} else if (box->opened) {
+		/* Creation failed after (partially) opening the mailbox.
+		   It may not be in a valid state, so close it. */
+		mail_storage_last_error_push(box->storage);
+		mailbox_close(box);
+		mail_storage_last_error_pop(box->storage);
+	}
 	return ret;
 }
 
 int mailbox_update(struct mailbox *box, const struct mailbox_update *update)
 {
+	int ret;
+
 	i_assert(update->min_next_uid == 0 ||
 		 update->min_first_recent_uid == 0 ||
 		 update->min_first_recent_uid <= update->min_next_uid);
 
 	if (mailbox_verify_existing_name(box) < 0)
 		return -1;
-	return box->v.update_box(box, update);
+	ret = box->v.update_box(box, update);
+	if (!guid_128_is_empty(update->mailbox_guid))
+		box->list->guid_cache_invalidated = TRUE;
+	return ret;
 }
 
 int mailbox_mark_index_deleted(struct mailbox *box, bool del)
@@ -1284,18 +1542,32 @@ int mailbox_mark_index_deleted(struct mailbox *box, bool del)
 		return -1;
 	}
 
-	/* sync the mailbox. this finishes the index deletion and it can
-	   succeed only for a single session. we do it here, so the rest of
-	   the deletion code doesn't have to worry about race conditions. */
-	if (mailbox_sync(box, MAILBOX_SYNC_FLAG_FULL_READ) < 0)
-		return -1;
+	if (del) {
+		/* sync the mailbox. this finishes the index deletion and it
+		   can succeed only for a single session. we do it here, so the
+		   rest of the deletion code doesn't have to worry about race
+		   conditions. */
+		box->delete_sync_check = TRUE;
+		ret = mailbox_sync(box, MAILBOX_SYNC_FLAG_FULL_READ);
+		box->delete_sync_check = FALSE;
+		if (ret < 0)
+			return -1;
+	}
 
 	box->marked_deleted = del;
 	return 0;
 }
 
+static void mailbox_close_reset_path(struct mailbox *box)
+{
+	i_zero(&box->_perm);
+	box->_path = NULL;
+	box->_index_path = NULL;
+}
+
 int mailbox_delete(struct mailbox *box)
 {
+	bool list_locked;
 	int ret;
 
 	if (*box->name == '\0') {
@@ -1306,21 +1578,35 @@ int mailbox_delete(struct mailbox *box)
 
 	box->deleting = TRUE;
 	if (mailbox_open(box) < 0) {
-		if (mailbox_get_last_mail_error(box) != MAIL_ERROR_NOTFOUND)
+		if (mailbox_get_last_mail_error(box) != MAIL_ERROR_NOTFOUND &&
+		    !box->mailbox_deleted)
 			return -1;
-		/* \noselect mailbox */
+		/* might be a \noselect mailbox, so continue deletion */
 	}
 
-	ret = box->v.delete_box(box);
+	if (mailbox_list_lock(box->list) < 0) {
+		mail_storage_copy_list_error(box->storage, box->list);
+		list_locked = FALSE;
+		ret = -1;
+	} else {
+		list_locked = TRUE;
+		ret = box->v.delete_box(box);
+	}
 	if (ret < 0 && box->marked_deleted) {
 		/* deletion failed. revert the mark so it can maybe be
 		   tried again later. */
 		if (mailbox_mark_index_deleted(box, FALSE) < 0)
-			return -1;
+			ret = -1;
 	}
+	if (list_locked)
+		mailbox_list_unlock(box->list);
 
 	box->deleting = FALSE;
 	mailbox_close(box);
+
+	/* if mailbox is reopened, its path may be different with
+	   LAYOUT=index */
+	mailbox_close_reset_path(box);
 	return ret;
 }
 
@@ -1384,6 +1670,41 @@ mailbox_lists_rename_compatible(struct mailbox_list *list1,
 	return TRUE;
 }
 
+static
+int mailbox_rename_check_children(struct mailbox *src, struct mailbox *dest)
+{
+	int ret = 0;
+	size_t src_prefix_len = strlen(src->vname)+1; /* include separator */
+	size_t dest_prefix_len = strlen(dest->vname)+1;
+	/* this can return folders with * in their name, that are not
+	   actually our children */
+	const char *pattern = t_strdup_printf("%s%c*", src->vname,
+				  mail_namespace_get_sep(src->list->ns));
+
+	struct mailbox_list_iterate_context *iter = mailbox_list_iter_init(src->list, pattern,
+				      MAILBOX_LIST_ITER_RETURN_NO_FLAGS);
+
+	const struct mailbox_info *child;
+	while((child = mailbox_list_iter_next(iter)) != NULL) {
+		if (strncmp(child->vname, src->vname, src_prefix_len) != 0)
+			continue; /* not our child */
+		/* if total length of new name exceeds the limit, fail */
+		if (strlen(child->vname + src_prefix_len)+dest_prefix_len > MAILBOX_LIST_NAME_MAX_LENGTH) {
+			mail_storage_set_error(src->storage, MAIL_ERROR_PARAMS,
+				"Mailbox or child name too long");
+			ret = -1;
+			break;
+		}
+	}
+
+	/* something went bad */
+	if (mailbox_list_iter_deinit(&iter) < 0) {
+		mail_storage_copy_list_error(src->storage, src->list);
+		ret = -1;
+	}
+	return ret;
+}
+
 int mailbox_rename(struct mailbox *src, struct mailbox *dest)
 {
 	const char *error = NULL;
@@ -1397,9 +1718,13 @@ int mailbox_rename(struct mailbox *src, struct mailbox *dest)
 		return -1;
 	}
 	if (mailbox_verify_create_name(dest) < 0) {
-		mail_storage_copy_error(dest->storage, src->storage);
+		mail_storage_copy_error(src->storage, dest->storage);
 		return -1;
 	}
+	if (mailbox_rename_check_children(src, dest) != 0) {
+		return -1;
+	}
+
 	if (!mail_storages_rename_compatible(src->storage,
 					     dest->storage, &error) ||
 	    !mailbox_lists_rename_compatible(src->list,
@@ -1425,13 +1750,32 @@ int mailbox_rename(struct mailbox *src, struct mailbox *dest)
 		return -1;
 	}
 
-	return src->v.rename_box(src, dest);
+	/* It would be safer to lock both source and destination, but that
+	   could lead to deadlocks. So at least for now lets just lock only the
+	   destination list. */
+	if (mailbox_list_lock(dest->list) < 0) {
+		mail_storage_copy_list_error(src->storage, dest->list);
+		return -1;
+	}
+	int ret = src->v.rename_box(src, dest);
+	mailbox_list_unlock(dest->list);
+	if (ret < 0)
+		return -1;
+	src->list->guid_cache_invalidated = TRUE;
+	dest->list->guid_cache_invalidated = TRUE;
+	return 0;
 }
 
 int mailbox_set_subscribed(struct mailbox *box, bool set)
 {
 	if (mailbox_verify_name(box) < 0)
 		return -1;
+	if (mailbox_list_iter_subscriptions_refresh(box->list) < 0) {
+		mail_storage_copy_list_error(box->storage, box->list);
+		return -1;
+	}
+	if (mailbox_is_subscribed(box) == set)
+		return 0;
 	return box->v.set_subscribed(box, set);
 }
 
@@ -1497,7 +1841,7 @@ static void
 mailbox_get_status_set_defaults(struct mailbox *box,
 				struct mailbox_status *status_r)
 {
-	memset(status_r, 0, sizeof(*status_r));
+	i_zero(status_r);
 	if ((box->storage->class_flags & MAIL_STORAGE_CLASS_FLAG_HAVE_MAIL_GUIDS) != 0)
 		status_r->have_guids = TRUE;
 	if ((box->storage->class_flags & MAIL_STORAGE_CLASS_FLAG_HAVE_MAIL_SAVE_GUIDS) != 0)
@@ -1513,6 +1857,7 @@ int mailbox_get_status(struct mailbox *box,
 	mailbox_get_status_set_defaults(box, status_r);
 	if (mailbox_verify_existing_name(box) < 0)
 		return -1;
+
 	if (box->v.get_status(box, items, status_r) < 0)
 		return -1;
 	i_assert(status_r->have_guids || !status_r->have_save_guids);
@@ -1534,7 +1879,7 @@ void mailbox_get_open_status(struct mailbox *box,
 int mailbox_get_metadata(struct mailbox *box, enum mailbox_metadata_items items,
 			 struct mailbox_metadata *metadata_r)
 {
-	memset(metadata_r, 0, sizeof(*metadata_r));
+	i_zero(metadata_r);
 	if (mailbox_verify_existing_name(box) < 0)
 		return -1;
 
@@ -1559,102 +1904,6 @@ enum mail_flags mailbox_get_private_flags_mask(struct mailbox *box)
 		return 0;
 }
 
-int mailbox_attribute_set(struct mailbox_transaction_context *t,
-			  enum mail_attribute_type type, const char *key,
-			  const struct mail_attribute_value *value)
-{
-	return t->box->v.attribute_set(t, type, key, value);
-}
-
-int mailbox_attribute_unset(struct mailbox_transaction_context *t,
-			    enum mail_attribute_type type, const char *key)
-{
-	struct mail_attribute_value value;
-
-	memset(&value, 0, sizeof(value));
-	return t->box->v.attribute_set(t, type, key, &value);
-}
-
-int mailbox_attribute_value_to_string(struct mail_storage *storage,
-				      const struct mail_attribute_value *value,
-				      const char **str_r)
-{
-	string_t *str;
-	const unsigned char *data;
-	size_t size;
-
-	if (value->value_stream == NULL) {
-		*str_r = value->value;
-		return 0;
-	}
-	str = t_str_new(128);
-	i_stream_seek(value->value_stream, 0);
-	while (i_stream_read_data(value->value_stream, &data, &size, 0) > 0) {
-		if (memchr(data, '\0', size) != NULL) {
-			mail_storage_set_error(storage, MAIL_ERROR_PARAMS,
-				"Attribute string value has NULs");
-			return -1;
-		}
-		str_append_n(str, data, size);
-		i_stream_skip(value->value_stream, size);
-	}
-	if (value->value_stream->stream_errno != 0) {
-		mail_storage_set_critical(storage, "read(%s) failed: %m",
-			i_stream_get_name(value->value_stream));
-		return -1;
-	}
-	i_assert(value->value_stream->eof);
-	*str_r = str_c(str);
-	return 0;
-}
-
-int mailbox_attribute_get(struct mailbox_transaction_context *t,
-			  enum mail_attribute_type type, const char *key,
-			  struct mail_attribute_value *value_r)
-{
-	int ret;
-
-	memset(value_r, 0, sizeof(*value_r));
-	if ((ret = t->box->v.attribute_get(t, type, key, value_r)) <= 0)
-		return ret;
-	i_assert(value_r->value != NULL);
-	return 1;
-}
-
-int mailbox_attribute_get_stream(struct mailbox_transaction_context *t,
-				 enum mail_attribute_type type, const char *key,
-				 struct mail_attribute_value *value_r)
-{
-	int ret;
-
-	memset(value_r, 0, sizeof(*value_r));
-	value_r->flags |= MAIL_ATTRIBUTE_VALUE_FLAG_INT_STREAMS;
-	if ((ret = t->box->v.attribute_get(t, type, key, value_r)) <= 0)
-		return ret;
-	i_assert(value_r->value != NULL || value_r->value_stream != NULL);
-	return 1;
-}
-
-struct mailbox_attribute_iter *
-mailbox_attribute_iter_init(struct mailbox *box, enum mail_attribute_type type,
-			    const char *prefix)
-{
-	return box->v.attribute_iter_init(box, type, prefix);
-}
-
-const char *mailbox_attribute_iter_next(struct mailbox_attribute_iter *iter)
-{
-	return iter->box->v.attribute_iter_next(iter);
-}
-
-int mailbox_attribute_iter_deinit(struct mailbox_attribute_iter **_iter)
-{
-	struct mailbox_attribute_iter *iter = *_iter;
-
-	*_iter = NULL;
-	return iter->box->v.attribute_iter_deinit(iter);
-}
-
 struct mailbox_sync_context *
 mailbox_sync_init(struct mailbox *box, enum mailbox_sync_flags flags)
 {
@@ -1663,6 +1912,15 @@ mailbox_sync_init(struct mailbox *box, enum mailbox_sync_flags flags)
 	if (box->transaction_count != 0) {
 		i_panic("Trying to sync mailbox %s with open transactions",
 			box->name);
+	}
+	if (!box->opened) {
+		if (mailbox_open(box) < 0) {
+			ctx = i_new(struct mailbox_sync_context, 1);
+			ctx->box = box;
+			ctx->flags = flags;
+			ctx->open_failed = TRUE;
+			return ctx;
+		}
 	}
 	T_BEGIN {
 		ctx = box->v.sync_init(box, flags);
@@ -1673,6 +1931,8 @@ mailbox_sync_init(struct mailbox *box, enum mailbox_sync_flags flags)
 bool mailbox_sync_next(struct mailbox_sync_context *ctx,
 		       struct mailbox_sync_rec *sync_rec_r)
 {
+	if (ctx->open_failed)
+		return FALSE;
 	return ctx->box->v.sync_next(ctx, sync_rec_r);
 }
 
@@ -1687,11 +1947,17 @@ int mailbox_sync_deinit(struct mailbox_sync_context **_ctx,
 
 	*_ctx = NULL;
 
-	memset(status_r, 0, sizeof(*status_r));
-	ret = box->v.sync_deinit(ctx, status_r);
+	i_zero(status_r);
+
+	if (!ctx->open_failed)
+		ret = box->v.sync_deinit(ctx, status_r);
+	else {
+		i_free(ctx);
+		ret = -1;
+	}
 	if (ret < 0 && box->inbox_user &&
 	    !box->storage->user->inbox_open_error_logged) {
-		errormsg = mailbox_get_last_error(box, &error);
+		errormsg = mailbox_get_last_internal_error(box, &error);
 		if (error == MAIL_ERROR_NOTPOSSIBLE) {
 			box->storage->user->inbox_open_error_logged = TRUE;
 			i_error("Syncing INBOX failed: %s", errormsg);
@@ -1746,6 +2012,8 @@ mailbox_search_init(struct mailbox_transaction_context *t,
 		    enum mail_fetch_field wanted_fields,
 		    struct mailbox_header_lookup_ctx *wanted_headers)
 {
+	i_assert(wanted_headers == NULL || wanted_headers->box == t->box);
+
 	mail_search_args_ref(args);
 	if (!args->simplified)
 		mail_search_args_simplify(args);
@@ -1783,6 +2051,7 @@ bool mailbox_search_next_nonblock(struct mail_search_context *ctx,
 	struct mailbox *box = ctx->transaction->box;
 
 	*mail_r = NULL;
+	*tryagain_r = FALSE;
 
 	if (!box->v.search_next_nonblock(ctx, mail_r, tryagain_r))
 		return FALSE;
@@ -1822,11 +2091,13 @@ mailbox_transaction_begin(struct mailbox *box,
 {
 	struct mailbox_transaction_context *trans;
 
+	i_assert((flags & MAILBOX_TRANSACTION_FLAG_FILL_IN_STUB) == 0 ||
+		 (box->flags & MAILBOX_FLAG_USE_STUBS) != 0);
+
 	i_assert(box->opened);
 
 	box->transaction_count++;
 	trans = box->v.transaction_begin(box, flags);
-	trans->flags = flags;
 	return trans;
 }
 
@@ -1884,6 +2155,15 @@ void mailbox_transaction_rollback(struct mailbox_transaction_context **_t)
 	box->transaction_count--;
 }
 
+void mailbox_transaction_set_reason(struct mailbox_transaction_context *t,
+				    const char *reason)
+{
+	i_assert(reason != NULL);
+
+	i_free(t->reason);
+	t->reason = i_strdup(reason);
+}
+
 unsigned int mailbox_transaction_get_count(const struct mailbox *box)
 {
 	return box->transaction_count;
@@ -1902,17 +2182,52 @@ mailbox_transaction_get_mailbox(const struct mailbox_transaction_context *t)
 	return t->box;
 }
 
+static void mailbox_save_dest_mail_close(struct mail_save_context *ctx)
+{
+	struct mail_private *mail = (struct mail_private *)ctx->dest_mail;
+
+	mail->v.close(&mail->mail);
+}
+
 struct mail_save_context *
 mailbox_save_alloc(struct mailbox_transaction_context *t)
 {
 	struct mail_save_context *ctx;
-
-	ctx = t->box->v.save_alloc(t);
+	const struct mail_storage_settings *mail_set =
+		mailbox_get_settings(t->box);
+	T_BEGIN {
+		ctx = t->box->v.save_alloc(t);
+	} T_END;
 	i_assert(!ctx->unfinished);
 	ctx->unfinished = TRUE;
 	ctx->data.received_date = (time_t)-1;
 	ctx->data.save_date = (time_t)-1;
+
+	/* Always have a dest_mail available. A lot of plugins make use
+	   of this. */
+	if (ctx->dest_mail == NULL)
+		ctx->dest_mail = mail_alloc(t, 0, NULL);
+	else {
+		/* make sure the mail isn't used before mail_set_seq_saving() */
+		mailbox_save_dest_mail_close(ctx);
+	}
+
+	/* make sure parts get parsed early on */
+	if (mail_set->parsed_mail_attachment_detection_add_flags_on_save)
+		mail_add_temp_wanted_fields(ctx->dest_mail,
+					    MAIL_FETCH_MESSAGE_PARTS, NULL);
+
 	return ctx;
+}
+
+void mailbox_save_context_deinit(struct mail_save_context *ctx)
+{
+	i_assert(ctx->dest_mail != NULL);
+
+	if (!ctx->dest_mail_external)
+		mail_free(&ctx->dest_mail);
+	else
+		ctx->dest_mail = NULL;
 }
 
 void mailbox_save_set_flags(struct mail_save_context *ctx,
@@ -1920,6 +2235,9 @@ void mailbox_save_set_flags(struct mail_save_context *ctx,
 			    struct mail_keywords *keywords)
 {
 	struct mailbox *box = ctx->transaction->box;
+
+	if (ctx->data.keywords != NULL)
+		mailbox_keywords_unref(&ctx->data.keywords);
 
 	ctx->data.flags = flags & ~mailbox_get_private_flags_mask(box);
 	ctx->data.pvt_flags = flags & mailbox_get_private_flags_mask(box);
@@ -1971,6 +2289,11 @@ void mailbox_save_set_from_envelope(struct mail_save_context *ctx,
 void mailbox_save_set_uid(struct mail_save_context *ctx, uint32_t uid)
 {
 	ctx->data.uid = uid;
+	if ((ctx->transaction->flags & MAILBOX_TRANSACTION_FLAG_FILL_IN_STUB) != 0) {
+		if (!mail_index_lookup_seq(ctx->transaction->view, uid,
+					   &ctx->data.stub_seq))
+			i_panic("Trying to fill in stub for nonexistent UID %u", uid);
+	}
 }
 
 void mailbox_save_set_guid(struct mail_save_context *ctx, const char *guid)
@@ -2001,7 +2324,17 @@ void mailbox_save_set_pop3_order(struct mail_save_context *ctx,
 void mailbox_save_set_dest_mail(struct mail_save_context *ctx,
 				struct mail *mail)
 {
+	i_assert(mail != NULL);
+
+	if (!ctx->dest_mail_external)
+		mail_free(&ctx->dest_mail);
 	ctx->dest_mail = mail;
+	ctx->dest_mail_external = TRUE;
+}
+
+struct mail *mailbox_save_get_dest_mail(struct mail_save_context *ctx)
+{
+	return ctx->dest_mail;
 }
 
 int mailbox_save_begin(struct mail_save_context **ctx, struct istream *input)
@@ -2015,15 +2348,27 @@ int mailbox_save_begin(struct mail_save_context **ctx, struct istream *input)
 		return -1;
 	}
 
-	if (!(*ctx)->copying_via_save)
+	/* if we're filling in a stub, we must have set UID already
+	   (which in turn sets stub_seq) */
+	i_assert(((*ctx)->transaction->flags & MAILBOX_TRANSACTION_FLAG_FILL_IN_STUB) == 0 ||
+		 (*ctx)->data.stub_seq != 0);
+
+	if (!(*ctx)->copying_or_moving) {
+		/* We're actually saving the mail. We're not being called by
+		   mail_storage_copy() because backend didn't support fast
+		   copying. */
+		i_assert(!(*ctx)->copying_via_save);
 		(*ctx)->saving = TRUE;
+	} else {
+		i_assert((*ctx)->copying_via_save);
+	}
 	if (box->v.save_begin == NULL) {
 		mail_storage_set_error(box->storage, MAIL_ERROR_NOTPOSSIBLE,
 				       "Saving messages not supported");
 		ret = -1;
-	} else {
+	} else T_BEGIN {
 		ret = box->v.save_begin(*ctx, input);
-	}
+	} T_END;
 
 	if (ret < 0) {
 		mailbox_save_cancel(ctx);
@@ -2034,7 +2379,12 @@ int mailbox_save_begin(struct mail_save_context **ctx, struct istream *input)
 
 int mailbox_save_continue(struct mail_save_context *ctx)
 {
-	return ctx->transaction->box->v.save_continue(ctx);
+	int ret;
+
+	T_BEGIN {
+		ret = ctx->transaction->box->v.save_continue(ctx);
+	} T_END;
+	return ret;
 }
 
 static void
@@ -2050,10 +2400,32 @@ mailbox_save_add_pvt_flags(struct mailbox_transaction_context *t,
 	save->flags = pvt_flags;
 }
 
+static void
+mailbox_save_context_reset(struct mail_save_context *ctx, bool success)
+{
+	i_assert(!ctx->unfinished);
+	if (!ctx->copying_or_moving) {
+		/* we're finishing a save (not copy/move). Note that we could
+		   have come here also from mailbox_save_cancel(), in which
+		   case ctx->saving may be FALSE. */
+		i_assert(!ctx->copying_via_save);
+		i_assert(ctx->saving || !success);
+		ctx->saving = FALSE;
+	} else {
+		i_assert(ctx->copying_via_save || !success);
+		/* We came from mailbox_copy(). saving==TRUE is possible here
+		   if we also came from mailbox_save_using_mail(). Don't set
+		   saving=FALSE yet in that case, because copy() is still
+		   running. */
+	}
+}
+
 int mailbox_save_finish(struct mail_save_context **_ctx)
 {
 	struct mail_save_context *ctx = *_ctx;
 	struct mailbox_transaction_context *t = ctx->transaction;
+	/* we need to keep a copy of this because save_finish implementations
+	   will likely zero the data structure during cleanup */
 	struct mail_keywords *keywords = ctx->data.keywords;
 	enum mail_flags pvt_flags = ctx->data.pvt_flags;
 	bool copying_via_save = ctx->copying_via_save;
@@ -2070,16 +2442,21 @@ int mailbox_save_finish(struct mail_save_context **_ctx)
 	}
 	*_ctx = NULL;
 
-	ret = t->box->v.save_finish(ctx);
+	ctx->finishing = TRUE;
+	T_BEGIN {
+		ret = t->box->v.save_finish(ctx);
+	} T_END;
+	ctx->finishing = FALSE;
+
 	if (ret == 0 && !copying_via_save) {
 		if (pvt_flags != 0)
 			mailbox_save_add_pvt_flags(t, pvt_flags);
 		t->save_count++;
 	}
+
 	if (keywords != NULL)
 		mailbox_keywords_unref(&keywords);
-	i_assert(!ctx->unfinished);
-	ctx->saving = FALSE;
+	mailbox_save_context_reset(ctx, TRUE);
 	return ret;
 }
 
@@ -2087,21 +2464,20 @@ void mailbox_save_cancel(struct mail_save_context **_ctx)
 {
 	struct mail_save_context *ctx = *_ctx;
 	struct mail_keywords *keywords = ctx->data.keywords;
-	struct mail_private *mail;
 
 	*_ctx = NULL;
-	ctx->transaction->box->v.save_cancel(ctx);
-	if (keywords != NULL)
+	T_BEGIN {
+		ctx->transaction->box->v.save_cancel(ctx);
+	} T_END;
+	if (keywords != NULL && !ctx->finishing)
 		mailbox_keywords_unref(&keywords);
-	if (ctx->dest_mail != NULL) {
-		/* the dest_mail is no longer valid. if we're still saving
-		   more mails, the mail sequence may get reused. make sure
-		   the mail gets reset in between */
-		mail = (struct mail_private *)ctx->dest_mail;
-		mail->v.close(&mail->mail);
-	}
-	i_assert(!ctx->unfinished);
-	ctx->saving = FALSE;
+
+	/* the dest_mail is no longer valid. if we're still saving
+	   more mails, the mail sequence may get reused. make sure
+	   the mail gets reset in between */
+	mailbox_save_dest_mail_close(ctx);
+
+	mailbox_save_context_reset(ctx, FALSE);
 }
 
 struct mailbox_transaction_context *
@@ -2110,13 +2486,13 @@ mailbox_save_get_transaction(struct mail_save_context *ctx)
 	return ctx->transaction;
 }
 
-int mailbox_copy(struct mail_save_context **_ctx, struct mail *mail)
+static int mailbox_copy_int(struct mail_save_context **_ctx, struct mail *mail)
 {
 	struct mail_save_context *ctx = *_ctx;
 	struct mailbox_transaction_context *t = ctx->transaction;
 	struct mail_keywords *keywords = ctx->data.keywords;
 	enum mail_flags pvt_flags = ctx->data.pvt_flags;
-	struct mail *real_mail;
+	struct mail *backend_mail;
 	int ret;
 
 	*_ctx = NULL;
@@ -2129,8 +2505,20 @@ int mailbox_copy(struct mail_save_context **_ctx, struct mail *mail)
 
 	/* bypass virtual storage, so hard linking can be used whenever
 	   possible */
-	real_mail = mail_get_real_mail(mail);
-	ret = t->box->v.copy(ctx, real_mail);
+	if (mail_get_backend_mail(mail, &backend_mail) < 0) {
+		mailbox_save_cancel(&ctx);
+		return -1;
+	}
+
+	i_assert(!ctx->copying_or_moving);
+	i_assert(ctx->copy_src_mail == NULL);
+	ctx->copying_or_moving = TRUE;
+	ctx->copy_src_mail = mail;
+	ctx->finishing = TRUE;
+	T_BEGIN {
+		ret = t->box->v.copy(ctx, backend_mail);
+	} T_END;
+	ctx->finishing = FALSE;
 	if (ret == 0) {
 		if (pvt_flags != 0)
 			mailbox_save_add_pvt_flags(t, pvt_flags);
@@ -2140,28 +2528,47 @@ int mailbox_copy(struct mail_save_context **_ctx, struct mail *mail)
 		mailbox_keywords_unref(&keywords);
 	i_assert(!ctx->unfinished);
 
+	ctx->copy_src_mail = NULL;
 	ctx->copying_via_save = FALSE;
-	ctx->saving = FALSE;
+	ctx->copying_or_moving = FALSE;
+	ctx->saving = FALSE; /* if we came from mailbox_save_using_mail() */
 	return ret;
+}
+
+int mailbox_copy(struct mail_save_context **_ctx, struct mail *mail)
+{
+	struct mail_save_context *ctx = *_ctx;
+
+	i_assert(!ctx->saving);
+	i_assert(!ctx->moving);
+
+	return mailbox_copy_int(_ctx, mail);
 }
 
 int mailbox_move(struct mail_save_context **_ctx, struct mail *mail)
 {
 	struct mail_save_context *ctx = *_ctx;
+	int ret;
+
+	i_assert(!ctx->saving);
+	i_assert(!ctx->moving);
 
 	ctx->moving = TRUE;
-	if (mailbox_copy(_ctx, mail) < 0)
-		return -1;
-
-	mail_expunge(mail);
+	if ((ret = mailbox_copy_int(_ctx, mail)) == 0)
+		mail_expunge(mail);
 	ctx->moving = FALSE;
-	return 0;
+	return ret;
 }
 
-int mailbox_save_using_mail(struct mail_save_context **ctx, struct mail *mail)
+int mailbox_save_using_mail(struct mail_save_context **_ctx, struct mail *mail)
 {
-	(*ctx)->saving = TRUE;
-	return mailbox_copy(ctx, mail);
+	struct mail_save_context *ctx = *_ctx;
+
+	i_assert(!ctx->saving);
+	i_assert(!ctx->moving);
+
+	ctx->saving = TRUE;
+	return mailbox_copy_int(_ctx, mail);
 }
 
 bool mailbox_is_inconsistent(struct mailbox *box)
@@ -2189,6 +2596,14 @@ int mailbox_get_path_to(struct mailbox *box, enum mailbox_list_path_type type,
 		*path_r = box->_path;
 		return 1;
 	}
+	if (type == MAILBOX_LIST_PATH_TYPE_INDEX && box->_index_path != NULL) {
+		if (box->_index_path[0] == '\0') {
+			*path_r = NULL;
+			return 0;
+		}
+		*path_r = box->_index_path;
+		return 1;
+	}
 	ret = mailbox_list_get_path(box->list, box->name, type, path_r);
 	if (ret < 0) {
 		mail_storage_copy_list_error(box->storage, box->list);
@@ -2196,6 +2611,8 @@ int mailbox_get_path_to(struct mailbox *box, enum mailbox_list_path_type type,
 	}
 	if (type == MAILBOX_LIST_PATH_TYPE_MAILBOX && box->_path == NULL)
 		box->_path = ret == 0 ? "" : p_strdup(box->pool, *path_r);
+	if (type == MAILBOX_LIST_PATH_TYPE_INDEX && box->_index_path == NULL)
+		box->_index_path = ret == 0 ? "" : p_strdup(box->pool, *path_r);
 	return ret;
 }
 
@@ -2204,6 +2621,13 @@ const char *mailbox_get_path(struct mailbox *box)
 	i_assert(box->_path != NULL);
 	i_assert(box->_path[0] != '\0');
 	return box->_path;
+}
+
+const char *mailbox_get_index_path(struct mailbox *box)
+{
+	i_assert(box->_index_path != NULL);
+	i_assert(box->_index_path[0] != '\0');
+	return box->_index_path;
 }
 
 static void mailbox_get_permissions_if_not_set(struct mailbox *box)
@@ -2220,9 +2644,9 @@ static void mailbox_get_permissions_if_not_set(struct mailbox *box)
 		return;
 	}
 
-	mailbox_list_get_permissions(box->list, box->name, &box->_perm);
-	box->_perm.file_create_gid_origin =
-		p_strdup(box->pool, box->_perm.file_create_gid_origin);
+	struct mailbox_permissions perm;
+	mailbox_list_get_permissions(box->list, box->name, &perm);
+	mailbox_permissions_copy(&box->_perm, &perm, box->pool);
 }
 
 const struct mailbox_permissions *mailbox_get_permissions(struct mailbox *box)
@@ -2241,7 +2665,7 @@ const struct mailbox_permissions *mailbox_get_permissions(struct mailbox *box)
 
 void mailbox_refresh_permissions(struct mailbox *box)
 {
-	memset(&box->_perm, 0, sizeof(box->_perm));
+	i_zero(&box->_perm);
 	(void)mailbox_get_permissions(box);
 }
 
@@ -2343,16 +2767,31 @@ int mailbox_create_missing_dir(struct mailbox *box,
 	if (mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_MAILBOX,
 				&mail_dir) < 0)
 		return -1;
-	if (null_strcmp(dir, mail_dir) == 0) {
-		if ((box->list->props & MAILBOX_LIST_PROP_AUTOCREATE_DIRS) == 0)
-			return 0;
-		/* the directory might not have been created yet */
+	if (null_strcmp(dir, mail_dir) != 0) {
+		/* Mailbox directory is different - create a missing dir */
+	} else if ((box->list->props & MAILBOX_LIST_PROP_AUTOCREATE_DIRS) != 0) {
+		/* This layout (e.g. imapc) wants to autocreate missing mailbox
+		   directories as well. */
+	} else {
+		/* If the mailbox directory doesn't exist, the mailbox
+		   shouldn't exist at all. So just assume that it's already
+		   created and if there's a race condition just fail later. */
+		return 0;
 	}
 
 	/* we call this function even when the directory exists, so first do a
 	   quick check to see if we need to mkdir anything */
 	if (stat(dir, &st) == 0)
 		return 0;
+
+	if (null_strcmp(dir, mail_dir) != 0 &&
+	    stat(mail_dir, &st) < 0 && (errno == ENOENT || errno == ENOTDIR)) {
+		/* Race condition - mail root directory doesn't exist
+		   anymore either. We shouldn't create this directory
+		   anymore. */
+		mailbox_set_deleted(box);
+		return -1;
+	}
 
 	return mailbox_mkdir(box, dir, type);
 }
@@ -2378,4 +2817,152 @@ mail_storage_settings_to_index_flags(const struct mail_storage_settings *set)
 	if (set->mail_nfs_index)
 		index_flags |= MAIL_INDEX_OPEN_FLAG_NFS_FLUSH;
 	return index_flags;
+}
+
+int mail_parse_human_timestamp(const char *str, time_t *timestamp_r,
+			       bool *utc_r)
+{
+	struct tm tm;
+	unsigned int secs;
+	const char *error;
+
+	if (i_isdigit(str[0]) && i_isdigit(str[1]) &&
+	    i_isdigit(str[2]) && i_isdigit(str[3]) && str[4] == '-' &&
+	    i_isdigit(str[5]) && i_isdigit(str[6]) && str[7] == '-' &&
+	    i_isdigit(str[8]) && i_isdigit(str[9]) && str[10] == '\0') {
+		/* yyyy-mm-dd */
+		i_zero(&tm);
+		tm.tm_year = (str[0]-'0') * 1000 + (str[1]-'0') * 100 +
+			(str[2]-'0') * 10 + (str[3]-'0') - 1900;
+		tm.tm_mon = (str[5]-'0') * 10 + (str[6]-'0') - 1;
+		tm.tm_mday = (str[8]-'0') * 10 + (str[9]-'0');
+		*timestamp_r = mktime(&tm);
+		*utc_r = FALSE;
+		return 0;
+	} else if (imap_parse_date(str, timestamp_r)) {
+		/* imap date */
+		*utc_r = FALSE;
+		return 0;
+	} else if (str_to_time(str, timestamp_r) == 0) {
+		/* unix timestamp */
+		*utc_r = TRUE;
+		return 0;
+	} else if (settings_get_time(str, &secs, &error) == 0) {
+		*timestamp_r = ioloop_time - secs;
+		*utc_r = TRUE;
+		return 0;
+	} else {
+		return -1;
+	}
+}
+
+void mail_set_mail_cache_corrupted(struct mail *mail, const char *fmt, ...)
+{
+	struct mail_cache_view *cache_view =
+		mail->transaction->cache_view;
+
+	i_assert(cache_view != NULL);
+
+	va_list va;
+	va_start(va, fmt);
+
+	T_BEGIN {
+		mail_cache_set_seq_corrupted_reason(cache_view, mail->seq,
+			t_strdup_printf("UID %u: %s",
+					mail->uid,
+					t_strdup_vprintf(fmt, va)));
+	} T_END;
+
+	/* update also the storage's internal error */
+	mailbox_set_index_error(mail->box);
+
+	va_end(va);
+}
+
+static int
+mail_storage_dotlock_create(const char *lock_path,
+			    const struct file_create_settings *lock_set,
+			    const struct mail_storage_settings *mail_set,
+			    struct file_lock **lock_r, const char **error_r)
+{
+	const struct dotlock_settings dotlock_set = {
+		.timeout = lock_set->lock_timeout_secs,
+		.stale_timeout = I_MAX(60*5, lock_set->lock_timeout_secs),
+		.lock_suffix = "",
+
+		.use_excl_lock = mail_set->dotlock_use_excl,
+		.nfs_flush = mail_set->mail_nfs_storage,
+		.use_io_notify = TRUE,
+	};
+	struct dotlock *dotlock;
+	int ret = file_dotlock_create(&dotlock_set, lock_path, 0, &dotlock);
+	if (ret <= 0) {
+		*error_r = t_strdup_printf("file_dotlock_create(%s) failed: %m",
+					   lock_path);
+		return ret;
+	}
+	*lock_r = file_lock_from_dotlock(&dotlock);
+	return 1;
+}
+
+int mail_storage_lock_create(const char *lock_path,
+			     const struct file_create_settings *lock_set,
+			     const struct mail_storage_settings *mail_set,
+			     struct file_lock **lock_r, const char **error_r)
+{
+	bool created;
+
+	if (lock_set->lock_method == FILE_LOCK_METHOD_DOTLOCK)
+		return mail_storage_dotlock_create(lock_path, lock_set, mail_set, lock_r, error_r);
+
+	if (file_create_locked(lock_path, lock_set, lock_r,
+			       &created, error_r) == -1) {
+		*error_r = t_strdup_printf("file_create_locked(%s) failed: %s",
+					   lock_path, *error_r);
+		return errno == EAGAIN ? 0 : -1;
+	}
+	file_lock_set_close_on_free(*lock_r, TRUE);
+	file_lock_set_unlink_on_free(*lock_r, TRUE);
+	return 1;
+}
+
+int mailbox_lock_file_create(struct mailbox *box, const char *lock_fname,
+			     unsigned int lock_secs, struct file_lock **lock_r,
+			     const char **error_r)
+{
+	const struct mailbox_permissions *perm;
+	struct file_create_settings set;
+	const char *lock_path;
+
+	perm = mailbox_get_permissions(box);
+	i_zero(&set);
+	set.lock_timeout_secs =
+		mail_storage_get_lock_timeout(box->storage, lock_secs);
+	set.lock_method = box->storage->set->parsed_lock_method;
+	set.mode = perm->file_create_mode;
+	set.gid = perm->file_create_gid;
+	set.gid_origin = perm->file_create_gid_origin;
+
+	if (box->list->set.volatile_dir == NULL)
+		lock_path = t_strdup_printf("%s/%s", box->index->dir, lock_fname);
+	else {
+		unsigned char box_name_sha1[SHA1_RESULTLEN];
+		string_t *str = t_str_new(128);
+
+		/* Keep this simple: Use the lock_fname with a SHA1 of the
+		   mailbox name as the suffix. The mailbox name itself could
+		   be too large as a filename and creating the full directory
+		   structure would be pretty troublesome. It would also make
+		   it more difficult to perform the automated deletion of empty
+		   lock directories. */
+		str_printfa(str, "%s/%s.", box->list->set.volatile_dir,
+			    lock_fname);
+		sha1_get_digest(box->name, strlen(box->name), box_name_sha1);
+		binary_to_hex_append(str, box_name_sha1, sizeof(box_name_sha1));
+		lock_path = str_c(str);
+		set.mkdir_mode = 0700;
+	}
+
+	return mail_storage_lock_create(lock_path, &set,
+					box->storage->set, lock_r, error_r);
 }

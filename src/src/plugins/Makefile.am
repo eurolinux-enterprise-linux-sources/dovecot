@@ -10,6 +10,14 @@ if BUILD_SOLR
 FTS_SOLR = fts-solr
 endif
 
+if HAVE_LDAP
+DICT_LDAP = dict-ldap
+endif
+
+if HAVE_APPARMOR
+APPARMOR = apparmor
+endif
+
 SUBDIRS = \
 	acl \
 	imap-acl \
@@ -17,21 +25,32 @@ SUBDIRS = \
 	expire \
 	fts \
 	fts-squat \
+	last-login \
 	lazy-expunge \
 	listescape \
 	notify \
+	notify-status \
+	push-notification \
 	mail-filter \
 	mail-log \
 	mailbox-alias \
 	quota \
+	quota-clone \
 	imap-quota \
 	pop3-migration \
 	replication \
 	snarf \
 	stats \
 	imap-stats \
+	mail-crypt \
 	trash \
 	virtual \
+	welcome \
 	$(ZLIB) \
 	$(FTS_LUCENE) \
-	$(FTS_SOLR)
+	$(FTS_SOLR) \
+	$(DICT_LDAP) \
+	$(APPARMOR) \
+	fs-compress \
+	var-expand-crypt \
+	charset-alias

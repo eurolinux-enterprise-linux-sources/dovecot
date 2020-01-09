@@ -1,10 +1,11 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "md4.h"
 #include "md5.h"
 #include "sha1.h"
 #include "sha2.h"
+#include "sha3.h"
 #include "hash-method.h"
 
 const struct hash_method *hash_method_lookup(const char *name)
@@ -47,7 +48,7 @@ static void hash_method_result_size(void *context, unsigned char *result_r)
 	result_r[7] = (*ctx & 0x00000000000000ffULL);
 }
 
-const struct hash_method hash_method_size = {
+static const struct hash_method hash_method_size = {
 	"size",
 	sizeof(uint64_t),
 	sizeof(uint64_t),
@@ -63,6 +64,8 @@ const struct hash_method *hash_methods[] = {
 	&hash_method_sha1,
 	&hash_method_sha256,
 	&hash_method_sha512,
+	&hash_method_sha3_256,
+	&hash_method_sha3_512,
 	&hash_method_size,
 	NULL
 };

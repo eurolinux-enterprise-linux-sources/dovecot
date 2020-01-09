@@ -4,6 +4,13 @@
 struct mailbox;
 struct mailbox_sync_status;
 
+struct imapc_sync_store {
+	enum modify_type modify_type;
+	const char *flags;
+
+	ARRAY_TYPE(seq_range) uids;
+};
+
 struct imapc_sync_context {
 	struct imapc_mailbox *mbox;
         struct mail_index_sync_ctx *index_sync_ctx;
@@ -14,6 +21,13 @@ struct imapc_sync_context {
 	ARRAY_TYPE(seq_range) expunged_uids;
 	unsigned int sync_command_count;
 
+	pool_t pool;
+	HASH_TABLE(struct imapc_sync_store *, struct imapc_sync_store *) stores;
+
+	uint32_t prev_uid1, prev_uid2;
+	enum modify_type prev_modify_type;
+	string_t *prev_flags;
+
 	unsigned int failed:1;
 };
 
@@ -21,6 +35,5 @@ struct mailbox_sync_context *
 imapc_mailbox_sync_init(struct mailbox *box, enum mailbox_sync_flags flags);
 int imapc_mailbox_sync_deinit(struct mailbox_sync_context *ctx,
 			      struct mailbox_sync_status *status_r);
-void imapc_sync_mailbox_reopened(struct imapc_mailbox *mbox);
 
 #endif

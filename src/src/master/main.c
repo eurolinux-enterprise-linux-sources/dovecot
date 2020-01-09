@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2018 Dovecot authors, see the included COPYING file */
 
 #include "common.h"
 #include "ioloop.h"
@@ -12,13 +12,13 @@
 #include "ipwd.h"
 #include "str.h"
 #include "execv-const.h"
-#include "mountpoint-list.h"
 #include "restrict-process-size.h"
 #include "master-instance.h"
 #include "master-service.h"
 #include "master-service-settings.h"
 #include "askpass.h"
 #include "capabilities.h"
+#include "master-client.h"
 #include "service.h"
 #include "service-anvil.h"
 #include "service-listen.h"
@@ -28,7 +28,6 @@
 #include "dovecot-version.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -44,8 +43,9 @@ uid_t master_uid;
 gid_t master_gid;
 bool core_dumps_disabled;
 const char *ssl_manual_key_password;
-int null_fd, global_master_dead_pipe_fd[2];
+int global_master_dead_pipe_fd[2];
 struct service_list *services;
+bool startup_finished = FALSE;
 
 static char *pidfile_path;
 static struct master_instance_list *instances;
@@ -58,26 +58,12 @@ static const struct setting_parser_info *set_roots[] = {
 	NULL
 };
 
-void process_exec(const char *cmd, const char *extra_args[])
+void process_exec(const char *cmd)
 {
 	const char *executable, *p, **argv;
 
 	argv = t_strsplit(cmd, " ");
 	executable = argv[0];
-
-	if (extra_args != NULL) {
-		unsigned int count1, count2;
-		const char **new_argv;
-
-		/* @UNSAFE */
-		count1 = str_array_length(argv);
-		count2 = str_array_length(extra_args);
-		new_argv = t_new(const char *, count1 + count2 + 1);
-		memcpy(new_argv, argv, sizeof(const char *) * count1);
-		memcpy(new_argv + count1, extra_args,
-		       sizeof(const char *) * count2);
-		argv = new_argv;
-	}
 
 	/* hide the path, it's ugly */
 	p = strrchr(argv[0], '/');
@@ -144,11 +130,14 @@ master_fatal_callback(const struct failure_context *ctx,
 {
 	const char *path, *str;
 	va_list args2;
+	pid_t pid;
 	int fd;
-
+	
 	/* if we already forked a child process, this isn't fatal for the
 	   main process and there's no need to write the fatal file. */
-	if (getpid() == strtol(my_pid, NULL, 10)) {
+	if (str_to_pid(my_pid, &pid) < 0)
+		i_unreached();
+	if (getpid() == pid) {
 		/* write the error message to a file (we're chdired to
 		   base dir) */
 		path = t_strconcat(FATAL_FILENAME, NULL);
@@ -156,6 +145,7 @@ master_fatal_callback(const struct failure_context *ctx,
 		if (fd != -1) {
 			VA_COPY(args2, args);
 			str = t_strdup_vprintf(format, args2);
+			va_end(args2);
 			(void)write_full(fd, str, strlen(str));
 			i_close_fd(&fd);
 		}
@@ -174,6 +164,7 @@ startup_fatal_handler(const struct failure_context *ctx,
 	VA_COPY(args2, args);
 	fprintf(stderr, "%s%s\n", failure_log_type_prefixes[ctx->type],
 		t_strdup_vprintf(fmt, args2));
+	va_end(args2);
 	orig_fatal_callback(ctx, fmt, args);
 	abort();
 }
@@ -187,6 +178,7 @@ startup_error_handler(const struct failure_context *ctx,
 	VA_COPY(args2, args);
 	fprintf(stderr, "%s%s\n", failure_log_type_prefixes[ctx->type],
 		t_strdup_vprintf(fmt, args2));
+	va_end(args2);
 	orig_error_callback(ctx, fmt, args);
 }
 
@@ -211,9 +203,8 @@ static void fatal_log_check(const struct master_settings *set)
 			"information): %s\n", buf);
 	}
 
-	close(fd);
-	if (unlink(path) < 0)
-		i_error("unlink(%s) failed: %m", path);
+	i_close_fd(&fd);
+	i_unlink(path);
 }
 
 static bool pid_file_read(const char *path, pid_t *pid_r)
@@ -243,10 +234,13 @@ static bool pid_file_read(const char *path, pid_t *pid_r)
 		if (buf[ret-1] == '\n')
 			ret--;
 		buf[ret] = '\0';
-		*pid_r = atoi(buf);
-
-		found = !(*pid_r == getpid() ||
-			  (kill(*pid_r, 0) < 0 && errno == ESRCH));
+		if (str_to_pid(buf, pid_r) < 0) {
+			i_error("PID file contains invalid PID value");
+			found = FALSE;
+		} else {
+			found = !(*pid_r == getpid() ||
+				  (kill(*pid_r, 0) < 0 && errno == ESRCH));
+		}
 	}
 	i_close_fd(&fd);
 	return found;
@@ -283,47 +277,12 @@ static void create_config_symlink(const struct master_settings *set)
 	const char *base_config_path;
 
 	base_config_path = t_strconcat(set->base_dir, "/"PACKAGE".conf", NULL);
-	if (unlink(base_config_path) < 0 && errno != ENOENT)
-		i_error("unlink(%s) failed: %m", base_config_path);
+	i_unlink_if_exists(base_config_path);
 
 	if (symlink(services->config->config_file_path, base_config_path) < 0) {
 		i_error("symlink(%s, %s) failed: %m",
 			services->config->config_file_path, base_config_path);
 	}
-}
-
-static void mountpoints_warn_missing(struct mountpoint_list *mountpoints)
-{
-	struct mountpoint_list_iter *iter;
-	struct mountpoint_list_rec *rec;
-
-	/* warn about mountpoints that no longer exist */
-	iter = mountpoint_list_iter_init(mountpoints);
-	while ((rec = mountpoint_list_iter_next(iter)) != NULL) {
-		if (MOUNTPOINT_WRONGLY_NOT_MOUNTED(rec)) {
-			i_warning("%s is no longer mounted. "
-				  "See http://wiki2.dovecot.org/Mountpoints",
-				  rec->mount_path);
-		}
-	}
-	mountpoint_list_iter_deinit(&iter);
-}
-
-static void mountpoints_update(const struct master_settings *set)
-{
-	struct mountpoint_list *mountpoints;
-	const char *perm_path, *state_path;
-
-	perm_path = t_strconcat(set->state_dir, "/"MOUNTPOINT_LIST_FNAME, NULL);
-	state_path = t_strconcat(set->base_dir, "/"MOUNTPOINT_LIST_FNAME, NULL);
-	mountpoints = mountpoint_list_init(perm_path, state_path);
-
-	if (mountpoint_list_add_missing(mountpoints, MOUNTPOINT_STATE_DEFAULT,
-				mountpoint_list_default_ignore_prefixes,
-				mountpoint_list_default_ignore_types) == 0)
-		mountpoints_warn_missing(mountpoints);
-	(void)mountpoint_list_save(mountpoints);
-	mountpoint_list_deinit(&mountpoints);
 }
 
 static void instance_update_now(struct master_instance_list *list)
@@ -378,7 +337,7 @@ sig_settings_reload(const siginfo_t *si ATTR_UNUSED,
 		}
 	}
 
-	memset(&input, 0, sizeof(input));
+	i_zero(&input);
 	input.roots = set_roots;
 	input.module = MASTER_SERVICE_NAME;
 	input.config_path = services_get_config_socket_path(services);
@@ -451,7 +410,7 @@ static struct master_settings *master_settings_read(void)
 	struct master_service_settings_output output;
 	const char *error;
 
-	memset(&input, 0, sizeof(input));
+	i_zero(&input);
 	input.roots = set_roots;
 	input.module = "master";
 	input.parse_full_config = TRUE;
@@ -460,32 +419,6 @@ static struct master_settings *master_settings_read(void)
 					 &error) < 0)
 		i_fatal("Error reading configuration: %s", error);
 	return master_service_settings_get_others(master_service)[0];
-}
-
-static void master_set_import_environment(const struct master_settings *set)
-{
-	const char *const *envs, *key, *value;
-	ARRAY_TYPE(const_string) keys;
-
-	if (*set->import_environment == '\0')
-		return;
-
-	t_array_init(&keys, 8);
-	envs = t_strsplit_spaces(set->import_environment, " ");
-	for (; *envs != NULL; envs++) {
-		value = strchr(*envs, '=');
-		if (value == NULL)
-			key = *envs;
-		else {
-			key = t_strdup_until(*envs, value);
-			env_put(*envs);
-		}
-		array_append(&keys, &key, 1);
-	}
-	array_append_zero(&keys);
-
-	value = t_strarray_join(array_idx(&keys, 0), " ");
-	env_put(t_strconcat(DOVECOT_PRESERVE_ENVS_ENV"=", value, NULL));
 }
 
 static void main_log_startup(char **protocols)
@@ -554,10 +487,11 @@ static void main_init(const struct master_settings *set)
 
 	create_pid_file(pidfile_path);
 	create_config_symlink(set);
-	mountpoints_update(set);
 	instance_update(set);
+	master_clients_init();
 
 	services_monitor_start(services);
+	startup_finished = TRUE;
 }
 
 static void global_dead_pipe_close(void)
@@ -572,6 +506,7 @@ static void global_dead_pipe_close(void)
 
 static void main_deinit(void)
 {
+	master_clients_deinit();
 	instance_update_now(instances);
 	timeout_remove(&to_instance);
 	master_instance_list_deinit(&instances);
@@ -580,8 +515,7 @@ static void main_deinit(void)
 	global_dead_pipe_close();
 	services_destroy(services, TRUE);
 
-	if (unlink(pidfile_path) < 0)
-		i_error("unlink(%s) failed: %m", pidfile_path);
+	i_unlink(pidfile_path);
 	i_free(pidfile_path);
 
 	service_anvil_global_deinit();
@@ -657,9 +591,6 @@ static void print_build_options(void)
 #ifdef IOLOOP_SELECT
 		" ioloop=select"
 #endif
-#ifdef IOLOOP_NOTIFY_DNOTIFY
-		" notify=dnotify"
-#endif
 #ifdef IOLOOP_NOTIFY_INOTIFY
 		" notify=inotify"
 #endif
@@ -681,6 +612,9 @@ static void print_build_options(void)
 	"SQL driver plugins:"
 #else
 	"SQL drivers:"
+#endif
+#ifdef BUILD_CASSANDRA
+		" cassandra"
 #endif
 #ifdef BUILD_MYSQL
 		" mysql"
@@ -813,6 +747,7 @@ int main(int argc, char *argv[])
 			break;
 		}
 	}
+	i_assert(optind > 0 && optind <= argc);
 
 	if (doveconf_arg != NULL) {
 		const char **args;
@@ -854,12 +789,6 @@ int main(int argc, char *argv[])
 		i_fatal("Unknown argument: --%s", argv[optind]);
 	}
 
-	do {
-		null_fd = open("/dev/null", O_WRONLY);
-		if (null_fd == -1)
-			i_fatal("Can't open /dev/null: %m");
-		fd_close_on_exec(null_fd, TRUE);
-	} while (null_fd <= STDERR_FILENO);
 	if (pipe(global_master_dead_pipe_fd) < 0)
 		i_fatal("pipe() failed: %m");
 	fd_close_on_exec(global_master_dead_pipe_fd[0], TRUE);
@@ -871,9 +800,10 @@ int main(int argc, char *argv[])
 			t_askpass("Give the password for SSL keys: ");
 	}
 
-	if (dup2(null_fd, STDIN_FILENO) < 0 ||
-	    dup2(null_fd, STDOUT_FILENO) < 0)
-		i_fatal("dup2(null_fd) failed: %m");
+	if (dup2(dev_null_fd, STDIN_FILENO) < 0)
+		i_fatal("dup2(dev_null_fd) failed: %m");
+	if (!foreground && dup2(dev_null_fd, STDOUT_FILENO) < 0)
+		i_fatal("dup2(dev_null_fd) failed: %m");
 
 	pidfile_path =
 		i_strconcat(set->base_dir, "/"MASTER_PID_FILE_NAME, NULL);
@@ -888,9 +818,9 @@ int main(int argc, char *argv[])
 	master_settings_do_fixes(set);
 	fatal_log_check(set);
 
-	T_BEGIN {
-		master_set_import_environment(set);
-	} T_END;
+	const struct master_service_settings *service_set =
+		master_service_settings_get(master_service);
+	master_service_import_environment(service_set->import_environment);
 	master_service_env_clean();
 
 	/* create service structures from settings. if there are any errors in

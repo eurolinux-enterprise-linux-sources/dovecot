@@ -120,8 +120,11 @@ doesn't grow beyond a manageable size. Save the below scriptlet as
 
 ---%<-------------------------------------------------------------------------
 /var/log/dovecot*.log {
+  weekly
+  rotate 4
   missingok
   notifempty
+  compress
   delaycompress
   sharedscripts
   postrotate
@@ -129,6 +132,22 @@ doesn't grow beyond a manageable size. Save the below scriptlet as
   endscript
 }
 ---%<-------------------------------------------------------------------------
+
+*Note:* doveadm is not working properly with SELinux (e.g. doveadm  cannot read
+config file when called from logrotate context).  SELinux safe postrotate 
+alternative scriplet:
+
+---%<-------------------------------------------------------------------------
+postrotate
+ kill -s 0 `cat /var/run/dovecot/master.pid` || kill -s USR1 `cat
+/var/run/dovecot/master.pid`
+endscript
+---%<-------------------------------------------------------------------------
+
+*Note 2:* When 'syslog_facility = local5'  is used for logging (example above),
+the line "/var/log/dovecot.log" should be added to the
+'/etc/logrotate.d/syslog' file to enable rotation (no
+'/etc/logrotate.d/dovecot' in this case!).
 
 Logging verbosity
 -----------------
@@ -155,4 +174,4 @@ all disabled, but they may be useful for debugging.
    That's enough to know if the password is same or different between login
    attempts.
 
-(This file was created from the wiki on 2013-12-19 04:42)
+(This file was created from the wiki on 2018-05-23 04:42)

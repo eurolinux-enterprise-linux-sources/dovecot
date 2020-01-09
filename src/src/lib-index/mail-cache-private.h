@@ -8,26 +8,6 @@
 #define MAIL_CACHE_MAJOR_VERSION 1
 #define MAIL_CACHE_MINOR_VERSION 1
 
-/* Drop fields that haven't been accessed for n seconds */
-#define MAIL_CACHE_FIELD_DROP_SECS (3600*24*30)
-
-/* Never compress the file if it's smaller than this */
-#define MAIL_CACHE_COMPRESS_MIN_SIZE (1024*32)
-
-/* Compress the file when n% of records are deleted */
-#define MAIL_CACHE_COMPRESS_DELETE_PERCENTAGE 20
-
-/* Compress the file when n% of rows contain continued rows.
-   200% means that there's 2 continued rows per record. */
-#define MAIL_CACHE_COMPRESS_CONTINUED_PERCENTAGE 200
-
-/* Compress the file when we need to follow more than n next_offsets to find
-   the latest cache header. */
-#define MAIL_CACHE_HEADER_FIELD_CONTINUE_COUNT 4
-
-/* If cache record becomes larger than this, don't add it. */
-#define MAIL_CACHE_RECORD_MAX_SIZE (64*1024)
-
 #define MAIL_CACHE_LOCK_TIMEOUT 10
 #define MAIL_CACHE_LOCK_CHANGE_TIMEOUT 300
 
@@ -114,6 +94,8 @@ struct mail_cache {
 	ino_t st_ino;
 	dev_t st_dev;
 
+	time_t last_mmap_error_time;
+
 	size_t mmap_length;
 	/* a) mmaping the whole file */
 	void *mmap_base;
@@ -126,7 +108,6 @@ struct mail_cache {
 	unsigned int remap_counter;
 
 	struct dotlock_settings dotlock_settings;
-	struct dotlock *dotlock;
 	struct file_lock *file_lock;
 
 	/* mmap_disable=no: hdr points to data / NULL when cache is invalid.
@@ -167,6 +148,15 @@ struct mail_cache_loop_track {
 	uoff_t size_sum;
 };
 
+struct mail_cache_missing_reason_cache {
+	uint32_t highest_checked_seq;
+	uint32_t highest_seq_with_cache;
+
+	uint32_t reset_id;
+	uint32_t log_file_head_seq;
+	uoff_t log_file_head_offset;
+};
+
 struct mail_cache_view {
 	struct mail_cache *cache;
 	struct mail_index_view *view, *trans_view;
@@ -175,6 +165,7 @@ struct mail_cache_view {
 	uint32_t trans_seq1, trans_seq2;
 
 	struct mail_cache_loop_track loop_track;
+	struct mail_cache_missing_reason_cache reason_cache;
 
 	/* if cached_exists_buf[field] == cached_exists_value, it's cached.
 	   this allows us to avoid constantly clearing the whole buffer.
@@ -212,7 +203,7 @@ struct mail_cache_lookup_iterate_ctx {
 
 /* Explicitly lock the cache file. Returns -1 if error / timed out,
    1 if ok, 0 if cache is broken/doesn't exist */
-int mail_cache_lock(struct mail_cache *cache, bool require_same_reset_id);
+int mail_cache_lock(struct mail_cache *cache);
 int mail_cache_try_lock(struct mail_cache *cache);
 /* Returns -1 if cache is / just got corrupted, 0 if ok. */
 int mail_cache_unlock(struct mail_cache *cache);
@@ -227,6 +218,7 @@ int mail_cache_header_fields_update(struct mail_cache *cache);
 void mail_cache_header_fields_get(struct mail_cache *cache, buffer_t *dest);
 int mail_cache_header_fields_get_next_offset(struct mail_cache *cache,
 					     uint32_t *offset_r);
+void mail_cache_expunge_count(struct mail_cache *cache, unsigned int count);
 
 uint32_t mail_cache_lookup_cur_offset(struct mail_index_view *view,
 				      uint32_t seq, uint32_t *reset_id_r);
@@ -256,12 +248,15 @@ int mail_cache_map(struct mail_cache *cache, size_t offset, size_t size,
 void mail_cache_file_close(struct mail_cache *cache);
 int mail_cache_reopen(struct mail_cache *cache);
 
-void mail_cache_delete(struct mail_cache *cache);
-
 /* Notify the decision handling code that field was looked up for seq.
-   This should be called even for fields that aren't currently in cache file */
+   This should be called even for fields that aren't currently in cache file.
+   This is used to update caching decisions for fields that already exist
+   in the cache file. */
 void mail_cache_decision_state_update(struct mail_cache_view *view,
 				      uint32_t seq, unsigned int field);
+/* Notify the decision handling code when field is committed to cache.
+   If this is the first time the field is added to cache, its caching decision
+   is updated to TEMP. */
 void mail_cache_decision_add(struct mail_cache_view *view, uint32_t seq,
 			     unsigned int field);
 

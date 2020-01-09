@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 /* @UNSAFE: whole file */
 
@@ -9,7 +9,7 @@
 #include "sendfile-util.h"
 #include "istream.h"
 #include "istream-private.h"
-#include "ostream-private.h"
+#include "ostream-file-private.h"
 
 #include <unistd.h>
 #include <sys/stat.h>
@@ -27,27 +27,6 @@
 
 #define MAX_SSIZE_T(size) \
 	((size) < SSIZE_T_MAX ? (size_t)(size) : SSIZE_T_MAX)
-
-struct file_ostream {
-	struct ostream_private ostream;
-
-	int fd;
-	struct io *io;
-	uoff_t buffer_offset;
-	uoff_t real_offset;
-
-	unsigned char *buffer; /* ring-buffer */
-	size_t buffer_size, optimal_block_size;
-	size_t head, tail; /* first unsent/unused byte */
-
-	unsigned int full:1; /* if head == tail, is buffer empty or full? */
-	unsigned int file:1;
-	unsigned int flush_pending:1;
-	unsigned int socket_cork_set:1;
-	unsigned int no_socket_cork:1;
-	unsigned int no_sendfile:1;
-	unsigned int autoclose_fd:1;
-};
 
 static void stream_send_io(struct file_ostream *fstream);
 
@@ -67,7 +46,7 @@ static void stream_closed(struct file_ostream *fstream)
 	fstream->ostream.ostream.closed = TRUE;
 }
 
-static void o_stream_file_close(struct iostream_private *stream,
+void o_stream_file_close(struct iostream_private *stream,
 				bool close_parent ATTR_UNUSED)
 {
 	struct file_ostream *fstream = (struct file_ostream *)stream;
@@ -169,16 +148,15 @@ static int o_stream_lseek(struct file_ostream *fstream)
 	return 0;
 }
 
-static ssize_t o_stream_writev(struct file_ostream *fstream,
-			       const struct const_iovec *iov, int iov_size)
+ssize_t o_stream_file_writev(struct file_ostream *fstream,
+				   const struct const_iovec *iov,
+				   unsigned int iov_count)
 {
-	ssize_t ret, ret2;
+	ssize_t ret;
 	size_t size, sent;
-	bool partial;
-	int i;
+	unsigned int i;
 
-	o_stream_socket_cork(fstream);
-	if (iov_size == 1) {
+	if (iov_count == 1) {
 		i_assert(iov->iov_len > 0);
 
 		if (!fstream->file ||
@@ -190,13 +168,12 @@ static ssize_t o_stream_writev(struct file_ostream *fstream,
 			ret = pwrite(fstream->fd, iov->iov_base, iov->iov_len,
 				     fstream->buffer_offset);
 		}
-		partial = ret != (ssize_t)iov->iov_len;
 	} else {
 		if (o_stream_lseek(fstream) < 0)
 			return -1;
 
-		sent = 0; partial = FALSE;
-		while (iov_size > IOV_MAX) {
+		sent = 0;
+		while (iov_count > IOV_MAX) {
 			size = 0;
 			for (i = 0; i < IOV_MAX; i++)
 				size += iov[i].iov_len;
@@ -204,7 +181,6 @@ static ssize_t o_stream_writev(struct file_ostream *fstream,
 			ret = writev(fstream->fd, (const struct iovec *)iov,
 				     IOV_MAX);
 			if (ret != (ssize_t)size) {
-				partial = TRUE;
 				break;
 			}
 
@@ -212,17 +188,16 @@ static ssize_t o_stream_writev(struct file_ostream *fstream,
 			fstream->buffer_offset += ret;
 			sent += ret;
 			iov += IOV_MAX;
-			iov_size -= IOV_MAX;
+			iov_count -= IOV_MAX;
 		}
 
-		if (iov_size <= IOV_MAX) {
+		if (iov_count <= IOV_MAX) {
 			size = 0;
-			for (i = 0; i < iov_size; i++)
+			for (i = 0; i < iov_count; i++)
 				size += iov[i].iov_len;
 
 			ret = writev(fstream->fd, (const struct iovec *)iov,
-				     iov_size);
-			partial = ret != (ssize_t)size;
+				     iov_count);
 		}
 		if (ret > 0) {
 			fstream->real_offset += ret;
@@ -232,10 +207,36 @@ static ssize_t o_stream_writev(struct file_ostream *fstream,
 			ret = sent;
 		}
 	}
+	return ret;
+}
+
+static ssize_t
+o_stream_file_writev_full(struct file_ostream *fstream,
+				   const struct const_iovec *iov,
+				   unsigned int iov_count)
+{
+	ssize_t ret, ret2;
+	size_t size, total_size;
+	bool partial;
+	unsigned int i;
+
+	for (i = 0, total_size = 0; i < iov_count; i++)
+		total_size += iov[i].iov_len;
+
+	o_stream_socket_cork(fstream);
+	ret = fstream->writev(fstream, iov, iov_count);
+	partial = ret != (ssize_t)total_size;
 
 	if (ret < 0) {
-		if (errno == EAGAIN || errno == EINTR)
+		if (fstream->file) {
+			if (errno == EINTR) {
+				/* automatically retry */
+				return o_stream_file_writev_full(fstream, iov, iov_count);
+			}
+		} else if (errno == EAGAIN || errno == EINTR) {
+			/* try again later */
 			return 0;
+		}
 		fstream->ostream.ostream.stream_errno = errno;
 		stream_closed(fstream);
 		return -1;
@@ -252,14 +253,14 @@ static ssize_t o_stream_writev(struct file_ostream *fstream,
 		   of disk space or we're writing to NFS. try to write the
 		   rest to resolve this. */
 		size = ret;
-		while (iov_size > 0 && size >= iov->iov_len) {
+		while (iov_count > 0 && size >= iov->iov_len) {
 			size -= iov->iov_len;
 			iov++;
-			iov_size--;
+			iov_count--;
 		}
-		i_assert(iov_size > 0);
+		i_assert(iov_count > 0);
 		if (size == 0)
-			ret2 = o_stream_writev(fstream, iov, iov_size);
+			ret2 = o_stream_file_writev_full(fstream, iov, iov_count);
 		else {
 			/* write the first iov separately */
 			struct const_iovec new_iov;
@@ -267,21 +268,25 @@ static ssize_t o_stream_writev(struct file_ostream *fstream,
 			new_iov.iov_base =
 				CONST_PTR_OFFSET(iov->iov_base, size);
 			new_iov.iov_len = iov->iov_len - size;
-			ret2 = o_stream_writev(fstream, &new_iov, 1);
+			ret2 = o_stream_file_writev_full(fstream, &new_iov, 1);
 			if (ret2 > 0) {
 				i_assert((size_t)ret2 == new_iov.iov_len);
 				/* write the rest */
-				if (iov_size > 1) {
+				if (iov_count > 1) {
 					ret += ret2;
-					ret2 = o_stream_writev(fstream, iov + 1,
-							       iov_size - 1);
+					ret2 = o_stream_file_writev_full(fstream, iov + 1,
+							       iov_count - 1);
 				}
 			}
 		}
-		if (ret2 <= 0)
-			return ret2;
-		ret += ret2;
+		i_assert(ret2 != 0);
+		if (ret2 < 0)
+			ret = ret2;
+		else
+			ret += ret2;
 	}
+	i_assert(ret < 0 || !fstream->file ||
+		 (size_t)ret == total_size);
 	return ret;
 }
 
@@ -317,7 +322,7 @@ static int buffer_flush(struct file_ostream *fstream)
 
 	iov_len = o_stream_fill_iovec(fstream, iov);
 	if (iov_len > 0) {
-		ret = o_stream_writev(fstream, iov, iov_len);
+		ret = o_stream_file_writev_full(fstream, iov, iov_len);
 		if (ret < 0)
 			return -1;
 
@@ -530,7 +535,7 @@ static size_t o_stream_add(struct file_ostream *fstream,
 	return sent;
 }
 
-static ssize_t o_stream_file_sendv(struct ostream_private *stream,
+ssize_t o_stream_file_sendv(struct ostream_private *stream,
 				   const struct const_iovec *iov,
 				   unsigned int iov_count)
 {
@@ -553,7 +558,7 @@ static ssize_t o_stream_file_sendv(struct ostream_private *stream,
 	if (IS_STREAM_EMPTY(fstream) &&
 	    (!stream->corked || size >= optimal_size)) {
 		/* send immediately */
-		ret = o_stream_writev(fstream, iov, iov_count);
+		ret = o_stream_file_writev_full(fstream, iov, iov_count);
 		if (ret < 0)
 			return -1;
 
@@ -654,7 +659,7 @@ o_stream_file_write_at(struct ostream_private *stream,
 				   of it in one pwrite(). */
 			} else {
 				/* write only the suffix */
-				unsigned int update_count = size - left;
+				size_t update_count = size - left;
 
 				data = CONST_PTR_OFFSET(data, update_count);
 				size -= update_count;
@@ -683,12 +688,15 @@ o_stream_file_write_at(struct ostream_private *stream,
 }
 
 static off_t io_stream_sendfile(struct ostream_private *outstream,
-				struct istream *instream, int in_fd)
+				struct istream *instream, int in_fd,
+				bool *sendfile_not_supported_r)
 {
 	struct file_ostream *foutstream = (struct file_ostream *)outstream;
 	uoff_t start_offset;
 	uoff_t in_size, offset, send_size, v_offset;
 	ssize_t ret;
+
+	*sendfile_not_supported_r = FALSE;
 
 	if ((ret = i_stream_get_size(instream, TRUE, &in_size)) <= 0) {
 		outstream->ostream.stream_errno = ret == 0 ? ESPIPE :
@@ -713,13 +721,23 @@ static off_t io_stream_sendfile(struct ostream_private *outstream,
 		ret = safe_sendfile(foutstream->fd, in_fd, &offset,
 				    MAX_SSIZE_T(send_size));
 		if (ret <= 0) {
-			if (ret == 0 || errno == EINTR || errno == EAGAIN) {
-				ret = 0;
+			if (ret == 0)
 				break;
+			if (foutstream->file) {
+				if (errno == EINTR) {
+					/* automatically retry */
+					continue;
+				}
+			} else {
+				if (errno == EINTR || errno == EAGAIN) {
+					ret = 0;
+					break;
+				}
 			}
-
-			outstream->ostream.stream_errno = errno;
-			if (errno != EINVAL) {
+			if (errno == EINVAL)
+				*sendfile_not_supported_r = TRUE;
+			else {
+				outstream->ostream.stream_errno = errno;
 				/* close only if error wasn't because
 				   sendfile() isn't supported */
 				stream_closed(foutstream);
@@ -735,8 +753,14 @@ static off_t io_stream_sendfile(struct ostream_private *outstream,
 
 	i_stream_seek(instream, v_offset);
 	if (ret == 0) {
-		/* we should be at EOF, verify it by reading instream */
-		(void)i_stream_read(instream);
+		/* we should be at EOF. if not, write more. */
+		i_assert(!foutstream->file ||
+			 instream->v_offset - start_offset == in_size);
+		if (i_stream_read(instream) > 0) {
+			if (io_stream_sendfile(outstream, instream, in_fd,
+					       sendfile_not_supported_r) < 0)
+				return -1;
+		}
 	}
 	return ret < 0 ? -1 : (off_t)(instream->v_offset - start_offset);
 }
@@ -821,7 +845,6 @@ static off_t io_stream_copy_backwards(struct ostream_private *outstream,
 static off_t io_stream_copy_stream(struct ostream_private *outstream,
 				   struct istream *instream, bool same_stream)
 {
-	struct file_ostream *foutstream = (struct file_ostream *)outstream;
 	uoff_t in_size;
 	off_t in_abs_offset, ret = 0;
 
@@ -857,8 +880,7 @@ static off_t io_stream_copy_stream(struct ostream_private *outstream,
 		}
 	}
 
-	return io_stream_copy(&outstream->ostream, instream,
-			      foutstream->optimal_block_size);
+	return io_stream_copy(&outstream->ostream, instream);
 }
 
 static off_t o_stream_file_send_istream(struct ostream_private *outstream,
@@ -868,17 +890,18 @@ static off_t o_stream_file_send_istream(struct ostream_private *outstream,
 	bool same_stream;
 	int in_fd;
 	off_t ret;
+	bool sendfile_not_supported;
 
 	in_fd = !instream->readable_fd ? -1 : i_stream_get_fd(instream);
 	if (!foutstream->no_sendfile && in_fd != -1 &&
 	    in_fd != foutstream->fd && instream->seekable) {
-		ret = io_stream_sendfile(outstream, instream, in_fd);
-		if (ret >= 0 || outstream->ostream.stream_errno != EINVAL)
+		ret = io_stream_sendfile(outstream, instream, in_fd,
+					 &sendfile_not_supported);
+		if (ret >= 0 || !sendfile_not_supported)
 			return ret;
 
 		/* sendfile() not supported (with this fd), fallback to
 		   regular sending. */
-		outstream->ostream.stream_errno = 0;
 		foutstream->no_sendfile = TRUE;
 	}
 
@@ -895,12 +918,12 @@ static void o_stream_file_switch_ioloop(struct ostream_private *stream)
 		fstream->io = io_loop_move_io(&fstream->io);
 }
 
-static struct file_ostream *
-o_stream_create_fd_common(int fd, bool autoclose_fd)
+struct ostream *
+o_stream_create_file_common(struct file_ostream *fstream,
+	int fd, size_t max_buffer_size, bool autoclose_fd)
 {
-	struct file_ostream *fstream;
+	struct ostream *ostream;
 
-	fstream = i_new(struct file_ostream, 1);
 	fstream->fd = fd;
 	fstream->autoclose_fd = autoclose_fd;
 	fstream->optimal_block_size = DEFAULT_OPTIMAL_BLOCK_SIZE;
@@ -918,7 +941,15 @@ o_stream_create_fd_common(int fd, bool autoclose_fd)
 	fstream->ostream.send_istream = o_stream_file_send_istream;
 	fstream->ostream.switch_ioloop = o_stream_file_switch_ioloop;
 
-	return fstream;
+	fstream->writev = o_stream_file_writev;
+
+	fstream->ostream.max_buffer_size = max_buffer_size;
+	ostream = o_stream_create(&fstream->ostream, NULL, fd);
+
+	if (max_buffer_size == 0)
+		fstream->ostream.max_buffer_size = fstream->optimal_block_size;
+
+	return ostream;
 }
 
 static void fstream_init_file(struct file_ostream *fstream)
@@ -948,9 +979,9 @@ o_stream_create_fd(int fd, size_t max_buffer_size, bool autoclose_fd)
 	struct ostream *ostream;
 	off_t offset;
 
-	fstream = o_stream_create_fd_common(fd, autoclose_fd);
-	fstream->ostream.max_buffer_size = max_buffer_size;
-	ostream = o_stream_create(&fstream->ostream, NULL, fd);
+	fstream = i_new(struct file_ostream, 1);
+	ostream = o_stream_create_file_common
+		(fstream, fd, max_buffer_size, autoclose_fd);
 
 	offset = lseek(fd, 0, SEEK_CUR);
 	if (offset >= 0) {
@@ -965,10 +996,17 @@ o_stream_create_fd(int fd, size_t max_buffer_size, bool autoclose_fd)
 		}
 	}
 
-	if (max_buffer_size == 0)
-		fstream->ostream.max_buffer_size = fstream->optimal_block_size;
-
 	return ostream;
+}
+
+struct ostream *
+o_stream_create_fd_autoclose(int *fd, size_t max_buffer_size)
+{
+	struct ostream *output;
+
+	output = o_stream_create_fd(*fd, max_buffer_size, TRUE);
+	*fd = -1;
+	return output;
 }
 
 struct ostream *
@@ -980,13 +1018,21 @@ o_stream_create_fd_file(int fd, uoff_t offset, bool autoclose_fd)
 	if (offset == (uoff_t)-1)
 		offset = lseek(fd, 0, SEEK_CUR);
 
-	fstream = o_stream_create_fd_common(fd, autoclose_fd);
+	fstream = i_new(struct file_ostream, 1);
+	ostream = o_stream_create_file_common(fstream, fd, 0, autoclose_fd);
 	fstream_init_file(fstream);
-	fstream->ostream.max_buffer_size = fstream->optimal_block_size;
 	fstream->real_offset = offset;
 	fstream->buffer_offset = offset;
-
-	ostream = o_stream_create(&fstream->ostream, NULL, fd);
+	ostream->blocking = fstream->file;
 	ostream->offset = offset;
 	return ostream;
+}
+
+struct ostream *o_stream_create_fd_file_autoclose(int *fd, uoff_t offset)
+{
+	struct ostream *output;
+
+	output = o_stream_create_fd_file(*fd, offset, TRUE);
+	*fd = -1;
+	return output;
 }

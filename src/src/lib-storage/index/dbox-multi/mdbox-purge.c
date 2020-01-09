@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -13,7 +13,6 @@
 #include "mdbox-map.h"
 #include "mdbox-sync.h"
 
-#include <stdlib.h>
 #include <dirent.h>
 
 /*
@@ -79,7 +78,8 @@ mdbox_file_read_metadata_hdr(struct dbox_file *file,
 			return 0;
 		}
 		mail_storage_set_critical(&file->storage->storage,
-			"read(%s) failed: %m", file->cur_path);
+			"read(%s) failed: %s", file->cur_path,
+			i_stream_get_error(file->input));
 		return -1;
 	}
 
@@ -165,10 +165,15 @@ mdbox_metadata_get_extrefs(struct dbox_file *file, pool_t ext_refs_pool,
 }
 
 static bool
-mdbox_purge_want_altpath(struct mdbox_purge_context *ctx, uint32_t map_uid)
+mdbox_purge_want_altpath(struct mdbox_purge_context *ctx,
+			 struct dbox_file *file, uint32_t map_uid)
 {
 	enum mdbox_msg_action action;
 	void *value;
+
+	if (dbox_file_is_in_alt(file) &&
+	    ctx->storage->set->mdbox_purge_preserve_alt)
+		return TRUE;
 
 	if (!ctx->have_altmoves)
 		return FALSE;
@@ -188,12 +193,11 @@ mdbox_purge_save_msg(struct mdbox_purge_context *ctx, struct dbox_file *file,
 	enum mdbox_map_append_flags append_flags;
 	uoff_t msg_size;
 	off_t ret;
-	int read_errno;
 
 	if (ctx->append_ctx == NULL)
 		ctx->append_ctx = mdbox_map_append_begin(ctx->atomic);
 
-	append_flags = !mdbox_purge_want_altpath(ctx, msg->map_uid) ? 0 :
+	append_flags = !mdbox_purge_want_altpath(ctx, file, msg->map_uid) ? 0 :
 		DBOX_MAP_APPEND_FLAG_ALT;
 	msg_size = file->msg_header_size + file->cur_physical_size;
 	if (mdbox_map_append_next(ctx->append_ctx, file->cur_physical_size,
@@ -204,19 +208,19 @@ mdbox_purge_save_msg(struct mdbox_purge_context *ctx, struct dbox_file *file,
 
 	input = i_stream_create_limit(file->input, msg_size);
 	ret = o_stream_send_istream(output, input);
-	read_errno = input->stream_errno;
-	i_stream_unref(&input);
-
-	if (read_errno != 0) {
-		errno = read_errno;
+	if (input->stream_errno != 0) {
 		mail_storage_set_critical(&file->storage->storage,
-			"read(%s) failed: %m", file->cur_path);
+			"read(%s) failed: %s", file->cur_path,
+			i_stream_get_error(input));
+		i_stream_unref(&input);
 		return -1;
 	}
+	i_stream_unref(&input);
 	if (o_stream_nfinish(output) < 0) {
 		mail_storage_set_critical(&file->storage->storage,
-					  "write(%s) failed: %m",
-					  out_file_append->file->cur_path);
+					  "write(%s) failed: %s",
+					  out_file_append->file->cur_path,
+					  o_stream_get_error(output));
 		return -1;
 	}
 	if (ret != (off_t)msg_size) {
@@ -246,7 +250,7 @@ mdbox_file_purge_check_refcounts(struct mdbox_purge_context *ctx,
 	unsigned int i, count;
 	int ret;
 
-	if (mdbox_map_atomic_lock(ctx->atomic) < 0)
+	if (mdbox_map_atomic_lock(ctx->atomic, "purging check") < 0)
 		return -1;
 
 	msgs = array_get(msgs_arr, &count);
@@ -383,6 +387,11 @@ mdbox_file_purge(struct mdbox_purge_context *ctx, struct dbox_file *file,
 			"(%"PRIuUOFF_T" < %"PRIuUOFF_T")", offset, st.st_size);
 		ret = 0;
 	}
+	if (ret > 0 && ctx->append_ctx != NULL) {
+		/* flush writes before locking the map */
+		if (mdbox_map_append_flush(ctx->append_ctx) < 0)
+			ret = -1;
+	}
 
 	if (ret <= 0)
 		ret = -1;
@@ -494,7 +503,8 @@ static int mdbox_purge_get_primary_files(struct mdbox_purge_context *ctx)
 	DIR *dir;
 	struct dirent *d;
 	string_t *path;
-	unsigned int file_id, dir_len;
+	unsigned int file_id;
+	size_t dir_len;
 	int ret = 0;
 
 	if (!array_is_created(&dstorage->move_to_alt_map_uids) &&

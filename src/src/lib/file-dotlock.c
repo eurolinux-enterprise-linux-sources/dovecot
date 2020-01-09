@@ -1,11 +1,11 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
 #include "str.h"
 #include "hex-binary.h"
 #include "hostpid.h"
-#include "randgen.h"
+#include "file-lock.h"
 #include "eacces-error.h"
 #include "write-full.h"
 #include "safe-mkstemp.h"
@@ -13,7 +13,6 @@
 #include "file-dotlock.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <signal.h>
 #include <time.h>
 #include <utime.h>
@@ -192,11 +191,8 @@ static int update_lock_info(time_t now, struct lock_info *lock_info,
 
 static int dotlock_override(struct lock_info *lock_info)
 {
-	if (unlink(lock_info->lock_path) < 0 && errno != ENOENT) {
-		i_error("unlink(%s) failed: %m",
-			lock_info->lock_path);
+	if (i_unlink_if_exists(lock_info->lock_path) < 0)
 		return -1;
-	}
 
 	/* make sure we sleep for a while after overriding the lock file.
 	   otherwise another process might try to override it at the same time
@@ -392,8 +388,7 @@ static int try_create_lock_hardlink(struct lock_info *lock_info, bool write_pid,
 		return -1;
 	}
 
-	if (unlink(lock_info->temp_path) < 0) {
-		i_error("unlink(%s) failed: %m", lock_info->temp_path);
+	if (i_unlink(lock_info->temp_path) < 0) {
 		/* non-fatal, continue */
 	}
 	lock_info->temp_path = NULL;
@@ -493,7 +488,7 @@ dotlock_create(struct dotlock *dotlock, enum dotlock_create_flags flags,
 		now + set->timeout;
 	tmp_path = t_str_new(256);
 
-	memset(&lock_info, 0, sizeof(lock_info));
+	i_zero(&lock_info);
 	lock_info.path = dotlock->path;
 	lock_info.set = set;
 	lock_info.lock_path = lock_path;
@@ -502,6 +497,7 @@ dotlock_create(struct dotlock *dotlock, enum dotlock_create_flags flags,
 
 	last_notify = 0; do_wait = FALSE;
 
+	file_lock_wait_start();
 	do {
 		if (do_wait) {
 			if (prev_last_change != lock_info.last_change) {
@@ -566,8 +562,10 @@ dotlock_create(struct dotlock *dotlock, enum dotlock_create_flags flags,
 		do_wait = TRUE;
 		now = time(NULL);
 	} while (now < max_wait_time);
+	file_lock_wait_end(dotlock->path);
 
 	if (ret > 0) {
+		i_assert(lock_info.fd != -1);
 		if (fstat(lock_info.fd, &st) < 0) {
 			i_error("fstat(%s) failed: %m", lock_path);
 			ret = -1;
@@ -597,10 +595,8 @@ dotlock_create(struct dotlock *dotlock, enum dotlock_create_flags flags,
 			i_error("close(%s) failed: %m", lock_path);
 		errno = old_errno;
 	}
-	if (lock_info.temp_path != NULL) {
-		if (unlink(lock_info.temp_path) < 0)
-			i_error("unlink(%s) failed: %m", lock_info.temp_path);
-	}
+	if (lock_info.temp_path != NULL)
+		i_unlink(lock_info.temp_path);
 
 	if (ret == 0)
 		errno = EAGAIN;
@@ -725,6 +721,7 @@ int file_dotlock_delete(struct dotlock **dotlock_p)
 	struct dotlock *dotlock;
 	const char *lock_path;
         struct stat st;
+	int ret;
 
 	dotlock = *dotlock_p;
 	*dotlock_p = NULL;
@@ -759,20 +756,10 @@ int file_dotlock_delete(struct dotlock **dotlock_p)
 			  (int)(time(NULL) - dotlock->lock_time));
 	}
 
-	if (unlink(lock_path) < 0) {
-		if (errno == ENOENT) {
-			dotlock_replaced_warning(dotlock, TRUE);
-			file_dotlock_free(&dotlock);
-			return 0;
-		}
-
-		i_error("unlink(%s) failed: %m", lock_path);
-		file_dotlock_free(&dotlock);
-		return -1;
-	}
-
+	if ((ret = i_unlink_if_exists(lock_path)) == 0)
+		dotlock_replaced_warning(dotlock, TRUE);
 	file_dotlock_free(&dotlock);
-	return 1;
+	return ret;
 }
 
 int file_dotlock_open(const struct dotlock_settings *set, const char *path,
@@ -855,22 +842,25 @@ int file_dotlock_replace(struct dotlock **dotlock_p,
 {
 	struct dotlock *dotlock;
 	const char *lock_path;
+	bool is_locked;
 
 	dotlock = *dotlock_p;
 	*dotlock_p = NULL;
 
+	is_locked = (flags & DOTLOCK_REPLACE_FLAG_VERIFY_OWNER) == 0 ? TRUE :
+		file_dotlock_is_locked(dotlock);
+
 	if ((flags & DOTLOCK_REPLACE_FLAG_DONT_CLOSE_FD) != 0)
 		dotlock->fd = -1;
 
-	lock_path = file_dotlock_get_lock_path(dotlock);
-	if ((flags & DOTLOCK_REPLACE_FLAG_VERIFY_OWNER) != 0 &&
-	    !file_dotlock_is_locked(dotlock)) {
+	if (!is_locked) {
 		dotlock_replaced_warning(dotlock, FALSE);
 		errno = EEXIST;
 		file_dotlock_free(&dotlock);
 		return 0;
 	}
 
+	lock_path = file_dotlock_get_lock_path(dotlock);
 	if (rename(lock_path, dotlock->path) < 0) {
 		i_error("rename(%s, %s) failed: %m", lock_path, dotlock->path);
 		if (errno == ENOENT)

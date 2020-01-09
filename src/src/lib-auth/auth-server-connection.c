@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,13 +8,13 @@
 #include "istream.h"
 #include "ostream.h"
 #include "net.h"
+#include "strescape.h"
 #include "eacces-error.h"
 #include "auth-client-private.h"
 #include "auth-client-request.h"
 #include "auth-server-connection.h"
 
 #include <unistd.h>
-#include <stdlib.h>
 
 #define AUTH_SERVER_CONN_MAX_LINE_LENGTH AUTH_CLIENT_MAX_LINE_LENGTH
 #define AUTH_HANDSHAKE_TIMEOUT (30*1000)
@@ -39,7 +39,7 @@ auth_server_input_mech(struct auth_server_connection *conn,
 		return -1;
 	}
 
-	memset(&mech_desc, 0, sizeof(mech_desc));
+	i_zero(&mech_desc);
 	mech_desc.name = p_strdup(conn->pool, args[0]);
 
 	if (strcmp(mech_desc.name, "PLAIN") == 0)
@@ -207,7 +207,7 @@ auth_server_connection_input_line(struct auth_server_connection *conn,
 	if (conn->client->debug)
 		i_debug("auth input: %s", line);
 
-	args = t_strsplit_tab(line);
+	args = t_strsplit_tabescaped(line);
 	if (args[0] == NULL) {
 		i_error("Auth server sent empty line");
 		return -1;
@@ -269,7 +269,7 @@ static void auth_server_connection_input(struct auth_server_connection *conn)
 			i_error("Authentication server not compatible with "
 				"this client (mixed old and new binaries?)");
 			auth_server_connection_disconnect(conn,
-				"incompatible serevr");
+				"incompatible server");
 			return;
 		}
 		conn->version_received = TRUE;
@@ -454,9 +454,10 @@ int auth_server_connection_connect(struct auth_server_connection *conn)
                                     AUTH_CLIENT_PROTOCOL_MINOR_VERSION,
 				    conn->client->client_pid);
 	if (o_stream_send_str(conn->output, handshake) < 0) {
-		i_warning("Error sending handshake to auth server: %m");
+		i_warning("Error sending handshake to auth server: %s",
+			  o_stream_get_error(conn->output));
 		auth_server_connection_disconnect(conn,
-			strerror(conn->output->last_failed_errno));
+			o_stream_get_error(conn->output));
 		return -1;
 	}
 
@@ -476,6 +477,14 @@ auth_server_connection_add_request(struct auth_server_connection *conn,
 		/* wrapped - ID 0 not allowed */
 		id = ++conn->client->request_id_counter;
 	}
+	i_assert(hash_table_lookup(conn->requests, POINTER_CAST(id)) == NULL);
 	hash_table_insert(conn->requests, POINTER_CAST(id), request);
 	return id;
+}
+
+void auth_server_connection_remove_request(struct auth_server_connection *conn,
+					   unsigned int id)
+{
+	i_assert(conn->handshake_received);
+	hash_table_remove(conn->requests, POINTER_CAST(id));
 }

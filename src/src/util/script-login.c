@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "env-util.h"
@@ -13,7 +13,6 @@
 #include "master-service.h"
 #include "master-service-settings.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 #define SCRIPT_LOGIN_PROTOCOL_VERSION_MAJOR 1
@@ -90,7 +89,7 @@ static void client_connected(struct master_service_connection *conn)
 		i_fatal("Missing input fields");
 
 	i = 0;
-	memset(&input, 0, sizeof(input));
+	i_zero(&input);
 	input.module = "mail"; /* need to get mail_uid, mail_gid */
 	input.service = "script-login";
 	(void)net_addr2ip(args[i++], &input.local_ip);
@@ -102,7 +101,7 @@ static void client_connected(struct master_service_connection *conn)
 	env_put(t_strconcat("IP=", net_ip2addr(&input.remote_ip), NULL));
 	env_put(t_strconcat("USER=", input.username, NULL));
 
-	for (; args[i] != '\0'; i++) {
+	for (; args[i] != NULL; i++) {
 		args[i] = str_tabunescape(t_strdup_noconst(args[i]));
 		value = strchr(args[i], '=');
 		if (value != NULL) {

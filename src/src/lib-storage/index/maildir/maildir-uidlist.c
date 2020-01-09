@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2018 Dovecot authors, see the included COPYING file */
 
 /*
    Version 1 format has been used for most versions of Dovecot up to v1.0.x.
@@ -38,7 +38,6 @@
 #include "maildir-uidlist.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/stat.h>
 
 /* NFS: How many times to retry reading dovecot-uidlist file if ESTALE
@@ -591,10 +590,18 @@ maildir_uidlist_read_v3_header(struct maildir_uidlist *uidlist,
 
 		switch (key) {
 		case MAILDIR_UIDLIST_HDR_EXT_UID_VALIDITY:
-			*uid_validity_r = strtoul(value, NULL, 10);
+			if (str_to_uint(value, uid_validity_r) < 0) {
+				maildir_uidlist_set_corrupted(uidlist,
+					"Invalid mailbox UID_VALIDITY: %s", value);
+				return -1;
+			}
 			break;
 		case MAILDIR_UIDLIST_HDR_EXT_NEXT_UID:
-			*next_uid_r = strtoul(value, NULL, 10);
+			if (str_to_uint(value, next_uid_r) < 0) {
+				maildir_uidlist_set_corrupted(uidlist,
+					"Invalid mailbox NEXT_UID: %s", value);
+				return -1;
+			}
 			break;
 		case MAILDIR_UIDLIST_HDR_EXT_GUID:
 			if (guid_128_from_string(value,
@@ -758,7 +765,7 @@ maildir_uidlist_update_read(struct maildir_uidlist *uidlist,
 							    st.st_size/8));
 	}
 
-	input = i_stream_create_fd(fd, 4096, FALSE);
+	input = i_stream_create_fd(fd, (size_t)-1, FALSE);
 	i_stream_seek(input, last_read_offset);
 
 	orig_uid_validity = uidlist->uid_validity;
@@ -809,7 +816,7 @@ maildir_uidlist_update_read(struct maildir_uidlist *uidlist,
 
         if (ret == 0) {
                 /* file is broken */
-                (void)unlink(uidlist->path);
+                i_unlink(uidlist->path);
         } else if (ret > 0) {
                 /* success */
 		if (readonly)
@@ -825,9 +832,9 @@ maildir_uidlist_update_read(struct maildir_uidlist *uidlist,
                 if (input->stream_errno == ESTALE && try_retry)
 			*retry_r = TRUE;
 		else {
-			errno = input->stream_errno;
 			mail_storage_set_critical(storage,
-				"read(%s) failed: %m", uidlist->path);
+				"read(%s) failed: %s", uidlist->path,
+				i_stream_get_error(input));
 		}
 		uidlist->last_read_offset = 0;
 	}
@@ -1142,7 +1149,7 @@ maildir_uidlist_rec_set_ext(struct maildir_uidlist_rec *rec, pool_t pool,
 {
 	const unsigned char *p;
 	buffer_t *buf;
-	unsigned int len;
+	size_t len;
 
 	/* copy existing extensions, except for the one we're updating */
 	buf = buffer_create_dynamic(pool_datastack_create(), 128);
@@ -1243,7 +1250,7 @@ static int maildir_uidlist_write_fd(struct maildir_uidlist *uidlist, int fd,
 	string_t *str;
 	const unsigned char *p;
 	const char *strp;
-	unsigned int len;
+	size_t len;
 
 	i_assert(fd != -1);
 
@@ -1294,7 +1301,7 @@ static int maildir_uidlist_write_fd(struct maildir_uidlist *uidlist, int fd,
 			}
 		}
 		str_append(str, " :");
-		strp = strchr(rec->filename, ':');
+		strp = strchr(rec->filename, *MAILDIR_INFO_SEP_S);
 		if (strp == NULL)
 			str_append(str, rec->filename);
 		else
@@ -1305,7 +1312,8 @@ static int maildir_uidlist_write_fd(struct maildir_uidlist *uidlist, int fd,
 	maildir_uidlist_iter_deinit(&iter);
 
 	if (o_stream_nfinish(output) < 0) {
-		mail_storage_set_critical(storage, "write(%s) failed: %m", path);
+		mail_storage_set_critical(storage, "write(%s) failed: %s", path,
+					  o_stream_get_error(output));
 		o_stream_unref(&output);
 		return -1;
 	}
@@ -1445,12 +1453,9 @@ static int maildir_uidlist_recreate(struct maildir_uidlist *uidlist)
 		}
 	}
 
-	if (ret < 0) {
-		if (unlink(temp_path) < 0) {
-			mail_storage_set_critical(box->storage,
-				"unlink(%s) failed: %m", temp_path);
-		}
-	} else if (fstat(fd, &st) < 0) {
+	if (ret < 0)
+		i_unlink(temp_path);
+	else if (fstat(fd, &st) < 0) {
 		mail_storage_set_critical(box->storage,
 			"fstat(%s) failed: %m", temp_path);
 		ret = -1;
@@ -1696,8 +1701,13 @@ maildir_uidlist_sync_next_partial(struct maildir_uidlist_sync_ctx *ctx,
 		rec = p_new(uidlist->record_pool,
 			    struct maildir_uidlist_rec, 1);
 		rec->uid = (uint32_t)-1;
+		rec->filename = p_strdup(uidlist->record_pool, filename);
 		array_append(&uidlist->records, &rec, 1);
 		uidlist->change_counter++;
+
+		hash_table_insert(uidlist->files, rec->filename, rec);
+	} else if (strcmp(rec->filename, filename) != 0) {
+		rec->filename = p_strdup(uidlist->record_pool, filename);
 	}
 	if (uid != 0) {
 		if (rec->uid != uid && rec->uid != (uint32_t)-1) {
@@ -1719,8 +1729,6 @@ maildir_uidlist_sync_next_partial(struct maildir_uidlist_sync_ctx *ctx,
 	rec->flags &= ~MAILDIR_UIDLIST_REC_FLAG_NEW_DIR;
 	rec->flags = (rec->flags | flags) &
 		~MAILDIR_UIDLIST_REC_FLAG_NONSYNCED;
-	rec->filename = p_strdup(uidlist->record_pool, filename);
-	hash_table_insert(uidlist->files, rec->filename, rec);
 
 	ctx->finished = FALSE;
 	*rec_r = rec;
@@ -1794,6 +1802,8 @@ int maildir_uidlist_sync_next_uid(struct maildir_uidlist_sync_ctx *ctx,
 		   to check for duplicates. */
 		rec->flags &= ~(MAILDIR_UIDLIST_REC_FLAG_NEW_DIR |
 				MAILDIR_UIDLIST_REC_FLAG_MOVED);
+		if (strcmp(rec->filename, filename) != 0)
+			rec->filename = p_strdup(ctx->record_pool, filename);
 	} else {
 		old_rec = hash_table_lookup(uidlist->files, filename);
 		i_assert(old_rec != NULL || UIDLIST_IS_LOCKED(uidlist));
@@ -1811,6 +1821,8 @@ int maildir_uidlist_sync_next_uid(struct maildir_uidlist_sync_ctx *ctx,
 			/* didn't exist in uidlist, it's recent */
 			flags |= MAILDIR_UIDLIST_REC_FLAG_RECENT;
 		}
+		rec->filename = p_strdup(ctx->record_pool, filename);
+		hash_table_insert(ctx->files, rec->filename, rec);
 
 		array_append(&ctx->records, &rec, 1);
 	}
@@ -1821,8 +1833,6 @@ int maildir_uidlist_sync_next_uid(struct maildir_uidlist_sync_ctx *ctx,
 	}
 
 	rec->flags = (rec->flags | flags) & ~MAILDIR_UIDLIST_REC_FLAG_NONSYNCED;
-	rec->filename = p_strdup(ctx->record_pool, filename);
-	hash_table_insert(ctx->files, rec->filename, rec);
 	*rec_r = rec;
 	return 1;
 }
@@ -1976,10 +1986,11 @@ static void maildir_uidlist_swap(struct maildir_uidlist_sync_ctx *ctx)
 	array_free(&uidlist->records);
 	uidlist->records = ctx->records;
 	ctx->records.arr.buffer = NULL;
+	i_assert(array_is_created(&uidlist->records));
 
 	hash_table_destroy(&uidlist->files);
 	uidlist->files = ctx->files;
-	memset(&ctx->files, 0, sizeof(ctx->files));
+	i_zero(&ctx->files);
 
 	if (uidlist->record_pool != NULL)
 		pool_unref(&uidlist->record_pool);

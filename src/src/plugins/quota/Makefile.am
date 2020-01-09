@@ -5,12 +5,17 @@ pkglibexec_PROGRAMS = quota-status
 
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
+	-I$(top_srcdir)/src/lib-test \
 	-I$(top_srcdir)/src/lib-master \
 	-I$(top_srcdir)/src/lib-dict \
 	-I$(top_srcdir)/src/lib-index \
 	-I$(top_srcdir)/src/lib-mail \
+	-I$(top_srcdir)/src/lib-imap \
+	-I$(top_srcdir)/src/lib-imap-client \
+	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-storage \
 	-I$(top_srcdir)/src/lib-storage/index \
+	-I$(top_srcdir)/src/lib-storage/index/imapc \
 	-I$(top_srcdir)/src/lib-storage/index/maildir \
 	-I$(top_srcdir)/src/doveadm
 
@@ -27,9 +32,11 @@ quota_dist_sources = \
 	quota-fs.c \
 	quota-dict.c \
 	quota-dirsize.c \
+	quota-imapc.c \
 	quota-maildir.c \
         quota-plugin.c \
-	quota-storage.c
+	quota-storage.c \
+	quota-util.c
 
 quota_common_objects = \
 	quota.lo \
@@ -37,9 +44,11 @@ quota_common_objects = \
 	quota-fs.lo \
 	quota-dict.lo \
 	quota-dirsize.lo \
+	quota-imapc.lo \
 	quota-maildir.lo \
         quota-plugin.lo \
 	quota-storage.lo \
+	quota-util.lo \
 	$(RQUOTA_XDR_LO)
 
 lib10_quota_plugin_la_SOURCES = $(quota_dist_sources)
@@ -53,7 +62,8 @@ lib10_doveadm_quota_plugin_la_SOURCES = \
 	doveadm-quota.c
 
 quota_status_SOURCES = \
-	quota-status.c
+	quota-status.c \
+	quota-status-settings.c
 
 quota_status_LDADD = \
 	$(quota_common_objects) \
@@ -70,7 +80,7 @@ RQUOTA_XDR = rquota_xdr.c
 RQUOTA_XDR_LO = rquota_xdr.lo
 #RQUOTA_X = /usr/include/rpcsvc/rquota.x
 RQUOTA_X = $(srcdir)/rquota.x
-rquota_xdr.c: Makefile $(RQUOTA_X)
+rquota_xdr.c: Makefile rquota.h
 	if [ "$(top_srcdir)" != "$(top_builddir)" ]; then \
 	  cp $(RQUOTA_X) $(top_builddir)/src/plugins/quota/; \
 	fi; \
@@ -95,6 +105,8 @@ pkginc_lib_HEADERS = \
 	quota-fs.h \
 	quota-plugin.h \
 	quota-private.h
+noinst_HEADERS = \
+	quota-status-settings.h
 
 EXTRA_DIST = rquota.x
 
@@ -103,3 +115,22 @@ clean-generic:
 	  rm -f $(top_builddir)/src/plugins/quota/rquota.x; \
 	fi; \
 	rm -f rquota_xdr.c rquota.h
+
+test_programs = \
+	test-quota-util
+noinst_PROGRAMS = $(test_programs)
+
+test_libs = \
+	../../lib-test/libtest.la \
+	../../lib/liblib.la
+test_deps = $(noinst_LTLIBRARIES) $(test_libs)
+
+test_quota_util_SOURCES = test-quota-util.c
+test_quota_util_LDADD = quota-util.lo $(test_libs)
+test_quota_util_DEPENDENCIES = quota-util.lo $(test_deps)
+
+check: check-am check-test
+check-test: all-am
+	for bin in $(test_programs); do \
+	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
+	done

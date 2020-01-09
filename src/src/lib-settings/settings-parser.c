@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -13,7 +13,6 @@
 #include "settings-parser.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -69,9 +68,6 @@ static const struct setting_parser_info strlist_info = {
 HASH_TABLE_DEFINE_TYPE(setting_link, struct setting_link *,
 		       struct setting_link *);
 
-static int settings_parse_keyvalue(struct setting_parser_context *ctx,
-				   const char *key, const char *value);
-
 static void
 setting_parser_copy_defaults(struct setting_parser_context *ctx, 
 			     const struct setting_parser_info *info,
@@ -115,10 +111,10 @@ copy_unique_defaults(struct setting_parser_context *ctx,
 	}
 	p_array_init(arr, ctx->set_pool, count + 4);
 
-	memset(&info, 0, sizeof(info));
+	i_zero(&info);
 	info = *def->list_info;
 
-	for (i = 0; i < count; i++) {
+	for (i = 0; i < count; i++) T_BEGIN {
 		new_set = p_malloc(ctx->set_pool, info.struct_size);
 		array_append(arr, &new_set, 1);
 
@@ -143,11 +139,12 @@ copy_unique_defaults(struct setting_parser_context *ctx,
 		new_link->change_array = carr;
 		new_link->set_struct = new_set;
 		new_link->change_struct = new_changes;
+		i_assert(hash_table_lookup(ctx->links, full_key) == NULL);
 		hash_table_insert(ctx->links, full_key, new_link);
 
 		info.defaults = children[i];
 		setting_parser_copy_defaults(ctx, &info, new_link);
-	}
+	} T_END;
 }
 
 static void
@@ -337,53 +334,73 @@ get_octal(struct setting_parser_context *ctx, const char *value,
 	  unsigned int *result_r)
 {
 	unsigned long long octal;
-	char *p;
 
 	if (*value != '0')
 		return get_uint(ctx, value, result_r);
 
-	octal = strtoull(value + 1, &p, 8);
-	if (*p != '\0' || octal > UINT_MAX) {
+	if (str_to_ullong_oct(value, &octal) < 0) {
 		ctx->error = p_strconcat(ctx->parser_pool, "Invalid number: ",
 					 value, NULL);
+		return -1;
 	}
 	*result_r = (unsigned int)octal;
 	return 0;
 }
 
-int settings_get_time(const char *str, unsigned int *secs_r,
-		      const char **error_r)
+static int settings_get_time_full(const char *str, unsigned int *interval_r,
+				  bool milliseconds, const char **error_r)
 {
-	unsigned int num, multiply = 1;
-	char *p;
+	uintmax_t num, multiply = milliseconds ? 1000 : 1;
+	const char *p;
 
-	num = strtoull(str, &p, 10);
+	if (str_parse_uintmax(str, &num, &p) < 0) {
+		*error_r = t_strconcat("Invalid time interval: ", str, NULL);
+		return -1;
+	}
 	while (*p == ' ') p++;
 	switch (i_toupper(*p)) {
 	case 'S':
-		multiply = 1;
+		multiply *= 1;
 		if (strncasecmp(p, "secs", strlen(p)) == 0 ||
 		    strncasecmp(p, "seconds", strlen(p)) == 0)
 			p = "";
 		break;
 	case 'M':
-		multiply = 60;
+		multiply *= 60;
 		if (strncasecmp(p, "mins", strlen(p)) == 0 ||
 		    strncasecmp(p, "minutes", strlen(p)) == 0)
 			p = "";
+		else if (strncasecmp(p, "msecs", strlen(p)) == 0 ||
+			 strncasecmp(p, "mseconds", strlen(p)) == 0 ||
+			 strncasecmp(p, "millisecs", strlen(p)) == 0 ||
+			 strncasecmp(p, "milliseconds", strlen(p)) == 0) {
+			if (milliseconds || (num % 1000) == 0) {
+				if (!milliseconds) {
+					/* allow ms also for seconds, as long
+					   as it's divisible by seconds */
+					num /= 1000;
+				}
+				multiply = 1;
+				p = "";
+				break;
+			}
+			*error_r = t_strdup_printf(
+				"Milliseconds not supported for this setting: %s", str);
+			return -1;
+		}
 		break;
 	case 'H':
-		multiply = 60*60;
+		multiply *= 60*60;
 		if (strncasecmp(p, "hours", strlen(p)) == 0)
 			p = "";
 		break;
 	case 'D':
-		multiply = 60*60*24;
+		multiply *= 60*60*24;
 		if (strncasecmp(p, "days", strlen(p)) == 0)
 			p = "";
 		break;
 	case 'W':
-		multiply = 60*60*24*7;
+		multiply *= 60*60*24*7;
 		if (strncasecmp(p, "weeks", strlen(p)) == 0)
 			p = "";
 		break;
@@ -398,17 +415,32 @@ int settings_get_time(const char *str, unsigned int *secs_r,
 				       str, NULL);
 		return -1;
 	}
-	*secs_r = num * multiply;
+	*interval_r = num * multiply;
 	return 0;
+}
+
+int settings_get_time(const char *str, unsigned int *secs_r,
+		      const char **error_r)
+{
+	return settings_get_time_full(str, secs_r, FALSE, error_r);
+}
+
+int settings_get_time_msecs(const char *str, unsigned int *msecs_r,
+			    const char **error_r)
+{
+	return settings_get_time_full(str, msecs_r, TRUE, error_r);
 }
 
 int settings_get_size(const char *str, uoff_t *bytes_r,
 		      const char **error_r)
 {
-	unsigned long long num, multiply = 1;
-	char *p;
+	uintmax_t num, multiply = 1;
+	const char *p;
 
-	num = strtoull(str, &p, 10);
+	if (str_parse_uintmax(str, &num, &p) < 0) {
+		*error_r = t_strconcat("Invalid size: ", str, NULL);
+		return -1;
+	}
 	while (*p == ' ') p++;
 	switch (i_toupper(*p)) {
 	case 'B':
@@ -444,7 +476,7 @@ int settings_get_size(const char *str, uoff_t *bytes_r,
 		*error_r = t_strconcat("Invalid size: ", str, NULL);
 		return -1;
 	}
-	if (num > ULLONG_MAX / multiply) {
+	if (num > ((uoff_t)-1) / multiply) {
 		*error_r = t_strconcat("Size is too large: ", str, NULL);
 		return -1;
 	}
@@ -524,6 +556,7 @@ setting_link_add(struct setting_parser_context *ctx,
 	link = p_new(ctx->parser_pool, struct setting_link, 1);
 	*link = *link_copy;
 	link->full_key = key;
+	i_assert(hash_table_lookup(ctx->links, key) == NULL);
 	hash_table_insert(ctx->links, key, link);
 
 	if (link->info->struct_size != 0)
@@ -549,7 +582,7 @@ get_deflist(struct setting_parser_context *ctx, struct setting_link *parent,
 	if (change_result != NULL && !array_is_created(change_result))
 		p_array_init(change_result, ctx->set_pool, 5);
 
-	memset(&new_link, 0, sizeof(new_link));
+	i_zero(&new_link);
 	new_link.parent = parent;
 	new_link.info = info;
 	new_link.array = result;
@@ -563,7 +596,7 @@ get_deflist(struct setting_parser_context *ctx, struct setting_link *parent,
 			return -1;
 	}
 
-	list = t_strsplit(value, "\t ");
+	list = t_strsplit(value, ",\t ");
 	for (; *list != NULL; list++) {
 		if (**list == '\0')
 			continue;
@@ -572,6 +605,18 @@ get_deflist(struct setting_parser_context *ctx, struct setting_link *parent,
 				       SETTINGS_SEPARATOR_S, *list, NULL);
 		if (setting_link_add(ctx, def, &new_link, full_key) < 0)
 			return -1;
+	}
+	return 0;
+}
+
+static int
+get_in_port_zero(struct setting_parser_context *ctx, const char *value,
+	 in_port_t *result_r)
+{
+	if (net_str2port_zero(value, result_r) < 0) {
+		ctx->error = p_strdup_printf(ctx->parser_pool,
+			"Invalid port number %s", value);
+		return -1;
 	}
 	return 0;
 }
@@ -623,6 +668,10 @@ settings_parse(struct setting_parser_context *ctx, struct setting_link *link,
 			ctx->error = p_strdup(ctx->parser_pool, error);
 			return -1;
 		}
+		break;
+	case SET_IN_PORT:
+		if (get_in_port_zero(ctx, value, (in_port_t *)ptr) < 0)
+			return -1;
 		break;
 	case SET_STR:
 		*((char **)ptr) = p_strdup(ctx->set_pool, value);
@@ -770,12 +819,15 @@ settings_parse_strlist(struct setting_parser_context *ctx,
 	array_append(link->array, &vvalue, 1);
 }
 
-static int settings_parse_keyvalue(struct setting_parser_context *ctx,
-				   const char *key, const char *value)
+int settings_parse_keyvalue(struct setting_parser_context *ctx,
+			    const char *key, const char *value)
 {
 	const struct setting_define *def;
 	struct setting_link *link;
 	unsigned int n = 0;
+
+	ctx->error = NULL;
+	ctx->prev_info = NULL;
 
 	if (!settings_find_key_nth(ctx, key, &n, &def, &link)) {
 		ctx->error = p_strconcat(ctx->parser_pool,
@@ -863,9 +915,6 @@ int settings_parse_line(struct setting_parser_context *ctx, const char *line)
 {
 	const char *key, *value;
 	int ret;
-
-	ctx->error = NULL;
-	ctx->prev_info = NULL;
 
 	key = line;
 	value = strchr(line, '=');
@@ -960,7 +1009,8 @@ int settings_parse_stream_read(struct setting_parser_context *ctx,
 			break;
 		if (input->stream_errno != 0) {
 			ctx->error = p_strdup_printf(ctx->parser_pool,
-						     "read() failed: %m");
+				"read(%s) failed: %s", i_stream_get_name(input),
+				i_stream_get_error(input));
 		} else if (input->v_offset == 0) {
 			ctx->error = p_strdup_printf(ctx->parser_pool,
 				"read(%s) disconnected before receiving any data",
@@ -999,7 +1049,7 @@ int settings_parse_file(struct setting_parser_context *ctx,
 		return -1;
 	}
 
-	input = i_stream_create_fd(fd, max_line_length, TRUE);
+	input = i_stream_create_fd_autoclose(&fd, max_line_length);
 	i_stream_set_name(input, path);
 	ret = settings_parse_stream_read(ctx, input);
 	i_stream_unref(&input);
@@ -1089,7 +1139,7 @@ int settings_parse_exec(struct setting_parser_context *ctx,
 	}
 	i_close_fd(&fd[1]);
 
-	input = i_stream_create_fd(fd[0], (size_t)-1, TRUE);
+	input = i_stream_create_fd_autoclose(&fd[0], (size_t)-1);
 	i_stream_set_name(input, bin_path);
 	ret = settings_parse_stream_read(ctx, input);
 	i_stream_destroy(&input);
@@ -1208,7 +1258,9 @@ void settings_parse_set_keys_expandeded(struct setting_parser_context *ctx,
 static void ATTR_NULL(3, 4, 5)
 settings_var_expand_info(const struct setting_parser_info *info, void *set,
 			 pool_t pool,
-			 const struct var_expand_table *table, string_t *str)
+			 const struct var_expand_table *table,
+			 const struct var_expand_func_table *func_table,
+			 void *func_context, string_t *str)
 {
 	const struct setting_define *def;
 	void *value, *const *children;
@@ -1222,6 +1274,7 @@ settings_var_expand_info(const struct setting_parser_info *info, void *set,
 		case SET_UINT_OCT:
 		case SET_TIME:
 		case SET_SIZE:
+		case SET_IN_PORT:
 		case SET_STR:
 		case SET_ENUM:
 		case SET_STRLIST:
@@ -1239,7 +1292,8 @@ settings_var_expand_info(const struct setting_parser_info *info, void *set,
 				*val += 1;
 			} else if (**val == SETTING_STRVAR_UNEXPANDED[0]) {
 				str_truncate(str, 0);
-				var_expand(str, *val + 1, table);
+				var_expand_with_funcs(str, *val + 1, table,
+						      func_table, func_context);
 				*val = p_strdup(pool, str_c(str));
 			} else {
 				i_assert(**val == SETTING_STRVAR_EXPANDED[0]);
@@ -1257,8 +1311,8 @@ settings_var_expand_info(const struct setting_parser_info *info, void *set,
 			children = array_get(val, &count);
 			for (i = 0; i < count; i++) {
 				settings_var_expand_info(def->list_info,
-							 children[i], pool,
-							 table, str);
+					children[i], pool, table, func_table,
+					func_context, str);
 			}
 			break;
 		}
@@ -1270,11 +1324,21 @@ void settings_var_expand(const struct setting_parser_info *info,
 			 void *set, pool_t pool,
 			 const struct var_expand_table *table)
 {
+	settings_var_expand_with_funcs(info, set, pool, table, NULL, NULL);
+}
+
+void settings_var_expand_with_funcs(const struct setting_parser_info *info,
+				    void *set, pool_t pool,
+				    const struct var_expand_table *table,
+				    const struct var_expand_func_table *func_table,
+				    void *func_context)
+{
 	string_t *str;
 
 	T_BEGIN {
 		str = t_str_new(256);
-		settings_var_expand_info(info, set, pool, table, str);
+		settings_var_expand_info(info, set, pool, table,
+					 func_table, func_context, str);
 	} T_END;
 }
 
@@ -1285,7 +1349,7 @@ void settings_parse_var_skip(struct setting_parser_context *ctx)
 	for (i = 0; i < ctx->root_count; i++) {
 		settings_var_expand_info(ctx->roots[i].info,
 					 ctx->roots[i].set_struct,
-					 NULL, NULL, NULL);
+					 NULL, NULL, NULL, NULL, NULL);
 	}
 }
 
@@ -1306,6 +1370,7 @@ bool settings_vars_have_key(const struct setting_parser_info *info, void *set,
 		case SET_UINT_OCT:
 		case SET_TIME:
 		case SET_SIZE:
+		case SET_IN_PORT:
 		case SET_STR:
 		case SET_ENUM:
 		case SET_STRLIST:
@@ -1364,7 +1429,8 @@ static void settings_set_parent(const struct setting_parser_info *info,
 }
 
 static bool
-setting_copy(enum setting_type type, const void *src, void *dest, pool_t pool)
+setting_copy(enum setting_type type, const void *src, void *dest, pool_t pool,
+	     bool keep_values)
 {
 	switch (type) {
 	case SET_BOOL: {
@@ -1390,13 +1456,23 @@ setting_copy(enum setting_type type, const void *src, void *dest, pool_t pool)
 		*dest_size = *src_size;
 		break;
 	}
+	case SET_IN_PORT: {
+		const in_port_t *src_size = src;
+		in_port_t *dest_size = dest;
+
+		*dest_size = *src_size;
+		break;
+	}
 	case SET_STR_VARS:
 	case SET_STR:
 	case SET_ENUM: {
 		const char *const *src_str = src;
 		const char **dest_str = dest;
 
-		*dest_str = p_strdup(pool, *src_str);
+		if (keep_values)
+			*dest_str = *src_str;
+		else
+			*dest_str = p_strdup(pool, *src_str);
 		break;
 	}
 	case SET_DEFLIST:
@@ -1427,9 +1503,9 @@ setting_copy(enum setting_type type, const void *src, void *dest, pool_t pool)
 				if (j < dest_count)
 					continue;
 			}
-			dup = p_strdup(pool, strings[i]);
+			dup = keep_values ? strings[i] : p_strdup(pool, strings[i]);
 			array_append(dest_arr, &dup, 1);
-			dup = p_strdup(pool, strings[i+1]);
+			dup = keep_values ? strings[i+1] : p_strdup(pool, strings[i+1]);
 			array_append(dest_arr, &dup, 1);
 		}
 		break;
@@ -1440,8 +1516,8 @@ setting_copy(enum setting_type type, const void *src, void *dest, pool_t pool)
 	return TRUE;
 }
 
-void *settings_dup(const struct setting_parser_info *info,
-		   const void *set, pool_t pool)
+static void *settings_dup_full(const struct setting_parser_info *info,
+			       const void *set, pool_t pool, bool keep_values)
 {
 	const struct setting_define *def;
 	const void *src;
@@ -1458,7 +1534,7 @@ void *settings_dup(const struct setting_parser_info *info,
 		src = CONST_PTR_OFFSET(set, def->offset);
 		dest = PTR_OFFSET(dest_set, def->offset);
 
-		if (!setting_copy(def->type, src, dest, pool)) {
+		if (!setting_copy(def->type, src, dest, pool, keep_values)) {
 			const ARRAY_TYPE(void_array) *src_arr = src;
 			ARRAY_TYPE(void_array) *dest_arr = dest;
 			void *child_set;
@@ -1469,8 +1545,9 @@ void *settings_dup(const struct setting_parser_info *info,
 			children = array_get(src_arr, &count);
 			p_array_init(dest_arr, pool, count);
 			for (i = 0; i < count; i++) {
-				child_set = settings_dup(def->list_info,
-							 children[i], pool);
+				child_set = settings_dup_full(def->list_info,
+							      children[i], pool,
+							      keep_values);
 				array_append(dest_arr, &child_set, 1);
 				settings_set_parent(def->list_info, child_set,
 						    dest_set);
@@ -1478,6 +1555,18 @@ void *settings_dup(const struct setting_parser_info *info,
 		}
 	}
 	return dest_set;
+}
+
+void *settings_dup(const struct setting_parser_info *info,
+		   const void *set, pool_t pool)
+{
+	return settings_dup_full(info, set, pool, FALSE);
+}
+
+void *settings_dup_with_pointers(const struct setting_parser_info *info,
+				 const void *set, pool_t pool)
+{
+	return settings_dup_full(info, set, pool, TRUE);
 }
 
 static void *
@@ -1503,6 +1592,7 @@ settings_changes_dup(const struct setting_parser_info *info,
 		case SET_UINT_OCT:
 		case SET_TIME:
 		case SET_SIZE:
+		case SET_IN_PORT:
 		case SET_STR_VARS:
 		case SET_STR:
 		case SET_ENUM:
@@ -1744,6 +1834,7 @@ settings_link_get_new(struct setting_parser_context *new_ctx,
 		}
 		i_assert(i < count);
 	}
+	i_assert(hash_table_lookup(links, old_link) == NULL);
 	hash_table_insert(links, old_link, new_link);
 	return new_link;
 }
@@ -1759,6 +1850,11 @@ settings_parser_dup(const struct setting_parser_context *old_ctx,
 	char *key;
 	unsigned int i;
 	pool_t parser_pool;
+	bool keep_values;
+
+	/* if source and destination pools are the same, there's no need to
+	   duplicate values */
+	keep_values = new_pool == old_ctx->set_pool;
 
 	pool_ref(new_pool);
 	parser_pool = pool_alloconly_create(MEMPOOL_GROWING"dup settings parser",
@@ -1783,9 +1879,9 @@ settings_parser_dup(const struct setting_parser_context *old_ctx,
 
 		new_ctx->roots[i].info = old_ctx->roots[i].info;
 		new_ctx->roots[i].set_struct =
-			settings_dup(old_ctx->roots[i].info,
-				     old_ctx->roots[i].set_struct,
-				     new_ctx->set_pool);
+			settings_dup_full(old_ctx->roots[i].info,
+					  old_ctx->roots[i].set_struct,
+					  new_ctx->set_pool, keep_values);
 		new_ctx->roots[i].change_struct =
 			settings_changes_dup(old_ctx->roots[i].info,
 					     old_ctx->roots[i].change_struct,
@@ -1906,8 +2002,8 @@ settings_copy_deflist_unique(const struct setting_define *def,
 		return 0;
 	type_offset = def->list_info->type_offset;
 
-	memset(&child_dest_link, 0, sizeof(child_dest_link));
-	memset(&child_src_link, 0, sizeof(child_src_link));
+	i_zero(&child_dest_link);
+	i_zero(&child_src_link);
 
 	child_dest_link.info = child_src_link.info = def->list_info;
 
@@ -1994,7 +2090,7 @@ settings_apply(struct setting_link *dest_link,
 		src = CONST_PTR_OFFSET(src_link->set_struct, def->offset);
 		dest = PTR_OFFSET(dest_link->set_struct, def->offset);
 
-		if (setting_copy(def->type, src, dest, pool)) {
+		if (setting_copy(def->type, src, dest, pool, FALSE)) {
 			/* non-list */
 		} else if (def->type == SET_DEFLIST) {
 			settings_copy_deflist(def, src_link, dest_link, pool);
@@ -2028,7 +2124,7 @@ int settings_parser_apply_changes(struct setting_parser_context *dest,
 const char *settings_section_escape(const char *name)
 {
 #define CHAR_NEED_ESCAPE(c) \
-	((c) == '=' || (c) == SETTINGS_SEPARATOR || (c) == '\\' || (c) == ' ')
+	((c) == '=' || (c) == SETTINGS_SEPARATOR || (c) == '\\' || (c) == ' ' || (c) == ',')
 	string_t *str;
 	unsigned int i;
 
@@ -2054,6 +2150,9 @@ const char *settings_section_escape(const char *name)
 			break;
 		case ' ':
 			str_append(str, "\\_");
+			break;
+		case ',':
+			str_append(str, "\\+");
 			break;
 		default:
 			str_append_c(str, name[i]);

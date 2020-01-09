@@ -1,8 +1,10 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2018 Dovecot authors, see the included COPYING file */
 
 #include "login-common.h"
 #include "ioloop.h"
+#include "array.h"
 #include "randgen.h"
+#include "module-dir.h"
 #include "process-title.h"
 #include "restrict-access.h"
 #include "restrict-process-size.h"
@@ -18,7 +20,6 @@
 #include "ssl-proxy.h"
 #include "login-proxy.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <syslog.h>
 
@@ -35,16 +36,23 @@ struct login_access_lookup {
 const struct login_binary *login_binary;
 struct auth_client *auth_client;
 struct master_auth *master_auth;
-bool closing_down;
+bool closing_down, login_debug;
 struct anvil_client *anvil;
 const char *login_rawlog_dir = NULL;
 unsigned int initial_service_count;
+struct login_module_register login_module_register;
+ARRAY_TYPE(string) global_alt_usernames;
 
 const struct login_settings *global_login_settings;
 const struct master_service_ssl_settings *global_ssl_settings;
 void **global_other_settings;
 
+const struct ip_addr *login_source_ips;
+unsigned int login_source_ips_idx, login_source_ips_count;
+
+static struct module *modules;
 static struct timeout *auth_client_to;
+static const char *post_login_socket;
 static bool shutting_down = FALSE;
 static bool ssl_connections = FALSE;
 static bool auth_connected_once = FALSE;
@@ -108,27 +116,19 @@ client_connected_finish(const struct master_service_connection *conn)
 {
 	struct client *client;
 	struct ssl_proxy *proxy;
-	struct ip_addr local_ip;
 	const struct login_settings *set;
 	const struct master_service_ssl_settings *ssl_set;
-	unsigned int local_port;
 	pool_t pool;
 	int fd_ssl;
 	void **other_sets;
 
-	if (net_getsockname(conn->fd, &local_ip, &local_port) < 0) {
-		memset(&local_ip, 0, sizeof(local_ip));
-		local_port = 0;
-	}
-
 	pool = pool_alloconly_create("login client", 8*1024);
-	set = login_settings_read(pool, &local_ip,
+	set = login_settings_read(pool, &conn->local_ip,
 				  &conn->remote_ip, NULL, &ssl_set, &other_sets);
 
 	if (!ssl_connections && !conn->ssl) {
-		client = client_create(conn->fd, FALSE, pool,
-				       set, ssl_set, other_sets,
-				       &local_ip, &conn->remote_ip);
+		(void)client_create(conn->fd, FALSE, pool, conn,
+				    set, ssl_set, other_sets);
 	} else {
 		fd_ssl = ssl_proxy_alloc(conn->fd, &conn->remote_ip, pool,
 					 set, ssl_set, &proxy);
@@ -139,16 +139,12 @@ client_connected_finish(const struct master_service_connection *conn)
 			return;
 		}
 
-		client = client_create(fd_ssl, TRUE, pool,
-				       set, ssl_set, other_sets,
-				       &local_ip, &conn->remote_ip);
+		client = client_create(fd_ssl, TRUE, pool, conn,
+				       set, ssl_set, other_sets);
 		client->ssl_proxy = proxy;
 		ssl_proxy_set_client(proxy, client);
 		ssl_proxy_start(proxy);
 	}
-
-	client->real_remote_port = client->remote_port = conn->remote_port;
-	client->real_local_port = client->local_port = local_port;
 
 	if (auth_client_to != NULL)
 		timeout_remove(&auth_client_to);
@@ -277,7 +273,71 @@ static bool anvil_reconnect_callback(void)
 	return FALSE;
 }
 
-static void main_preinit(bool allow_core_dumps)
+void login_anvil_init(void)
+{
+	if (anvil != NULL)
+		return;
+
+	anvil = anvil_client_init("anvil", anvil_reconnect_callback, 0);
+	if (anvil_client_connect(anvil, TRUE) < 0)
+		i_fatal("Couldn't connect to anvil");
+}
+
+static const struct ip_addr *
+parse_login_source_ips(const char *ips_str, unsigned int *count_r)
+{
+	ARRAY(struct ip_addr) ips;
+	const char *const *tmp;
+	struct ip_addr *tmp_ips;
+	bool skip_nonworking = FALSE;
+	unsigned int i, tmp_ips_count;
+	int ret;
+
+	if (ips_str[0] == '?') {
+		/* try binding to the IP immediately. if it doesn't
+		   work, skip it. (this allows using the same config file for
+		   all the servers.) */
+		skip_nonworking = TRUE;
+		ips_str++;
+	}
+	t_array_init(&ips, 4);
+	for (tmp = t_strsplit_spaces(ips_str, ", "); *tmp != NULL; tmp++) {
+		ret = net_gethostbyname(*tmp, &tmp_ips, &tmp_ips_count);
+		if (ret != 0) {
+			i_error("login_source_ips: net_gethostbyname(%s) failed: %s",
+				*tmp, net_gethosterror(ret));
+			continue;
+		}
+		for (i = 0; i < tmp_ips_count; i++) {
+			if (skip_nonworking && net_try_bind(&tmp_ips[i]) < 0)
+				continue;
+			array_append(&ips, &tmp_ips[i], 1);
+		}
+	}
+	return array_get(&ips, count_r);
+}
+
+static void login_load_modules(void)
+{
+	struct module_dir_load_settings mod_set;
+
+	if (global_login_settings->login_plugins[0] == '\0')
+		return;
+
+	i_zero(&mod_set);
+	mod_set.abi_version = DOVECOT_ABI_VERSION;
+	mod_set.binary_name = login_binary->process_name;
+	mod_set.setting_name = "login_plugins";
+	mod_set.require_init_funcs = TRUE;
+	mod_set.debug = login_debug;
+
+	modules = module_dir_load(global_login_settings->login_plugin_dir,
+				  global_login_settings->login_plugins,
+				  &mod_set);
+	module_dir_init(modules);
+}
+
+static void main_preinit(void)
 {
 	unsigned int max_fds;
 
@@ -286,6 +346,7 @@ static void main_preinit(bool allow_core_dumps)
 	   key file. */
 	ssl_proxy_init();
 	dsasl_clients_init();
+	client_common_init();
 
 	/* set the number of fds we want to use. it may get increased or
 	   decreased. leave a couple of extra fds for auth sockets and such.
@@ -296,24 +357,37 @@ static void main_preinit(bool allow_core_dumps)
 	    - 1 for login proxy
 	    - 2 for client-side ssl proxy
 	    - 2 for server-side ssl proxy (with login proxy)
+
+	   However, login process nowadays supports plugins, there are rawlogs
+	   and so on. Don't enforce the fd limit anymore, but use this value
+	   for optimizing the ioloop's fd table size.
 	*/
 	max_fds = MASTER_LISTEN_FD_FIRST + 16 +
 		master_service_get_socket_count(master_service) +
 		master_service_get_client_limit(master_service)*6;
-	restrict_fd_limit(max_fds);
 	io_loop_set_max_fd_count(current_ioloop, max_fds);
 
 	i_assert(strcmp(global_ssl_settings->ssl, "no") == 0 ||
 		 ssl_initialized);
 
-	if (global_login_settings->mail_max_userip_connections > 0) {
-		anvil = anvil_client_init("anvil", anvil_reconnect_callback, 0);
-		if (anvil_client_connect(anvil, TRUE) < 0)
-			i_fatal("Couldn't connect to anvil");
+	if (global_login_settings->mail_max_userip_connections > 0)
+		login_anvil_init();
+
+	/* read the login_source_ips before chrooting so it can access
+	   /etc/hosts */
+	login_source_ips = parse_login_source_ips(global_login_settings->login_source_ips,
+						  &login_source_ips_count);
+	if (login_source_ips_count > 0) {
+		/* randomize the initial index in case service_count=1
+		   (although in that case it's unlikely this setting is
+		   even used..) */
+		login_source_ips_idx = rand() % login_source_ips_count;
 	}
 
+	login_load_modules();
+
 	restrict_access_by_env(NULL, TRUE);
-	if (allow_core_dumps)
+	if (login_debug)
 		restrict_access_allow_coredumps(TRUE);
 	initial_service_count = master_service_get_service_count(master_service);
 
@@ -335,6 +409,7 @@ static void main_init(const char *login_socket)
 	/* make sure we can't fork() */
 	restrict_process_count(1);
 
+	i_array_init(&global_alt_usernames, 4);
 	master_service_set_avail_overflow_callback(master_service,
 						   client_destroy_oldest);
 	master_service_set_die_callback(master_service, login_die);
@@ -342,10 +417,11 @@ static void main_init(const char *login_socket)
 	auth_client = auth_client_init(login_socket, (unsigned int)getpid(),
 				       FALSE);
         auth_client_set_connect_notify(auth_client, auth_connect_notify, NULL);
-	master_auth = master_auth_init(master_service, login_binary->protocol);
+	master_auth = master_auth_init(master_service, post_login_socket);
 
 	login_binary->init();
-	login_proxy_init("proxy-notify");
+
+	login_proxy_init(global_login_settings->login_proxy_notify_path);
 }
 
 static void main_deinit(void)
@@ -354,13 +430,20 @@ static void main_deinit(void)
 	login_proxy_deinit();
 
 	login_binary->deinit();
+	module_dir_unload(&modules);
 	auth_client_deinit(&auth_client);
 	master_auth_deinit(&master_auth);
+
+	char **strp;
+	array_foreach_modifiable(&global_alt_usernames, strp)
+		i_free(*strp);
+	array_free(&global_alt_usernames);
 
 	if (anvil != NULL)
 		anvil_client_deinit(&anvil);
 	if (auth_client_to != NULL)
 		timeout_remove(&auth_client_to);
+	client_common_deinit();
 	dsasl_clients_deinit();
 	login_settings_deinit();
 }
@@ -374,24 +457,27 @@ int login_binary_run(const struct login_binary *binary,
 		MASTER_SERVICE_FLAG_USE_SSL_SETTINGS |
 		MASTER_SERVICE_FLAG_NO_SSL_INIT;
 	pool_t set_pool;
-	bool allow_core_dumps = FALSE;
 	const char *login_socket;
 	int c;
 
 	login_binary = binary;
 	login_socket = binary->default_login_socket != NULL ?
 		binary->default_login_socket : LOGIN_DEFAULT_SOCKET;
+	post_login_socket = binary->protocol;
 
 	master_service = master_service_init(login_binary->process_name,
 					     service_flags, &argc, &argv,
-					     "DR:S");
+					     "Dl:R:S");
 	master_service_init_log(master_service, t_strconcat(
 		login_binary->process_name, ": ", NULL));
 
 	while ((c = master_getopt(master_service)) > 0) {
 		switch (c) {
 		case 'D':
-			allow_core_dumps = TRUE;
+			login_debug = TRUE;
+			break;
+		case 'l':
+			post_login_socket = optarg;
 			break;
 		case 'R':
 			login_rawlog_dir = optarg;
@@ -414,7 +500,7 @@ int login_binary_run(const struct login_binary *binary,
 				    &global_ssl_settings,
 				    &global_other_settings);
 
-	main_preinit(allow_core_dumps);
+	main_preinit();
 	master_service_init_finish(master_service);
 	main_init(login_socket);
 

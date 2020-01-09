@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2018 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -66,7 +66,7 @@ mail_storage_try_copy(struct mail_save_context **_ctx, struct mail *mail)
 	   to help anything. */
 	pmail->v.set_uid_cache_updates(mail, TRUE);
 
-	if (mail_get_stream(mail, NULL, NULL, &input) < 0) {
+	if (mail_get_stream_because(mail, NULL, NULL, "copying", &input) < 0) {
 		mail_copy_set_failed(ctx, mail, "stream");
 		return -1;
 	}
@@ -76,14 +76,18 @@ mail_storage_try_copy(struct mail_save_context **_ctx, struct mail *mail)
 	if (mailbox_save_begin(_ctx, input) < 0)
 		return -1;
 
+	ssize_t ret;
 	do {
 		if (mailbox_save_continue(ctx) < 0)
 			break;
-	} while (i_stream_read(input) != -1);
+		ret = i_stream_read(input);
+		i_assert(ret != 0);
+	} while (ret != -1);
 
 	if (input->stream_errno != 0) {
 		mail_storage_set_critical(ctx->transaction->box->storage,
-					  "copy: i_stream_read() failed: %m");
+			"copy: i_stream_read(%s) failed: %s",
+			i_stream_get_name(input), i_stream_get_error(input));
 		return -1;
 	}
 	return 0;
@@ -91,6 +95,8 @@ mail_storage_try_copy(struct mail_save_context **_ctx, struct mail *mail)
 
 int mail_storage_copy(struct mail_save_context *ctx, struct mail *mail)
 {
+	i_assert(ctx->copying_or_moving);
+
 	if (ctx->data.keywords != NULL) {
 		/* keywords gets unreferenced twice: first in
 		   mailbox_save_cancel()/_finish() and second time in
