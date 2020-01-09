@@ -5,7 +5,7 @@ Name: dovecot
 Epoch: 1
 Version: 2.2.10
 %global prever %{nil}
-Release: 7%{?dist}
+Release: 8%{?dist}
 #dovecot itself is MIT, a few sources are PD, pigeonhole is LGPLv2
 License: MIT and LGPLv2
 Group: System Environment/Daemons
@@ -55,6 +55,9 @@ Patch13: dovecot-2.2.10-b8864211b88ed7521e9af514590639344af38910.patch
 
 # dovecot < 2.2.14, rhbz#1224496
 Patch14: dovecot-2.2.10-0e1a3c909a13.patch
+
+# dovecot < 2.2.25, rhbz#1280436
+Patch15: dovecot-2.2-gidcheck.patch
 
 Source15: prestartscript
 
@@ -159,6 +162,7 @@ This package provides the development files for dovecot.
 %patch12 -p1 -b .ed6e472cab0e
 %patch13 -p1 -b .b8864211b88ed7521e9af514590639344af38910
 %patch14 -p1 -b .0e1a3c909a13
+%patch15 -p1 -b .gidcheck
 sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src/plugins/fts-lucene/Makefile.in
 #pigeonhole
 pushd dovecot-2*2-pigeonhole-%{pigeonholever}
@@ -518,6 +522,9 @@ make check
 
 
 %changelog
+* Tue Mar 21 2017 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.10-8
+- do not iterate over users outside of first/last_valid_gid range (#1280436)
+
 * Thu Jun 09 2016 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.10-7
 - prevent warning messages from %%post section if selinux-policy is
   not installed (yet) (#1057522)

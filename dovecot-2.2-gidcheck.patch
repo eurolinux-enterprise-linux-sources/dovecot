@@ -1,0 +1,63 @@
+From ca5b3ec5331545b46ec1f1c4ecfa1302ddb10653 Mon Sep 17 00:00:00 2001
+From: Timo Sirainen <timo.sirainen@dovecot.fi>
+Date: Wed, 29 Jun 2016 00:56:56 +0300
+Subject: [PATCH] auth: userdb passwd iteration now skips users not in
+ first/last_valid_gid range
+
+Patch by Michal Hlavinka / Red Hat
+---
+ src/auth/auth-settings.c | 4 ++++
+ src/auth/auth-settings.h | 2 ++
+ src/auth/userdb-passwd.c | 4 ++++
+ 3 files changed, 10 insertions(+)
+
+diff --git a/src/auth/auth-settings.c b/src/auth/auth-settings.c
+index c942819..ea987cb 100644
+--- a/src/auth/auth-settings.c
++++ b/src/auth/auth-settings.c
+@@ -264,6 +264,8 @@ static const struct setting_define auth_setting_defines[] = {
+ 	DEF_NOPREFIX(SET_BOOL, verbose_proctitle),
+ 	DEF_NOPREFIX(SET_UINT, first_valid_uid),
+ 	DEF_NOPREFIX(SET_UINT, last_valid_uid),
++	DEF_NOPREFIX(SET_UINT, first_valid_gid),
++	DEF_NOPREFIX(SET_UINT, last_valid_gid),
+ 
+ 	SETTING_DEFINE_LIST_END
+ };
+@@ -313,6 +315,8 @@ static const struct auth_settings auth_default_settings = {
+ 	.verbose_proctitle = FALSE,
+ 	.first_valid_uid = 500,
+ 	.last_valid_uid = 0,
++	.first_valid_gid = 1,
++	.last_valid_gid = 0,
+ };
+ 
+ const struct setting_parser_info auth_setting_parser_info = {
+diff --git a/src/auth/auth-settings.h b/src/auth/auth-settings.h
+index 1313576..409653f 100644
+--- a/src/auth/auth-settings.h
++++ b/src/auth/auth-settings.h
+@@ -79,6 +79,8 @@ struct auth_settings {
+ 	bool verbose_proctitle;
+ 	unsigned int first_valid_uid;
+ 	unsigned int last_valid_uid;
++	unsigned int first_valid_gid;
++	unsigned int last_valid_gid;
+ 
+ 	/* generated: */
+ 	char username_chars_map[256];
+diff --git a/src/auth/userdb-passwd.c b/src/auth/userdb-passwd.c
+index f50bcba..a1f1871 100644
+--- a/src/auth/userdb-passwd.c
++++ b/src/auth/userdb-passwd.c
+@@ -145,6 +145,10 @@ passwd_iterate_want_pw(struct passwd *pw, const struct auth_settings *set)
+ 		return FALSE;
+ 	if (pw->pw_uid > (uid_t)set->last_valid_uid && set->last_valid_uid != 0)
+ 		return FALSE;
++	if (pw->pw_gid < (gid_t)set->first_valid_gid)
++		return FALSE;
++	if (pw->pw_gid > (gid_t)set->last_valid_gid && set->last_valid_gid != 0)
++		return FALSE;
+ 	return TRUE;
+ }
+ 
