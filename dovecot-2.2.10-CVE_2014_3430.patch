@@ -1,0 +1,52 @@
+
+# HG changeset patch
+# User Timo Sirainen <tss@iki.fi>
+# Date 1399472781 -10800
+# Node ID 41622541a7a3a938895b5fe045bbc633a9b6c022
+# Parent  7a08a481c133be4b8cb8415feaed1321d560cee5
+*-login: SSL connections didn't get closed when the client got destroyed.
+
+diff -r 7a08a481c133 -r 41622541a7a3 src/login-common/client-common.c
+--- a/src/login-common/client-common.c	Wed May 07 17:12:19 2014 +0300
++++ b/src/login-common/client-common.c	Wed May 07 17:26:21 2014 +0300
+@@ -171,6 +171,8 @@
+ 		last_client = client->prev;
+ 	DLLIST_REMOVE(&clients, client);
+ 
++	if (!client->login_success && client->ssl_proxy != NULL)
++		ssl_proxy_destroy(client->ssl_proxy);
+ 	if (client->input != NULL)
+ 		i_stream_close(client->input);
+ 	if (client->output != NULL)
+diff -r 7a08a481c133 -r 41622541a7a3 src/login-common/ssl-proxy-openssl.c
+--- a/src/login-common/ssl-proxy-openssl.c	Wed May 07 17:12:19 2014 +0300
++++ b/src/login-common/ssl-proxy-openssl.c	Wed May 07 17:26:21 2014 +0300
+@@ -116,7 +116,6 @@
+ static void ssl_read(struct ssl_proxy *proxy);
+ static void ssl_write(struct ssl_proxy *proxy);
+ static void ssl_step(struct ssl_proxy *proxy);
+-static void ssl_proxy_destroy(struct ssl_proxy *proxy);
+ static void ssl_proxy_unref(struct ssl_proxy *proxy);
+ 
+ static struct ssl_server_context *
+@@ -807,7 +806,7 @@
+ 	i_free(proxy);
+ }
+ 
+-static void ssl_proxy_destroy(struct ssl_proxy *proxy)
++void ssl_proxy_destroy(struct ssl_proxy *proxy)
+ {
+ 	if (proxy->destroyed)
+ 		return;
+diff -r 7a08a481c133 -r 41622541a7a3 src/login-common/ssl-proxy.h
+--- a/src/login-common/ssl-proxy.h	Wed May 07 17:12:19 2014 +0300
++++ b/src/login-common/ssl-proxy.h	Wed May 07 17:26:21 2014 +0300
+@@ -34,6 +34,7 @@
+ const char *ssl_proxy_get_security_string(struct ssl_proxy *proxy);
+ const char *ssl_proxy_get_compression(struct ssl_proxy *proxy);
+ const char *ssl_proxy_get_cert_error(struct ssl_proxy *proxy);
++void ssl_proxy_destroy(struct ssl_proxy *proxy);
+ void ssl_proxy_free(struct ssl_proxy **proxy);
+ 
+ /* Return number of active SSL proxies */
+
