@@ -1,0 +1,21 @@
+diff -r 5b05411a81cf src/auth/auth-client-connection.c
+--- a/src/auth/auth-client-connection.c	Thu Mar 15 18:24:15 2012 +0200
++++ b/src/auth/auth-client-connection.c	Fri Mar 16 22:13:36 2012 +0200
+@@ -95,7 +95,16 @@
+ 		return FALSE;
+ 	}
+ 
+-	old = auth_client_connection_lookup(pid);
++	if (conn->login_requests)
++		old = auth_client_connection_lookup(pid);
++	else {
++		/* the client is only authenticating, not logging in.
++		   the PID isn't necessary, and since we allow authentication
++		   via TCP sockets the PIDs may conflict, so ignore them. */
++		old = NULL;
++		pid = 0;
++	}
++
+ 	if (old != NULL) {
+ 		/* already exists. it's possible that it just reconnected,
+ 		   see if the old connection is still there. */

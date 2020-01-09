@@ -2,7 +2,7 @@ Summary: Secure imap and pop3 server
 Name: dovecot
 Epoch: 1
 Version: 2.0.9
-Release: 19%{?dist}.2
+Release: 22%{?dist}
 #dovecot itself is MIT, a few sources are PD, pigeonhole is LGPLv2
 License: MIT and LGPLv2
 Group: System Environment/Daemons
@@ -77,6 +77,15 @@ Patch21: dovecot-2.0.9-remove-file-set-size.patch
 
 # for dovecot < 2.0.14, rhbz#1220628
 Patch22: dovecot-2.0.9-0e64f0217feb.patch
+
+# for dovecot < 2.2.7, rhbz#1230258
+Patch23: dovecot-2.0.9-ssllength.patch
+
+# for dovecot <=2.0.19, rhbz#1281670
+Patch24: dovecot-2.0.9-pidconflict.diff
+
+# for dovecot < 2.0.10, rhbz#1275233
+Patch25: dovecot-2.0.9-fixcharset.patch
 
 Buildroot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 BuildRequires: openssl-devel, pam-devel, zlib-devel, bzip2-devel, libcap-devel
@@ -153,7 +162,6 @@ This package provides the development files for dovecot.
 %patch7 -p1 -b .CVE-2011-4318
 %patch8 -p1 -b .CVE-2011-2166
 %patch9 -p1 -b .CVE-2011-2167
-%patch10 -p1 -b .fipsfix
 %patch11 -p1 -b .CVE_2014_3430
 %patch12 -p1 -b .copyhang
 %patch13 -p1 -b .gsssize
@@ -166,6 +174,9 @@ This package provides the development files for dovecot.
 %patch20 -p1 -b .fixsepend
 %patch21 -p1 -b .remove-file-set-size
 %patch22 -p1 -b .0e64f0217feb
+%patch23 -p1 -b .ssllength
+%patch24 -p1 -b .pidconflict
+%patch25 -p1 -b .fixcharset
 
 %build
 #required for fdpass.c line 125,190: dereferencing type-punned pointer will break strict-aliasing rules
@@ -436,11 +447,16 @@ make check
 %{_libdir}/%{name}/dict/libdriver_pgsql.so
 
 %changelog
-* Mon Aug 24 2015 Michal Hlavinka <mhlavink@redhat.com> - 1:2.0.9-19.2
-- fixed crash on "NOT <nonexistent sequence>" search (#1256413)
+* Fri Jan 08 2016 Michal Hlavinka <mhlavink@redhat.com> - 1:2.0.9-22
+- allow larger DH parameters length(#1230258)
+- don't check client PID in non-login auth sockets (#1281670)
+- messages containing a CP932 character were not shown in a search result (#1275233)
 
-* Wed Jun 17 2015 Michal Hlavinka <mhlavink@redhat.com> - 1:2.0.9-19.1
-- mailbox on GFS2 filesystem added extra NULL characters (#1232364)
+* Mon Aug 24 2015 Michal Hlavinka <mhlavink@redhat.com> - 1:2.0.9-21
+ -fixed crash on "NOT <nonexistent sequence>" search (#1220628)
+
+* Tue Jun 16 2015 Michal Hlavinka <mhlavink@redhat.com> - 1:2.0.9-20
+- mailbox on GFS2 filesystem added extra NULL characters (#1209092)
 
 * Thu Mar 05 2015 Michal Hlavinka <mhlavink@redhat.com> - 1:2.0.9-19
 - fix coverity found issues
