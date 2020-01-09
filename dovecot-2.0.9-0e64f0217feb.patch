@@ -1,0 +1,32 @@
+
+# HG changeset patch
+# User Timo Sirainen <tss@iki.fi>
+# Date 1311864397 -10800
+# Node ID 0e64f0217feb4660bba01f1d3df5d7fb4bf2e98d
+# Parent  a77d53d40ea33d6232691ee5bf7c1586ec3f7a32
+lib-storage: Fixed crashing on "NOT <nonexistent sequence>" search.
+
+diff -r a77d53d40ea3 -r 0e64f0217feb src/lib-storage/index/index-search.c
+--- a/src/lib-storage/index/index-search.c	Thu Jul 28 12:08:10 2011 +0300
++++ b/src/lib-storage/index/index-search.c	Thu Jul 28 17:46:37 2011 +0300
+@@ -745,7 +745,7 @@
+ 	else {
+ 		/* if all messages are in the range, it can't match */
+ 		range = array_get_modifiable(seqset, &count);
+-		return range[0].seq1 != 1 ||
++		return count == 0 || range[0].seq1 != 1 ||
+ 			range[count-1].seq2 != messages_count;
+ 	}
+ }
+@@ -768,6 +768,10 @@
+ 	if (!not) {
+ 		min_seq = range[0].seq1;
+ 		max_seq = range[count-1].seq2;
++	} else if (count == 0) {
++		/* matches all messages */
++		min_seq = 1;
++		max_seq = messages_count;
+ 	} else {
+ 		min_seq = range[0].seq1 > 1 ? 1 : range[0].seq2 + 1;
+ 		max_seq = range[count-1].seq2 < messages_count ?
+
