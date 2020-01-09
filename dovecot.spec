@@ -5,7 +5,7 @@ Name: dovecot
 Epoch: 1
 Version: 2.2.36
 %global prever %{nil}
-Release: 3%{?dist}
+Release: 3%{?dist}.1
 #dovecot itself is MIT, a few sources are PD, pigeonhole is LGPLv2
 License: MIT and LGPLv2
 Group: System Environment/Daemons
@@ -45,6 +45,11 @@ Patch10: dovecot-2.2-gidcheck.patch
 
 
 Source15: prestartscript
+
+Patch19: dovecot-2.2.36-cve2019_11500_part1of4.patch
+Patch20: dovecot-2.2.36-cve2019_11500_part2of4.patch
+Patch21: dovecot-2.2.36-cve2019_11500_part3of4.patch
+Patch22: dovecot-2.2.36-cve2019_11500_part4of4.patch
 
 Buildroot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 BuildRequires: openssl-devel, pam-devel, zlib-devel, bzip2-devel, xz-devel, libcap-devel
@@ -141,9 +146,13 @@ This package provides the development files for dovecot.
 %patch7 -p1 -b .nodevrand
 %patch9 -p1 -b .aclfix
 %patch10 -p1 -b .gidcheck
+%patch19 -p1 -b .cve2019_11500_part1of4
+%patch20 -p1 -b .cve2019_11500_part2of4
 sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src/plugins/fts-lucene/Makefile.in
 #pigeonhole
 pushd dovecot-2*2-pigeonhole-%{pigeonholever}
+%patch21 -p1 -b .cve2019_11500_part3of4
+%patch22 -p1 -b .cve2019_11500_part4of4
 popd
 
 %build
@@ -517,6 +526,11 @@ make check
 
 
 %changelog
+* Thu Sep 12 2019 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.36-3.1
+- fix CVE-2019-11500: IMAP protocol parser does not properly handle NUL byte
+  when scanning data in quoted strings, leading to out of bounds heap
+  memory writes (#1751383)
+
 * Wed Sep 19 2018 Michal Hlavinka <mhlavink@redhat.com> - 1:2.2.36-3
 - fix global ACL directory configuration search path (#1630380)
 - update first/last_valid_gid range patch (#1630409)
