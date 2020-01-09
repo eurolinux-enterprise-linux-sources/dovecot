@@ -2,7 +2,7 @@ Summary: Secure imap and pop3 server
 Name: dovecot
 Epoch: 1
 Version: 2.0.9
-Release: 22%{?dist}
+Release: 22%{?dist}.1
 #dovecot itself is MIT, a few sources are PD, pigeonhole is LGPLv2
 License: MIT and LGPLv2
 Group: System Environment/Daemons
@@ -86,6 +86,11 @@ Patch24: dovecot-2.0.9-pidconflict.diff
 
 # for dovecot < 2.0.10, rhbz#1275233
 Patch25: dovecot-2.0.9-fixcharset.patch
+
+Patch26: dovecot-2.2.36-cve2019_11500_part1of4.patch
+Patch27: dovecot-2.2.36-cve2019_11500_part2of4.patch
+Patch28: dovecot-2.2.36-cve2019_11500_part3of4.patch
+Patch29: dovecot-2.2.36-cve2019_11500_part4of4.patch
 
 Buildroot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 BuildRequires: openssl-devel, pam-devel, zlib-devel, bzip2-devel, libcap-devel
@@ -177,6 +182,14 @@ This package provides the development files for dovecot.
 %patch23 -p1 -b .ssllength
 %patch24 -p1 -b .pidconflict
 %patch25 -p1 -b .fixcharset
+%patch26 -p1 -b .cve2019_11500_part1of4
+%patch27 -p1 -b .cve2019_11500_part2of4
+#pigeonhole
+pushd dovecot-2*0-pigeonhole-%{pigeonholever}
+%patch28 -p1 -b .cve2019_11500_part3of4
+%patch29 -p1 -b .cve2019_11500_part4of4
+popd
+
 
 %build
 #required for fdpass.c line 125,190: dereferencing type-punned pointer will break strict-aliasing rules
@@ -447,6 +460,11 @@ make check
 %{_libdir}/%{name}/dict/libdriver_pgsql.so
 
 %changelog
+* Tue Sep 17 2019 Michal Hlavinka <mhlavink@redhat.com> - 1:2.0.9-22.1
+- fix CVE-2019-11500: IMAP protocol parser does not properly handle NUL byte
+  when scanning data in quoted strings, leading to out of bounds heap
+  memory writes (#1752708)
+
 * Fri Jan 08 2016 Michal Hlavinka <mhlavink@redhat.com> - 1:2.0.9-22
 - allow larger DH parameters length(#1230258)
 - don't check client PID in non-login auth sockets (#1281670)
